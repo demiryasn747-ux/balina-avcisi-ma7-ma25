@@ -92,6 +92,12 @@ MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.008"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.015"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.020"))
 MA_TP3_PCT = float(os.getenv("MA_TP3_PCT", "0.025"))
+MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
+MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
+MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
+MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOKBACK", "50")))
+MA_FOLLOWUP_ENABLED = os.getenv("MA_FOLLOWUP_ENABLED", "true").lower() == "true"
+MA_FOLLOWUP_INTERVAL_SEC = int(float(os.getenv("MA_FOLLOWUP_INTERVAL_SEC", "60")))
 DYNAMIC_TOP_200_COIN_POOL = os.getenv("DYNAMIC_TOP_200_COIN_POOL", "true").lower() == "true"
 ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "true").lower() == "true"
 RAW_COINS_ENV = os.getenv("COINS", "").strip()
@@ -238,12 +244,16 @@ def ensure_memory_shape() -> None:
     memory.setdefault("follows", {})
     memory.setdefault("stats", {})
     memory.setdefault("ma_signals", {})
+    memory.setdefault("ma_follows", {})
     memory.setdefault("daily_short_sent", {})
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("last_diag_ts", 0.0)
     memory["stats"].setdefault("ma_long", 0)
     memory["stats"].setdefault("ma_short", 0)
     memory["stats"].setdefault("ma_analyzed", 0)
+    memory["stats"].setdefault("ma_tp", 0)
+    memory["stats"].setdefault("ma_stop", 0)
+    memory["stats"].setdefault("ma_followup", 0)
 
 
 def load_memory() -> None:
@@ -1146,18 +1156,33 @@ def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
     }
 
 
-async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    symbol = normalize_symbol(symbol)
-    k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 80)
-    if len(k1h) < 30:
-        return None
+def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int = MA_SUPPORT_RESISTANCE_LOOKBACK) -> Dict[str, float]:
+    prev_rows = klines[:-1]
+    if not prev_rows:
+        return {"support": 0.0, "resistance": 0.0, "support_diff_pct": 0.0, "resistance_diff_pct": 0.0}
 
-    c = closes(k1h)
-    ma7 = sma(c, 7)
-    ma25 = sma(c, 25)
-    if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
-        return None
+    rows = prev_rows[-max(5, lookback):]
+    low_values = [safe_float(x[3]) for x in rows if safe_float(x[3]) > 0]
+    high_values = [safe_float(x[2]) for x in rows if safe_float(x[2]) > 0]
 
+    below_supports = [x for x in low_values if x <= price]
+    above_resistances = [x for x in high_values if x >= price]
+
+    support = max(below_supports) if below_supports else (min(low_values) if low_values else 0.0)
+    resistance = min(above_resistances) if above_resistances else (max(high_values) if high_values else 0.0)
+
+    support_diff = abs(pct_change(support, price)) if support > 0 and price > 0 else 0.0
+    resistance_diff = abs(pct_change(price, resistance)) if resistance > 0 and price > 0 else 0.0
+
+    return {
+        "support": support,
+        "resistance": resistance,
+        "support_diff_pct": round(support_diff, 4),
+        "resistance_diff_pct": round(resistance_diff, 4),
+    }
+
+
+def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: List[float], ma25: List[float]) -> Optional[Dict[str, Any]]:
     prev_ma7 = ma7[-2]
     prev_ma25 = ma25[-2]
     cur_ma7 = ma7[-1]
@@ -1170,22 +1195,31 @@ async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     candle_low = safe_float(last_candle[3])
     last_price = safe_float(last_candle[4])
 
-    direction = ""
     entry = 0.0
     entry_note = ""
+    entry_diff_pct = 0.0
 
-    if prev_ma7 >= prev_ma25 and cur_ma7 <= cur_ma25:
-        direction = "SHORT"
-        if last_price != candle_high:
+    if direction == "SHORT":
+        if not (prev_ma7 >= prev_ma25 and cur_ma7 <= cur_ma25):
+            return None
+        if candle_high <= 0 or last_price <= 0:
+            return None
+        entry_diff_pct = abs(((candle_high - last_price) / candle_high) * 100.0)
+        if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = "SHORT giriş: güncel fiyat 1 saatlik mumun tam tepesinde"
-    elif prev_ma7 <= prev_ma25 and cur_ma7 >= cur_ma25:
-        direction = "LONG"
-        if last_price != candle_low:
+        entry_note = f"SHORT giriş: güncel fiyat 1 saatlik mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
+
+    elif direction == "LONG":
+        if not (prev_ma7 <= prev_ma25 and cur_ma7 >= cur_ma25):
+            return None
+        if candle_low <= 0 or last_price <= 0:
+            return None
+        entry_diff_pct = abs(((last_price - candle_low) / candle_low) * 100.0)
+        if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = "LONG giriş: güncel fiyat 1 saatlik mumun tam dibinde"
+        entry_note = f"LONG giriş: güncel fiyat 1 saatlik mum dibine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
     else:
         return None
 
@@ -1193,6 +1227,7 @@ async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     targets = calc_ma_targets(entry, direction)
+    sr = calc_support_resistance(k1h, entry)
     return {
         "symbol": symbol,
         "direction": direction,
@@ -1201,6 +1236,12 @@ async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         "candle_open": candle_open,
         "candle_high": candle_high,
         "candle_low": candle_low,
+        "entry_diff_pct": round(entry_diff_pct, 4),
+        "max_entry_diff_pct": MA_ENTRY_MAX_DIFF_PCT,
+        "support": sr["support"],
+        "resistance": sr["resistance"],
+        "support_diff_pct": sr["support_diff_pct"],
+        "resistance_diff_pct": sr["resistance_diff_pct"],
         "stop": targets["stop"],
         "tp1": targets["tp1"],
         "tp2": targets["tp2"],
@@ -1215,6 +1256,47 @@ async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     }
 
 
+async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], List[float], List[float]]]:
+    symbol = normalize_symbol(symbol)
+    k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 80)
+    if len(k1h) < 30:
+        return None
+
+    c = closes(k1h)
+    ma7 = sma(c, 7)
+    ma25 = sma(c, 25)
+    if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
+        return None
+    return symbol, k1h, ma7, ma25
+
+
+async def analyze_ma_long_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    prepared = await _prepare_ma_data(symbol)
+    if not prepared:
+        return None
+    sym, k1h, ma7, ma25 = prepared
+    return _build_ma_result(sym, "LONG", k1h, ma7, ma25)
+
+
+async def analyze_ma_short_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    prepared = await _prepare_ma_data(symbol)
+    if not prepared:
+        return None
+    sym, k1h, ma7, ma25 = prepared
+    return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
+
+
+async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    prepared = await _prepare_ma_data(symbol)
+    if not prepared:
+        return None
+    sym, k1h, ma7, ma25 = prepared
+    long_res = _build_ma_result(sym, "LONG", k1h, ma7, ma25)
+    if long_res:
+        return long_res
+    return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
+
+
 def ma_signal_key(res: Dict[str, Any]) -> str:
     return f"MA:{res['symbol']}:{res['direction']}:{res['candle_ts']}"
 
@@ -1225,12 +1307,28 @@ def ma_already_sent(res: Dict[str, Any]) -> bool:
 
 def mark_ma_sent(res: Dict[str, Any]) -> None:
     key = ma_signal_key(res)
+    sent_ts = time.time()
     memory.setdefault("ma_signals", {})[key] = {
-        "ts": time.time(),
+        "ts": sent_ts,
         "symbol": res["symbol"],
         "direction": res["direction"],
         "entry": res["entry"],
         "candle_ts": res["candle_ts"],
+    }
+    memory.setdefault("ma_follows", {})[key] = {
+        "done": False,
+        "sent_ts": sent_ts,
+        "key": key,
+        "symbol": res["symbol"],
+        "direction": res["direction"],
+        "entry": res["entry"],
+        "stop": res["stop"],
+        "tp1": res["tp1"],
+        "tp2": res["tp2"],
+        "tp3": res["tp3"],
+        "support": res.get("support", 0),
+        "resistance": res.get("resistance", 0),
+        "timeframe": res.get("timeframe", MA_KLINE_INTERVAL),
     }
     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0))
     if res["direction"] == "SHORT":
@@ -1240,14 +1338,63 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
         memory["stats"]["ma_long"] = int(memory["stats"].get("ma_long", 0)) + 1
         stats["ma_long_sent"] += 1
     stats["ma_signal_sent"] += 1
-    memory["last_signal_ts"] = time.time()
+    memory["last_signal_ts"] = sent_ts
 
+
+
+
+def ma_performance_summary() -> Dict[str, Any]:
+    stats_mem = memory.setdefault("stats", {})
+    long_sent = int(stats_mem.get("ma_long", 0))
+    short_sent = int(stats_mem.get("ma_short", 0))
+
+    long_tp = 0
+    long_stop = 0
+    short_tp = 0
+    short_stop = 0
+
+    follows = memory.get("ma_follows", {})
+    if isinstance(follows, dict):
+        for rec in follows.values():
+            if not isinstance(rec, dict) or not rec.get("done"):
+                continue
+            direction = str(rec.get("direction", "")).upper()
+            result = str(rec.get("result", "")).upper()
+            if direction == "LONG":
+                if result.startswith("TP"):
+                    long_tp += 1
+                elif result == "STOP":
+                    long_stop += 1
+            elif direction == "SHORT":
+                if result.startswith("TP"):
+                    short_tp += 1
+                elif result == "STOP":
+                    short_stop += 1
+
+    long_resolved = long_tp + long_stop
+    short_resolved = short_tp + short_stop
+    long_success = (long_tp / long_resolved * 100.0) if long_resolved > 0 else 0.0
+    short_success = (short_tp / short_resolved * 100.0) if short_resolved > 0 else 0.0
+
+    return {
+        "long_sent": long_sent,
+        "short_sent": short_sent,
+        "long_tp": long_tp,
+        "long_stop": long_stop,
+        "short_tp": short_tp,
+        "short_stop": short_stop,
+        "long_resolved": long_resolved,
+        "short_resolved": short_resolved,
+        "long_success": long_success,
+        "short_success": short_success,
+    }
 
 def build_ma_signal_message(res: Dict[str, Any]) -> str:
     return (
         f"🚨 {VERSION_NAME} - MA7/MA25 {res['timeframe']} - {res['direction']} AL\n"
         f"Saat: {tr_str()}\n"
         f"Coin: {res['symbol']}\n"
+        f"Motor: {res['direction']} MOTORU\n"
         f"Zaman dilimi: 1 saat\n"
         f"Kural: MA7 / MA25 temas-kesişim\n"
         f"{res['entry_note']}\n"
@@ -1256,6 +1403,9 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Mum tepe: {fmt_num(res['candle_high'])}\n"
         f"Mum dip: {fmt_num(res['candle_low'])}\n"
         f"Güncel: {fmt_num(res['last_price'])}\n"
+        f"Dip/tepe farkı: %{safe_float(res.get('entry_diff_pct', 0)):.2f} / max %{safe_float(res.get('max_entry_diff_pct', MA_ENTRY_MAX_DIFF_PCT)):.2f}\n"
+        f"Destek: {fmt_num(safe_float(res.get('support', 0)))} | fark %{safe_float(res.get('support_diff_pct', 0)):.2f}\n"
+        f"Direnç: {fmt_num(safe_float(res.get('resistance', 0)))} | fark %{safe_float(res.get('resistance_diff_pct', 0)):.2f}\n"
         f"Entry: {fmt_num(res['entry'])}\n"
         f"Stop: {fmt_num(res['stop'])} (%0.80)\n"
         f"TP1: {fmt_num(res['tp1'])} (%1.5)\n"
@@ -1272,6 +1422,143 @@ async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
         mark_ma_sent(res)
         save_memory()
         logger.info("MA7/MA25 sinyal gönderildi: %s %s", res["symbol"], res["direction"])
+
+
+def detect_ma_followup_result(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> Optional[Dict[str, Any]]:
+    direction = str(rec.get("direction", "")).upper()
+    sent_ts = safe_float(rec.get("sent_ts", 0))
+    entry = safe_float(rec.get("entry", 0))
+    stop = safe_float(rec.get("stop", 0))
+    tp1 = safe_float(rec.get("tp1", 0))
+    tp2 = safe_float(rec.get("tp2", 0))
+    tp3 = safe_float(rec.get("tp3", 0))
+    if direction not in ("LONG", "SHORT") or entry <= 0 or stop <= 0 or tp1 <= 0:
+        return None
+
+    start_ms = max(0.0, (sent_ts - 60.0) * 1000.0)
+    for row in klines_1m:
+        row_ts = safe_float(row[0])
+        if row_ts < start_ms:
+            continue
+        high = safe_float(row[2])
+        low = safe_float(row[3])
+        if high <= 0 or low <= 0:
+            continue
+
+        hit_stop = False
+        hit_tp = ""
+        hit_price = 0.0
+
+        if direction == "LONG":
+            hit_stop = low <= stop
+            if high >= tp3:
+                hit_tp = "TP3"
+                hit_price = tp3
+            elif high >= tp2:
+                hit_tp = "TP2"
+                hit_price = tp2
+            elif high >= tp1:
+                hit_tp = "TP1"
+                hit_price = tp1
+        else:
+            hit_stop = high >= stop
+            if low <= tp3:
+                hit_tp = "TP3"
+                hit_price = tp3
+            elif low <= tp2:
+                hit_tp = "TP2"
+                hit_price = tp2
+            elif low <= tp1:
+                hit_tp = "TP1"
+                hit_price = tp1
+
+        if hit_stop and hit_tp:
+            return {
+                "result": "AYNI_1M_MUMDA_STOP_TP",
+                "level": hit_tp,
+                "price": hit_price,
+                "stop": stop,
+                "touch_ts": row_ts / 1000.0,
+            }
+        if hit_tp:
+            return {"result": hit_tp, "level": hit_tp, "price": hit_price, "touch_ts": row_ts / 1000.0}
+        if hit_stop:
+            return {"result": "STOP", "level": "STOP", "price": stop, "touch_ts": row_ts / 1000.0}
+
+    return None
+
+
+def build_ma_followup_message(rec: Dict[str, Any], hit: Dict[str, Any]) -> str:
+    direction = str(rec.get("direction", ""))
+    entry = safe_float(rec.get("entry", 0))
+    result = str(hit.get("result", ""))
+    result_price = safe_float(hit.get("price", 0))
+    if result == "STOP":
+        pnl_pct = pct_change(entry, result_price)
+        if direction == "SHORT":
+            pnl_pct *= -1
+        title = "❌ STOP GELDİ"
+    elif result == "AYNI_1M_MUMDA_STOP_TP":
+        pnl_pct = pct_change(entry, result_price)
+        if direction == "SHORT":
+            pnl_pct *= -1
+        title = f"⚠️ AYNI 1M MUMDA STOP VE {hit.get('level', 'TP')} TEMASI"
+    else:
+        pnl_pct = pct_change(entry, result_price)
+        if direction == "SHORT":
+            pnl_pct *= -1
+        title = f"✅ {result} GELDİ"
+
+    return (
+        f"⏱ MA7/MA25 TP/STOP TAKİP\n"
+        f"{title}\n"
+        f"Saat: {tr_str()} | İlk temas: {tr_str(safe_float(hit.get('touch_ts', 0)))}\n"
+        f"Coin: {rec.get('symbol')}\n"
+        f"Yön: {direction}\n"
+        f"Entry: {fmt_num(entry)}\n"
+        f"Sonuç fiyatı: {fmt_num(result_price)}\n"
+        f"Stop: {fmt_num(safe_float(rec.get('stop', 0)))}\n"
+        f"TP1: {fmt_num(safe_float(rec.get('tp1', 0)))}\n"
+        f"TP2: {fmt_num(safe_float(rec.get('tp2', 0)))}\n"
+        f"TP3: {fmt_num(safe_float(rec.get('tp3', 0)))}\n"
+        f"Destek: {fmt_num(safe_float(rec.get('support', 0)))}\n"
+        f"Direnç: {fmt_num(safe_float(rec.get('resistance', 0)))}\n"
+        f"Sonuç: {result}\n"
+        f"Fiyat hareketi: %{pnl_pct:.2f}"
+    )
+
+
+async def check_ma_followups() -> None:
+    if not MA_FOLLOWUP_ENABLED:
+        return
+    follows = memory.get("ma_follows", {})
+    if not follows:
+        return
+
+    for key, rec in list(follows.items()):
+        if rec.get("done"):
+            continue
+        symbol = str(rec.get("symbol", ""))
+        if not symbol:
+            continue
+        k1m = await get_klines(symbol, "1m", 300)
+        if not k1m:
+            continue
+        hit = detect_ma_followup_result(rec, k1m)
+        if not hit:
+            continue
+        ok = await safe_send_telegram(build_ma_followup_message(rec, hit))
+        if ok:
+            rec["done"] = True
+            rec["result"] = hit.get("result")
+            rec["result_price"] = hit.get("price")
+            rec["touch_ts"] = hit.get("touch_ts")
+            memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
+            if str(hit.get("result")) == "STOP":
+                memory["stats"]["ma_stop"] = int(memory["stats"].get("ma_stop", 0)) + 1
+            elif str(hit.get("result")).startswith("TP"):
+                memory["stats"]["ma_tp"] = int(memory["stats"].get("ma_tp", 0)) + 1
+            save_memory()
 
 # =========================================================
 # MEMORY / COOLDOWN
@@ -1462,11 +1749,14 @@ def build_heartbeat_message() -> str:
     hot_count = len(memory.get("hot", {}))
     last_sig = safe_float(memory.get("last_signal_ts", 0))
     last_sig_txt = tr_str(last_sig) if last_sig else "Yok"
+    ma_perf = ma_performance_summary()
     return (
         f"💓 {VERSION_NAME} DURUM\n"
         f"Saat: {tr_str()}\n"
         f"Toplam coin: {len(COINS)} / hedef {MA_COIN_LIMIT}\n"
-        f"MA motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'} | LONG={memory.get('stats', {}).get('ma_long', 0)} | SHORT={memory.get('stats', {}).get('ma_short', 0)}\n"
+        f"MA motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
+        f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
+        f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"Sıcak coin: {hot_count}\n"
         f"Bloklu coin: {get_blocked_symbol_count()}\n"
         f"Çıkarılan coin: {stats['okx_symbol_pruned']}\n"
@@ -1740,23 +2030,57 @@ async def deep_scan_loop() -> None:
 
 
 
-async def ma_scan_loop() -> None:
-    if not MA_ENGINE_ENABLED:
+async def ma_long_scan_loop() -> None:
+    if not MA_ENGINE_ENABLED or not MA_LONG_ENGINE_ENABLED:
         return
     while True:
         try:
             if not COINS:
                 await refresh_coin_pool(force=True)
             for sym in list(COINS)[:MA_COIN_LIMIT]:
-                res = await analyze_ma_symbol(sym)
+                res = await analyze_ma_long_symbol(sym)
                 stats["ma_analyzed"] += 1
                 memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
                 if not res:
                     continue
                 await maybe_send_ma_signal(res)
         except Exception as e:
-            logger.exception("ma_scan_loop hata: %s", e)
+            logger.exception("ma_long_scan_loop hata: %s", e)
         await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
+
+
+async def ma_short_scan_loop() -> None:
+    if not MA_ENGINE_ENABLED or not MA_SHORT_ENGINE_ENABLED:
+        return
+    while True:
+        try:
+            if not COINS:
+                await refresh_coin_pool(force=True)
+            for sym in list(COINS)[:MA_COIN_LIMIT]:
+                res = await analyze_ma_short_symbol(sym)
+                stats["ma_analyzed"] += 1
+                memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
+                if not res:
+                    continue
+                await maybe_send_ma_signal(res)
+        except Exception as e:
+            logger.exception("ma_short_scan_loop hata: %s", e)
+        await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
+
+
+async def ma_followup_loop() -> None:
+    if not MA_FOLLOWUP_ENABLED:
+        return
+    while True:
+        try:
+            await check_ma_followups()
+        except Exception as e:
+            logger.exception("ma_followup_loop hata: %s", e)
+        await asyncio.sleep(max(10, MA_FOLLOWUP_INTERVAL_SEC))
+
+
+async def ma_scan_loop() -> None:
+    return
 
 
 async def heartbeat_loop() -> None:
@@ -1901,17 +2225,20 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ma_perf = ma_performance_summary()
     await update.message.reply_text(
         f"💓 MA7/MA25 1H 200 COIN DURUM\n"
         f"Saat: {tr_str()}\n"
         f"Motor: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
+        f"LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
+        f"TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
         f"Coin: {len(COINS)} / {MA_COIN_LIMIT}\n"
         f"Kural: MA7 altına MA25 = SHORT | MA7 üstüne MA25 = LONG\n"
-        f"Entry: SHORT mum tepe | LONG mum dip\n"
+        f"Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
         f"Stop: %0.80\n"
         f"TP1/TP2/TP3: %1.5 / %2 / %2.5\n"
-        f"LONG sinyal: {memory.get('stats', {}).get('ma_long', 0)}\n"
-        f"SHORT sinyal: {memory.get('stats', {}).get('ma_short', 0)}\n"
+        f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
+        f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"MA analiz: {memory.get('stats', {}).get('ma_analyzed', 0)}"
     )
 
@@ -1931,7 +2258,9 @@ async def post_init(application) -> None:
             f"Veri kaynağı: OKX {OKX_INST_TYPE}\n"
             f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA7/MA25 1H\n"
             f"MA7/MA25: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'} | hedef coin={MA_COIN_LIMIT}\n"
-            f"MA Entry: SHORT mum tepe | LONG mum dip\n"
+            f"MA LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | MA SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
+            f"MA TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
+            f"MA Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
             f"MA Stop/TP: stop %0.80 | TP1 %1.5 | TP2 %2 | TP3 %2.5\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
@@ -1940,7 +2269,9 @@ async def post_init(application) -> None:
     asyncio.create_task(hot_scan_loop())
     asyncio.create_task(deep_scan_loop())
     asyncio.create_task(symbol_refresh_loop())
-    asyncio.create_task(ma_scan_loop())
+    asyncio.create_task(ma_long_scan_loop())
+    asyncio.create_task(ma_short_scan_loop())
+    asyncio.create_task(ma_followup_loop())
     asyncio.create_task(heartbeat_loop())
     asyncio.create_task(diagnostic_loop())
     asyncio.create_task(followup_loop())
