@@ -93,6 +93,10 @@ MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.015"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.020"))
 MA_TP3_PCT = float(os.getenv("MA_TP3_PCT", "0.025"))
 MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
+SHORT_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MAX_RESISTANCE_DIFF_PCT", "0.30"))
+SHORT_MIN_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MIN_SUPPORT_DIFF_PCT", "1.00"))
+LONG_MAX_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MAX_SUPPORT_DIFF_PCT", "0.30"))
+LONG_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MIN_RESISTANCE_DIFF_PCT", "1.00"))
 MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
 MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
 MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOKBACK", "50")))
@@ -104,11 +108,11 @@ RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 # Buyuk / bilindik coinler silinmis liste
 DEFAULT_COINS = [
-  "FET-USDT-SWAP", "INJ-USDT-SWAP",
+    "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
     "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
     "ENA-USDT-SWAP", "PENDLE-USDT-SWAP", "TAO-USDT-SWAP", "WLD-USDT-SWAP", "RENDER-USDT-SWAP",
     "RAY-USDT-SWAP", "STX-USDT-SWAP", "RNDR-USDT-SWAP", "MANTA-USDT-SWAP", "GALA-USDT-SWAP",
-    "SAND-USDT-SWAP", "HBAR-USDT-SWAP", "KAS-USDT-SWAP", "CRV-USDT-SWAP",
+    "SAND-USDT-SWAP", "AR-USDT-SWAP", "HBAR-USDT-SWAP", "KAS-USDT-SWAP", "CRV-USDT-SWAP",
     "DYDX-USDT-SWAP", "GMT-USDT-SWAP", "ZIL-USDT-SWAP", "ZRX-USDT-SWAP", "API3-USDT-SWAP",
     "BLUR-USDT-SWAP", "ACH-USDT-SWAP", "PEOPLE-USDT-SWAP", "LDO-USDT-SWAP", "ARKM-USDT-SWAP",
     "MEME-USDT-SWAP", "NFP-USDT-SWAP", "STRK-USDT-SWAP", "PORTAL-USDT-SWAP", "ALT-USDT-SWAP",
@@ -1228,6 +1232,19 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
 
     targets = calc_ma_targets(entry, direction)
     sr = calc_support_resistance(k1h, entry)
+
+    if direction == "SHORT":
+        if safe_float(sr.get("resistance_diff_pct", 0)) > SHORT_MAX_RESISTANCE_DIFF_PCT:
+            return None
+        if safe_float(sr.get("support_diff_pct", 0)) < SHORT_MIN_SUPPORT_DIFF_PCT:
+            return None
+
+    if direction == "LONG":
+        if safe_float(sr.get("support_diff_pct", 0)) > LONG_MAX_SUPPORT_DIFF_PCT:
+            return None
+        if safe_float(sr.get("resistance_diff_pct", 0)) < LONG_MIN_RESISTANCE_DIFF_PCT:
+            return None
+
     return {
         "symbol": symbol,
         "direction": direction,
@@ -1242,6 +1259,10 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         "resistance": sr["resistance"],
         "support_diff_pct": sr["support_diff_pct"],
         "resistance_diff_pct": sr["resistance_diff_pct"],
+        "short_max_resistance_diff_pct": SHORT_MAX_RESISTANCE_DIFF_PCT,
+        "short_min_support_diff_pct": SHORT_MIN_SUPPORT_DIFF_PCT,
+        "long_max_support_diff_pct": LONG_MAX_SUPPORT_DIFF_PCT,
+        "long_min_resistance_diff_pct": LONG_MIN_RESISTANCE_DIFF_PCT,
         "stop": targets["stop"],
         "tp1": targets["tp1"],
         "tp2": targets["tp2"],
@@ -1406,6 +1427,8 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Dip/tepe farkı: %{safe_float(res.get('entry_diff_pct', 0)):.2f} / max %{safe_float(res.get('max_entry_diff_pct', MA_ENTRY_MAX_DIFF_PCT)):.2f}\n"
         f"Destek: {fmt_num(safe_float(res.get('support', 0)))} | fark %{safe_float(res.get('support_diff_pct', 0)):.2f}\n"
         f"Direnç: {fmt_num(safe_float(res.get('resistance', 0)))} | fark %{safe_float(res.get('resistance_diff_pct', 0)):.2f}\n"
+        f"SHORT S/R: direnç max %{SHORT_MAX_RESISTANCE_DIFF_PCT:.2f} | destek min %{SHORT_MIN_SUPPORT_DIFF_PCT:.2f}\n"
+        f"LONG S/R: destek max %{LONG_MAX_SUPPORT_DIFF_PCT:.2f} | direnç min %{LONG_MIN_RESISTANCE_DIFF_PCT:.2f}\n"
         f"Entry: {fmt_num(res['entry'])}\n"
         f"Stop: {fmt_num(res['stop'])} (%0.80)\n"
         f"TP1: {fmt_num(res['tp1'])} (%1.5)\n"
@@ -2235,6 +2258,8 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Coin: {len(COINS)} / {MA_COIN_LIMIT}\n"
         f"Kural: MA7 altına MA25 = SHORT | MA7 üstüne MA25 = LONG\n"
         f"Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
+        f"SHORT S/R: direnç max %{SHORT_MAX_RESISTANCE_DIFF_PCT:.2f} | destek min %{SHORT_MIN_SUPPORT_DIFF_PCT:.2f}\n"
+        f"LONG S/R: destek max %{LONG_MAX_SUPPORT_DIFF_PCT:.2f} | direnç min %{LONG_MIN_RESISTANCE_DIFF_PCT:.2f}\n"
         f"Stop: %0.80\n"
         f"TP1/TP2/TP3: %1.5 / %2 / %2.5\n"
         f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
