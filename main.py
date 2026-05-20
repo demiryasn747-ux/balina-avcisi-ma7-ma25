@@ -21,7 +21,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # - Ana analiz mantigina minimum dokunmak
 # =========================================================
 
-VERSION_NAME = "Balina Avcısı V5.2.7 HİBRİT ONAYLI + MA7/MA25 1H 200 COIN BİRLEŞİK"
+VERSION_NAME = "Balina Avcısı V5.2.7 HİBRİT ONAYLI + MA7/MA25 15M SİNYAL + 1H YÖN 200 COIN"
 
 # -------------------------
 # ENV / AYARLAR
@@ -88,6 +88,9 @@ MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "60"))
 MA_KLINE_INTERVAL = os.getenv("MA_KLINE_INTERVAL", "1H").strip()
+MA_SIGNAL_INTERVAL = os.getenv("MA_SIGNAL_INTERVAL", "3m").strip()
+MA_CONFIRM_INTERVAL = os.getenv("MA_CONFIRM_INTERVAL", "15m").strip()
+MA_TREND_INTERVAL = os.getenv("MA_TREND_INTERVAL", "1H").strip()
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.008"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.015"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.020"))
@@ -108,7 +111,7 @@ RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 # Buyuk / bilindik coinler silinmis liste
 DEFAULT_COINS = [
-     "INJ-USDT-SWAP",
+    "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
     "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
     "ENA-USDT-SWAP", "PENDLE-USDT-SWAP", "TAO-USDT-SWAP", "WLD-USDT-SWAP", "RENDER-USDT-SWAP",
     "RAY-USDT-SWAP", "STX-USDT-SWAP", "RNDR-USDT-SWAP", "MANTA-USDT-SWAP", "GALA-USDT-SWAP",
@@ -1131,7 +1134,7 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
 
 
 # =========================================================
-# MA7 / MA25 1H 200 COIN MOTORU
+# MA7 / MA25 3M SİNYAL + 15M/1H YÖN 200 COIN MOTORU
 # =========================================================
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
@@ -1186,13 +1189,47 @@ def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int
     }
 
 
-def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: List[float], ma25: List[float]) -> Optional[Dict[str, Any]]:
-    prev_ma7 = ma7[-2]
-    prev_ma25 = ma25[-2]
-    cur_ma7 = ma7[-1]
-    cur_ma25 = ma25[-1]
+def _direction_ok_for_timeframe(direction: str, klines: List[List[Any]], ma7_values: List[float]) -> bool:
+    # Yön filtresi: burada MA7'nin MA25 üstünde/altında olması şart değildir.
+    # LONG için o zaman diliminde fiyat ve MA7 yukarı eğimli olmalı.
+    # SHORT için o zaman diliminde fiyat ve MA7 aşağı eğimli olmalı.
+    if len(klines) < 3 or len(ma7_values) < 3:
+        return False
+    prev_close = safe_float(klines[-2][4])
+    cur_close = safe_float(klines[-1][4])
+    prev_ma7 = safe_float(ma7_values[-2])
+    cur_ma7 = safe_float(ma7_values[-1])
+    if prev_close <= 0 or cur_close <= 0 or prev_ma7 <= 0 or cur_ma7 <= 0:
+        return False
+    if direction == "LONG":
+        return cur_close > prev_close and cur_ma7 >= prev_ma7
+    if direction == "SHORT":
+        return cur_close < prev_close and cur_ma7 <= prev_ma7
+    return False
 
-    last_candle = k1h[-1]
+
+def _build_ma_result(
+    symbol: str,
+    direction: str,
+    signal_klines: List[List[Any]],
+    signal_ma7: List[float],
+    signal_ma25: List[float],
+    confirm_klines: List[List[Any]],
+    confirm_ma7: List[float],
+    trend_klines: List[List[Any]],
+    trend_ma7: List[float],
+) -> Optional[Dict[str, Any]]:
+    prev_ma7 = signal_ma7[-2]
+    prev_ma25 = signal_ma25[-2]
+    cur_ma7 = signal_ma7[-1]
+    cur_ma25 = signal_ma25[-1]
+
+    confirm_cur_ma7 = confirm_ma7[-1]
+    trend_cur_ma7 = trend_ma7[-1]
+    confirm_cur_close = safe_float(confirm_klines[-1][4])
+    trend_cur_close = safe_float(trend_klines[-1][4])
+
+    last_candle = signal_klines[-1]
     candle_ts = str(last_candle[0])
     candle_open = safe_float(last_candle[1])
     candle_high = safe_float(last_candle[2])
@@ -1204,7 +1241,13 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     entry_diff_pct = 0.0
 
     if direction == "SHORT":
-        if not (prev_ma7 >= prev_ma25 and cur_ma7 <= cur_ma25):
+        # 3 dakikalık MA7, MA25 altında olacak.
+        # 15 dakikalık ve 1 saatlik yön aşağı olacak. MA7'nin MA25 altında olması şart değildir.
+        if not (cur_ma7 <= cur_ma25):
+            return None
+        if not _direction_ok_for_timeframe("SHORT", confirm_klines, confirm_ma7):
+            return None
+        if not _direction_ok_for_timeframe("SHORT", trend_klines, trend_ma7):
             return None
         if candle_high <= 0 or last_price <= 0:
             return None
@@ -1212,10 +1255,16 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = f"SHORT giriş: güncel fiyat 1 saatlik mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
+        entry_note = f"SHORT giriş: 3m MA7, MA25 altında + güncel fiyat 3 dakikalık mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
 
     elif direction == "LONG":
-        if not (prev_ma7 <= prev_ma25 and cur_ma7 >= cur_ma25):
+        # 3 dakikalık MA7, MA25 üstünde olacak.
+        # 15 dakikalık ve 1 saatlik yön yukarı olacak. MA7'nin MA25 üstünde olması şart değildir.
+        if not (cur_ma7 >= cur_ma25):
+            return None
+        if not _direction_ok_for_timeframe("LONG", confirm_klines, confirm_ma7):
+            return None
+        if not _direction_ok_for_timeframe("LONG", trend_klines, trend_ma7):
             return None
         if candle_low <= 0 or last_price <= 0:
             return None
@@ -1223,7 +1272,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = f"LONG giriş: güncel fiyat 1 saatlik mum dibine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
+        entry_note = f"LONG giriş: 3m MA7, MA25 üstünde + güncel fiyat 3 dakikalık mum dibine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
     else:
         return None
 
@@ -1231,7 +1280,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         return None
 
     targets = calc_ma_targets(entry, direction)
-    sr = calc_support_resistance(k1h, entry)
+    sr = calc_support_resistance(signal_klines, entry)
 
     if direction == "SHORT":
         if safe_float(sr.get("resistance_diff_pct", 0)) > SHORT_MAX_RESISTANCE_DIFF_PCT:
@@ -1244,6 +1293,8 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
         if safe_float(sr.get("resistance_diff_pct", 0)) < LONG_MIN_RESISTANCE_DIFF_PCT:
             return None
+
+    trend_text = "15m + 1H YÖN AŞAĞI" if direction == "SHORT" else "15m + 1H YÖN YUKARI"
 
     return {
         "symbol": symbol,
@@ -1271,51 +1322,68 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         "ma25": cur_ma25,
         "prev_ma7": prev_ma7,
         "prev_ma25": prev_ma25,
+        "confirm_ma7": confirm_cur_ma7,
+        "confirm_close": confirm_cur_close,
+        "trend_ma7": trend_cur_ma7,
+        "trend_close": trend_cur_close,
+        "trend_text": trend_text,
         "candle_ts": candle_ts,
-        "timeframe": MA_KLINE_INTERVAL,
+        "timeframe": MA_SIGNAL_INTERVAL,
+        "confirm_timeframe": MA_CONFIRM_INTERVAL,
+        "trend_timeframe": MA_TREND_INTERVAL,
         "entry_note": entry_note,
     }
 
 
-async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], List[float], List[float]]]:
+async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], List[float], List[float], List[List[Any]], List[float], List[List[Any]], List[float]]]:
     symbol = normalize_symbol(symbol)
-    k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 80)
-    if len(k1h) < 30:
+    signal_klines = await get_klines(symbol, MA_SIGNAL_INTERVAL, 80)
+    confirm_klines = await get_klines(symbol, MA_CONFIRM_INTERVAL, 80)
+    trend_klines = await get_klines(symbol, MA_TREND_INTERVAL, 80)
+    if len(signal_klines) < 30 or len(confirm_klines) < 30 or len(trend_klines) < 30:
         return None
 
-    c = closes(k1h)
-    ma7 = sma(c, 7)
-    ma25 = sma(c, 25)
-    if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
+    signal_c = closes(signal_klines)
+    confirm_c = closes(confirm_klines)
+    trend_c = closes(trend_klines)
+
+    signal_ma7 = sma(signal_c, 7)
+    signal_ma25 = sma(signal_c, 25)
+    confirm_ma7 = sma(confirm_c, 7)
+    trend_ma7 = sma(trend_c, 7)
+
+    if signal_ma7[-1] <= 0 or signal_ma25[-1] <= 0:
         return None
-    return symbol, k1h, ma7, ma25
+    if confirm_ma7[-1] <= 0 or trend_ma7[-1] <= 0:
+        return None
+    return symbol, signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7
 
 
 async def analyze_ma_long_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
     if not prepared:
         return None
-    sym, k1h, ma7, ma25 = prepared
-    return _build_ma_result(sym, "LONG", k1h, ma7, ma25)
+    sym, signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7 = prepared
+    return _build_ma_result(sym, "LONG", signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7)
 
 
 async def analyze_ma_short_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
     if not prepared:
         return None
-    sym, k1h, ma7, ma25 = prepared
-    return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
+    sym, signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7 = prepared
+    return _build_ma_result(sym, "SHORT", signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7)
 
 
 async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
     if not prepared:
         return None
-    sym, k1h, ma7, ma25 = prepared
-    long_res = _build_ma_result(sym, "LONG", k1h, ma7, ma25)
+    sym, signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7 = prepared
+    long_res = _build_ma_result(sym, "LONG", signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7)
     if long_res:
         return long_res
-    return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
+    return _build_ma_result(sym, "SHORT", signal_klines, signal_ma7, signal_ma25, confirm_klines, confirm_ma7, trend_klines, trend_ma7)
 
 
 def ma_signal_key(res: Dict[str, Any]) -> str:
@@ -1349,7 +1417,7 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
         "tp3": res["tp3"],
         "support": res.get("support", 0),
         "resistance": res.get("resistance", 0),
-        "timeframe": res.get("timeframe", MA_KLINE_INTERVAL),
+        "timeframe": res.get("timeframe", MA_SIGNAL_INTERVAL),
     }
     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0))
     if res["direction"] == "SHORT":
@@ -1412,15 +1480,21 @@ def ma_performance_summary() -> Dict[str, Any]:
 
 def build_ma_signal_message(res: Dict[str, Any]) -> str:
     return (
-        f"🚨 {VERSION_NAME} - MA7/MA25 {res['timeframe']} - {res['direction']} AL\n"
+        f"🚨 {VERSION_NAME} - MA7/MA25 {res['timeframe']} + {res.get('trend_timeframe', MA_TREND_INTERVAL)} YÖN - {res['direction']} AL\n"
         f"Saat: {tr_str()}\n"
         f"Coin: {res['symbol']}\n"
         f"Motor: {res['direction']} MOTORU\n"
-        f"Zaman dilimi: 1 saat\n"
-        f"Kural: MA7 / MA25 temas-kesişim\n"
+        f"Sinyal veri: {res['timeframe']} | Yön filtre: {res.get('trend_timeframe', MA_TREND_INTERVAL)}\n"
+        f"Kural: 3m MA7/MA25 durumu + 15m/1H yön filtresi\n"
         f"{res['entry_note']}\n"
-        f"MA7: {fmt_num(res['ma7'])}\n"
-        f"MA25: {fmt_num(res['ma25'])}\n"
+        f"3m MA7: {fmt_num(res['ma7'])}\n"
+        f"3m MA25: {fmt_num(res['ma25'])}\n"
+        f"15m yön MA7: {fmt_num(safe_float(res.get('confirm_ma7', 0)))} | 15m fiyat: {fmt_num(safe_float(res.get('confirm_close', 0)))}\n"
+        f"1H yön MA7: {fmt_num(safe_float(res.get('trend_ma7', 0)))} | 1H fiyat: {fmt_num(safe_float(res.get('trend_close', 0)))}\n"
+        f"Yön filtresi: {res.get('trend_text', '-')}\n"
+        f"1H MA7: {fmt_num(safe_float(res.get('trend_ma7', 0)))}\n"
+        f"1H MA25: {fmt_num(safe_float(res.get('trend_ma25', 0)))}\n"
+        f"Yön filtresi: {res.get('trend_text', '-')}\n"
         f"Mum tepe: {fmt_num(res['candle_high'])}\n"
         f"Mum dip: {fmt_num(res['candle_low'])}\n"
         f"Güncel: {fmt_num(res['last_price'])}\n"
@@ -2162,8 +2236,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/scan - kısa özet tarama\n"
         "/coin BTCUSDT - tek coin analiz\n"
         "/hot - sıcak coinler\n"
-        "/ma BTCUSDT - MA7/MA25 1H tek coin\n"
-        "/ma_status - MA7/MA25 motor durumu\n"
+        "/ma BTCUSDT - MA7/MA25 15m tek coin\n"
+        "/ma_status - MA7/MA25 3m sinyal + 15m/1H yön motor durumu\n"
         "Not: Veri OKX SWAP, işlem teyidi Binance tarafında."
     )
 
@@ -2244,20 +2318,23 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if res:
         await update.message.reply_text(build_ma_signal_message(res))
     else:
-        await update.message.reply_text(f"{symbol} için şu an 1 saatlik MA7/MA25 temas-kesişim yok.")
+        await update.message.reply_text(f"{symbol} için şu an 3m MA7/MA25 durumu + 15m/1H yön şartı yok.")
 
 
 async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ma_perf = ma_performance_summary()
     await update.message.reply_text(
-        f"💓 MA7/MA25 1H 200 COIN DURUM\n"
+        f"💓 MA7/MA25 3M SİNYAL + 15M/1H YÖN 200 COIN DURUM\n"
         f"Saat: {tr_str()}\n"
         f"Motor: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
         f"LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
         f"TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
         f"Coin: {len(COINS)} / {MA_COIN_LIMIT}\n"
-        f"Kural: MA7 altına MA25 = SHORT | MA7 üstüne MA25 = LONG\n"
-        f"Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
+        f"Kural: 3m MA7<MA25 = SHORT | 3m MA7>MA25 = LONG\n"
+        f"Yön: 15m ve 1H yukarıysa LONG | 15m ve 1H aşağıysa SHORT\n"
+        f"Not: 15m/1H yön filtresinde MA7'nin MA25 üstünde/altında olması şart değil\n"
+        f"Veri: sinyal={MA_SIGNAL_INTERVAL} | yön={MA_CONFIRM_INTERVAL}+{MA_TREND_INTERVAL}\n"
+        f"Entry: SHORT 3m tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG 3m dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
         f"SHORT S/R: direnç max %{SHORT_MAX_RESISTANCE_DIFF_PCT:.2f} | destek min %{SHORT_MIN_SUPPORT_DIFF_PCT:.2f}\n"
         f"LONG S/R: destek max %{LONG_MAX_SUPPORT_DIFF_PCT:.2f} | direnç min %{LONG_MIN_RESISTANCE_DIFF_PCT:.2f}\n"
         f"Stop: %0.80\n"
@@ -2281,11 +2358,12 @@ async def post_init(application) -> None:
             f"Coin sayısı: {active_count}\n"
             f"Çıkarılan coin: {pruned_count}\n"
             f"Veri kaynağı: OKX {OKX_INST_TYPE}\n"
-            f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA7/MA25 1H\n"
+            f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA7/MA25 3M + 15M/1H yön\n"
             f"MA7/MA25: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'} | hedef coin={MA_COIN_LIMIT}\n"
             f"MA LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | MA SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
             f"MA TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
-            f"MA Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
+            f"MA veri: sinyal={MA_SIGNAL_INTERVAL} | yön={MA_CONFIRM_INTERVAL}+{MA_TREND_INTERVAL}\n"
+            f"MA Entry: SHORT 3m tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG 3m dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
             f"MA Stop/TP: stop %0.80 | TP1 %1.5 | TP2 %2 | TP3 %2.5\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
