@@ -21,7 +21,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # - Ana analiz mantigina minimum dokunmak
 # =========================================================
 
-VERSION_NAME = "Balina Avcısı V5.2.7 HİBRİT ONAYLI + MA7/MA25 15M SİNYAL + 1H YÖN 200 COIN"
+VERSION_NAME = "Balina Avcısı V5.2.7 HİBRİT ONAYLI + MA7/MA25 3M SİNYAL + 15M/1H YÖN 200 COIN"
+CODE_ID = "MA3M_15M_1H_YON_FIX_V2"
 
 # -------------------------
 # ENV / AYARLAR
@@ -140,6 +141,9 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("balina_avcisi_v527_hibrit_onayli")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
 # -------------------------
 # GLOBAL STATE
@@ -1850,6 +1854,8 @@ def build_heartbeat_message() -> str:
     return (
         f"💓 {VERSION_NAME} DURUM\n"
         f"Saat: {tr_str()}\n"
+        f"Kod ID: {CODE_ID}\n"
+        f"MA veri: sinyal={MA_SIGNAL_INTERVAL} | yön={MA_CONFIRM_INTERVAL}+{MA_TREND_INTERVAL}\n"
         f"Toplam coin: {len(COINS)} / hedef {MA_COIN_LIMIT}\n"
         f"MA motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
         f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
@@ -2230,6 +2236,8 @@ async def save_loop() -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
+        f"Kod ID: {CODE_ID}\n"
+        f"MA veri: sinyal={MA_SIGNAL_INTERVAL} | yön={MA_CONFIRM_INTERVAL}+{MA_TREND_INTERVAL}\n"
         "Komutlar:\n"
         "/status - durum\n"
         "/test - test mesajı\n"
@@ -2326,6 +2334,7 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         f"💓 MA7/MA25 3M SİNYAL + 15M/1H YÖN 200 COIN DURUM\n"
         f"Saat: {tr_str()}\n"
+        f"Kod ID: {CODE_ID}\n"
         f"Motor: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
         f"LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
         f"TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
@@ -2392,6 +2401,18 @@ def validate_config() -> None:
         raise RuntimeError(f"Eksik env: {', '.join(missing)}")
 
 
+
+async def cmd_versiyon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"✅ AKTİF KOD\n"
+        f"Version: {VERSION_NAME}\n"
+        f"Kod ID: {CODE_ID}\n"
+        f"Dosya: main.py\n"
+        f"Sinyal veri: {MA_SIGNAL_INTERVAL}\n"
+        f"Yön filtre: {MA_CONFIRM_INTERVAL}+{MA_TREND_INTERVAL}\n"
+        f"Saat: {tr_str()}"
+    )
+
 def build_app():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", cmd_start))
@@ -2402,6 +2423,7 @@ def build_app():
     application.add_handler(CommandHandler("hot", cmd_hot))
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
+    application.add_handler(CommandHandler("versiyon", cmd_versiyon))
     return application
 
 
