@@ -22,7 +22,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # - Ana analiz mantigina minimum dokunmak
 # =========================================================
 
-VERSION_NAME = "Balina Avcısı V5.2.8 FIX (MA sinyal + likidasyon + lock + repaint)"
+VERSION_NAME = "Balina Avcısı V8 PRO MAX (Whale Eye + OI Divergence)"
 
 # -------------------------
 # ENV / AYARLAR
@@ -104,6 +104,24 @@ MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOK
 MA_FOLLOWUP_ENABLED = os.getenv("MA_FOLLOWUP_ENABLED", "true").lower() == "true"
 
 # =========================================================
+# 🐋 WHALE EYE — KURUMSAL OI DIVERGENCE MOTORU
+# Mantık:
+#   • Fiyat ↑ + OI sert ↓  = Balinalar long kapatıyor (top forming) → SHORT için güçlü teyit
+#   • Fiyat ↓ + OI sert ↑  = Yeni shortlar yığılıyor (downtrend confirmed) → SHORT için güçlü teyit
+#   • Her iki uyumsuzlukta da analyze_symbol skoruna +WHALE_DIVERGENCE_BONUS eklenir
+# OI verisi /api/v5/market/open-interest endpointinden çekilir (anlık).
+# Tarihsel veri olmadığı için her scan'de snapshot alıp yerel history'de tutuyoruz.
+# =========================================================
+WHALE_EYE_ENABLED = os.getenv("WHALE_EYE_ENABLED", "true").lower() == "true"
+WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "20")))   # OI değişim penceresi (dk)
+WHALE_OI_CACHE_SEC = int(float(os.getenv("WHALE_OI_CACHE_SEC", "30")))          # OI çağrı cache (sn) - rate limit koruması
+WHALE_OI_HISTORY_MAX = int(float(os.getenv("WHALE_OI_HISTORY_MAX", "180")))     # symbol başına saklanan snapshot
+WHALE_MIN_PRICE_MOVE_PCT = float(os.getenv("WHALE_MIN_PRICE_MOVE_PCT", "0.4"))  # divergence için min fiyat hareketi %
+WHALE_MIN_OI_MOVE_PCT = float(os.getenv("WHALE_MIN_OI_MOVE_PCT", "1.5"))        # divergence için min OI hareketi %
+WHALE_DIVERGENCE_BONUS = float(os.getenv("WHALE_DIVERGENCE_BONUS", "25"))       # Balina Puanı (kullanıcının talebi: +25)
+WHALE_SOFT_BONUS_PCT = float(os.getenv("WHALE_SOFT_BONUS_PCT", "0.4"))           # OI hareketi eşik altıysa ama divergence yönündeyse oran (0.4 = bonusun %40'ı)
+
+# =========================================================
 # YÜKSEK KALDIRAÇ RİSK YÖNETİMİ (20x-30x)
 # =========================================================
 LEVERAGE = float(os.getenv("LEVERAGE", "1"))
@@ -154,7 +172,7 @@ RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 # Buyuk / bilindik coinler silinmis liste
 DEFAULT_COINS = [
-     "INJ-USDT-SWAP",
+    "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
     "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
     "ENA-USDT-SWAP", "PENDLE-USDT-SWAP", "TAO-USDT-SWAP", "WLD-USDT-SWAP", "RENDER-USDT-SWAP",
     "RAY-USDT-SWAP", "STX-USDT-SWAP", "MANTA-USDT-SWAP", "GALA-USDT-SWAP",
@@ -196,6 +214,10 @@ ticker_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 instrument_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 okx_live_symbols: Dict[str, Dict[str, Any]] = {}
 symbol_fail_state: Dict[str, Dict[str, Any]] = {}
+
+# 🐋 WHALE EYE state - in-memory (bot restart'ta warmup gerekli, kasıtlı)
+oi_history: Dict[str, List[Tuple[float, float]]] = {}  # symbol -> [(ts, oi_value), ...]
+oi_cache: Dict[str, Tuple[float, float]] = {}          # symbol -> (fetch_ts, oi_value)
 
 memory: Dict[str, Any] = {
     "hot": {},
@@ -239,6 +261,14 @@ stats: Dict[str, Any] = {
     "ma_long_sent": 0,
     "ma_short_sent": 0,
     "ma_analyzed": 0,
+    # 🐋 WHALE EYE counters
+    "whale_oi_calls": 0,
+    "whale_oi_fail": 0,
+    "whale_divergence_hit": 0,
+    "whale_bearish_divergence": 0,   # Fiyat ↑ + OI ↓
+    "whale_short_pileup": 0,         # Fiyat ↓ + OI ↑
+    "whale_soft_hit": 0,             # Eşik altı ama yönü doğru
+    "whale_warmup_skip": 0,          # History yetersiz
 }
 
 app = None
@@ -402,6 +432,18 @@ def cleanup_memory() -> None:
                 daily_short_sent.pop(day_key, None)
 
     cleanup_symbol_fail_state()
+    cleanup_whale_oi_state()
+
+
+def cleanup_whale_oi_state() -> None:
+    """🐋 OI history'sinden artık takip edilmeyen coinleri temizle"""
+    now_ts = time.time()
+    cutoff = now_ts - (WHALE_OI_LOOKBACK_MIN * 60 * 3)  # 3x lookback'ten eski coin verilerini sil
+    for sym in list(oi_history.keys()):
+        hist = oi_history.get(sym, [])
+        if not hist or hist[-1][0] < cutoff:
+            oi_history.pop(sym, None)
+            oi_cache.pop(sym, None)
 
 
 def note_symbol_fail(symbol: str, reason: str = "") -> None:
@@ -823,6 +865,219 @@ async def confirm_signal_on_binance(res: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =========================================================
+# 🐋 WHALE EYE - OKX OPEN INTEREST DIVERGENCE MOTORU
+# =========================================================
+async def fetch_oi(symbol: str) -> float:
+    """
+    OKX /api/v5/market/open-interest endpointinden anlık OI çek.
+    oiCcy (currency cinsinden) tercih edilir; yoksa oi (kontrat) kullanılır.
+    
+    Cache stratejisi: WHALE_OI_CACHE_SEC saniyede bir gerçek API çağrısı.
+    OKX rate limit: 20 req / 2sec — cache bu pencerede tüm coin'ler için yeter.
+    """
+    symbol = normalize_symbol(symbol)
+
+    # Geçersiz veya geçici bloklu coinler için API'ye gitme
+    if okx_live_symbols and symbol not in okx_live_symbols:
+        return 0.0
+    if symbol_temporarily_blocked(symbol):
+        return 0.0
+
+    cached = oi_cache.get(symbol)
+    now_ts = time.time()
+    if cached and now_ts - cached[0] <= WHALE_OI_CACHE_SEC:
+        return cached[1]
+
+    try:
+        data = await asyncio.to_thread(
+            _okx_get,
+            "/api/v5/market/open-interest",
+            {"instId": symbol, "instType": OKX_INST_TYPE},
+        )
+        stats["whale_oi_calls"] += 1
+        if not data:
+            stats["whale_oi_fail"] += 1
+            return 0.0
+        row = data[0] if isinstance(data, list) else data
+        # oiCcy = currency cinsinden OI (BTC, ETH vb) — coinler arası karşılaştırılabilir
+        # oi = kontrat sayısı (multiplier'a göre değişir)
+        oi_val = safe_float(row.get("oiCcy", 0)) or safe_float(row.get("oi", 0))
+        if oi_val > 0:
+            oi_cache[symbol] = (now_ts, oi_val)
+        return oi_val
+    except Exception as e:
+        stats["whale_oi_fail"] += 1
+        logger.warning("OKX OI alınamadı %s: %s", symbol, e)
+        return 0.0
+
+
+def record_oi_snapshot(symbol: str, oi_val: float) -> None:
+    """OI history'sine snapshot ekle, sliding window yönetimi."""
+    if oi_val <= 0:
+        return
+    now_ts = time.time()
+    hist = oi_history.setdefault(symbol, [])
+
+    # Aynı saniye içinde tekrar ekleme (cache nedeniyle olabilir)
+    if hist and now_ts - hist[-1][0] < 1.0:
+        return
+
+    hist.append((now_ts, oi_val))
+
+    # Sliding window: lookback * 2'den eski kayıtları at + max cap
+    cutoff = now_ts - (WHALE_OI_LOOKBACK_MIN * 60 * 2)
+    if len(hist) > WHALE_OI_HISTORY_MAX or (hist and hist[0][0] < cutoff):
+        new_hist = [(t, v) for t, v in hist if t >= cutoff]
+        if len(new_hist) > WHALE_OI_HISTORY_MAX:
+            new_hist = new_hist[-WHALE_OI_HISTORY_MAX:]
+        oi_history[symbol] = new_hist
+
+
+def calc_oi_change_pct(symbol: str, lookback_sec: float) -> Optional[float]:
+    """
+    Verilen pencere için OI değişim yüzdesi.
+    Return None: history yetersiz (warmup gerekiyor).
+    """
+    hist = oi_history.get(symbol, [])
+    if len(hist) < 2:
+        return None
+    now_ts = time.time()
+    target_ts = now_ts - lookback_sec
+
+    # Hedef zamandaki veya daha eski en yakın snapshot
+    old_entry = None
+    for t, v in hist:
+        if t <= target_ts:
+            old_entry = (t, v)
+        else:
+            break
+
+    if old_entry is None:
+        # Pencerede yeterli geçmiş yok — en eski snapshot'u kullan
+        # ama pencerenin yarısından kısa süredeyse warmup sayılır
+        if now_ts - hist[0][0] < lookback_sec * 0.5:
+            return None
+        old_entry = hist[0]
+
+    if old_entry[1] <= 0:
+        return None
+    latest = hist[-1]
+    return pct_change(old_entry[1], latest[1])
+
+
+def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, Any]:
+    """
+    Fiyat-OI uyumsuzluğu (divergence) tespiti.
+    
+    Returns dict:
+      - divergence: bool
+      - type: BEARISH_DIVERGENCE | SHORT_PILEUP | ALIGNED | QUIET | NO_DATA | DISABLED
+      - oi_change_pct: float
+      - price_change_pct: float
+      - bonus: float (skora eklenecek puan)
+      - note: str (Telegram mesajına eklenecek not)
+    """
+    base = {
+        "divergence": False,
+        "type": "NONE",
+        "oi_change_pct": 0.0,
+        "price_change_pct": round(price_change_pct, 2),
+        "bonus": 0.0,
+        "note": "",
+    }
+
+    if not WHALE_EYE_ENABLED:
+        base["type"] = "DISABLED"
+        return base
+
+    oi_change = calc_oi_change_pct(symbol, WHALE_OI_LOOKBACK_MIN * 60)
+    if oi_change is None:
+        stats["whale_warmup_skip"] += 1
+        base["type"] = "NO_DATA"
+        base["note"] = f"OI warmup (~{WHALE_OI_LOOKBACK_MIN}dk gerekli)"
+        return base
+
+    base["oi_change_pct"] = round(oi_change, 2)
+
+    price_strong = abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT
+    oi_strong = abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT
+
+    # BEARISH DIVERGENCE: Fiyat ↑ + OI ↓  → Balinalar long kapatıyor / shortlar yapılıyor sessizce
+    if price_change_pct > 0 and oi_change < 0:
+        if price_strong and oi_strong:
+            stats["whale_bearish_divergence"] += 1
+            stats["whale_divergence_hit"] += 1
+            return {
+                "divergence": True,
+                "type": "BEARISH_DIVERGENCE",
+                "oi_change_pct": round(oi_change, 2),
+                "price_change_pct": round(price_change_pct, 2),
+                "bonus": WHALE_DIVERGENCE_BONUS,
+                "note": f"🐋 BALINA BEARISH DIVERGENCE: Fiyat +%{price_change_pct:.2f} ⇄ OI %{oi_change:.2f} (long kapatma)",
+            }
+        # Yönü doğru ama eşik altı - soft bonus
+        if abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT * 0.5 and abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT * 0.5:
+            stats["whale_soft_hit"] += 1
+            soft_bonus = WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT
+            return {
+                "divergence": False,
+                "type": "BEARISH_SOFT",
+                "oi_change_pct": round(oi_change, 2),
+                "price_change_pct": round(price_change_pct, 2),
+                "bonus": soft_bonus,
+                "note": f"🐋 BALINA bearish ipucu (soft): Fiyat +%{price_change_pct:.2f} ⇄ OI %{oi_change:.2f}",
+            }
+
+    # SHORT PILEUP: Fiyat ↓ + OI ↑  → Yeni shortlar yığılıyor, downtrend onaylı
+    if price_change_pct < 0 and oi_change > 0:
+        if price_strong and oi_strong:
+            stats["whale_short_pileup"] += 1
+            stats["whale_divergence_hit"] += 1
+            return {
+                "divergence": True,
+                "type": "SHORT_PILEUP",
+                "oi_change_pct": round(oi_change, 2),
+                "price_change_pct": round(price_change_pct, 2),
+                "bonus": WHALE_DIVERGENCE_BONUS,
+                "note": f"🐋 BALINA SHORT PILEUP: Fiyat %{price_change_pct:.2f} + OI +%{oi_change:.2f} (yeni shortlar)",
+            }
+        if abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT * 0.5 and abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT * 0.5:
+            stats["whale_soft_hit"] += 1
+            soft_bonus = WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT
+            return {
+                "divergence": False,
+                "type": "PILEUP_SOFT",
+                "oi_change_pct": round(oi_change, 2),
+                "price_change_pct": round(price_change_pct, 2),
+                "bonus": soft_bonus,
+                "note": f"🐋 BALINA short yığılma ipucu (soft): Fiyat %{price_change_pct:.2f} + OI +%{oi_change:.2f}",
+            }
+
+    # Aynı yön (price↑+OI↑ veya price↓+OI↓) = momentum confirmation, divergence YOK
+    if (price_change_pct > 0 and oi_change > 0) or (price_change_pct < 0 and oi_change < 0):
+        base["type"] = "ALIGNED"
+        base["note"] = f"OI ile fiyat aynı yönde (%{oi_change:.2f} / %{price_change_pct:.2f})"
+        return base
+
+    base["type"] = "QUIET"
+    return base
+
+
+async def update_whale_oi(symbol: str) -> Tuple[float, Optional[float]]:
+    """
+    OI çek + history'ye kaydet + son lookback değişimini döndür.
+    Convenience wrapper for analyze_symbol.
+    
+    Returns: (current_oi, oi_change_pct_or_None)
+    """
+    oi_now = await fetch_oi(symbol)
+    if oi_now > 0:
+        record_oi_snapshot(symbol, oi_now)
+    oi_change = calc_oi_change_pct(symbol, WHALE_OI_LOOKBACK_MIN * 60)
+    return oi_now, oi_change
+
+
+# =========================================================
 # TEKNİK HESAPLAR
 # =========================================================
 def closes(klines: List[List[Any]]) -> List[float]:
@@ -1031,6 +1286,13 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     vol_ratio_1m = safe_float(v1[-1]) / max(avg(v1[-20:-1]), 1e-9)
     vol_ratio_5m = safe_float(v5[-1]) / max(avg(v5[-12:-1]), 1e-9)
 
+    # 🐋 WHALE EYE - End-to-end fiyat değişimi (divergence için temiz delta)
+    # pump_20m "min'den şimdiye" yani max strength; divergence için NET yön gerek
+    if WHALE_EYE_ENABLED and len(c1) >= WHALE_OI_LOOKBACK_MIN + 1:
+        price_change_for_whale = pct_change(c1[-(WHALE_OI_LOOKBACK_MIN + 1)], last_price)
+    else:
+        price_change_for_whale = pump_20m  # Fallback
+
     recent_high_20 = max(h1[-21:-1])
     last_kline = k1[-1]
     prev_kline = k1[-2]
@@ -1139,6 +1401,28 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     verify_score += verify_bonus
     reasons.extend(bonus_reasons)
 
+    # =========================================================
+    # 🐋 WHALE EYE - OI DIVERGENCE SKOR ENTEGRASYONU
+    # Fiyat-OI uyumsuzluğu varsa +WHALE_DIVERGENCE_BONUS (default +25) puan
+    # verify_score'a eklenir çünkü divergence bir TEYİT sinyalidir, aday değil.
+    # =========================================================
+    whale_oi_value = 0.0
+    whale_payload: Dict[str, Any] = {
+        "divergence": False, "type": "DISABLED", "oi_change_pct": 0.0,
+        "price_change_pct": round(price_change_for_whale, 2), "bonus": 0.0, "note": "",
+    }
+    if WHALE_EYE_ENABLED:
+        try:
+            whale_oi_value, _ = await update_whale_oi(symbol)
+            whale_payload = detect_whale_divergence(symbol, price_change_for_whale)
+            whale_bonus = safe_float(whale_payload.get("bonus", 0))
+            if whale_bonus > 0:
+                verify_score += whale_bonus
+                if whale_payload.get("note"):
+                    reasons.append(whale_payload["note"])
+        except Exception as e:
+            logger.warning("Whale Eye hata %s: %s", symbol, e)
+
     if pump_10m < 0.55 and pump_20m < 1.0:
         candidate_score -= 4
         reasons.append("Pump zayıf")
@@ -1214,6 +1498,15 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "vol_ratio_1m": round(vol_ratio_1m, 2),
         "vol_ratio_5m": round(vol_ratio_5m, 2),
         "quote_volume": quote_vol,
+        # 🐋 WHALE EYE fields
+        "whale_enabled": WHALE_EYE_ENABLED,
+        "whale_divergence": bool(whale_payload.get("divergence", False)),
+        "whale_type": whale_payload.get("type", "NONE"),
+        "whale_oi_value": whale_oi_value,
+        "whale_oi_change_pct": safe_float(whale_payload.get("oi_change_pct", 0)),
+        "whale_price_change_pct": safe_float(whale_payload.get("price_change_pct", 0)),
+        "whale_bonus": safe_float(whale_payload.get("bonus", 0)),
+        "whale_note": whale_payload.get("note", ""),
         "reason": " | ".join(reasons[:10]) if reasons else "Sebep yok",
     }
 
@@ -1910,12 +2203,36 @@ def build_signal_message(res: Dict[str, Any]) -> str:
     if LEVERAGE >= 20:
         risk_line = f"⚠️ YÜKSEK KALDIRAÇ {LEVERAGE}x | Stopta pozisyon kaybı: %{pos_loss_v5:.1f}\n"
 
+    # 🐋 WHALE EYE satırı
+    whale_line = ""
+    if res.get("whale_enabled"):
+        whale_type = str(res.get("whale_type", "NONE"))
+        whale_oi_change = safe_float(res.get("whale_oi_change_pct", 0))
+        whale_price_change = safe_float(res.get("whale_price_change_pct", 0))
+        whale_bonus = safe_float(res.get("whale_bonus", 0))
+        whale_note = str(res.get("whale_note", ""))
+        if res.get("whale_divergence"):
+            whale_line = (
+                f"🐋 BALINA EYE: {whale_type} (+{whale_bonus:.0f} puan)\n"
+                f"   Fiyat {WHALE_OI_LOOKBACK_MIN}dk: %{whale_price_change:+.2f} | OI: %{whale_oi_change:+.2f}\n"
+            )
+        elif whale_bonus > 0:
+            whale_line = (
+                f"🐋 Balina ipucu: {whale_type} (+{whale_bonus:.1f} soft puan)\n"
+                f"   Fiyat {WHALE_OI_LOOKBACK_MIN}dk: %{whale_price_change:+.2f} | OI: %{whale_oi_change:+.2f}\n"
+            )
+        elif whale_type == "NO_DATA":
+            whale_line = f"🐋 Balina Eye: OI warmup devam ediyor\n"
+        elif whale_type == "ALIGNED":
+            whale_line = f"🐋 Balina Eye: OI ve fiyat aynı yönde (divergence yok)\n"
+
     return (
         f"🚨 {VERSION_NAME} SHORT AL\n"
         f"Saat: {tr_str()}\n"
         f"Coin: {res['symbol']}\n"
         f"KALDIRAÇ: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f}\n"
         f"{risk_line}"
+        f"{whale_line}"
         f"Veri motoru: {data_engine}\n"
         f"Binance teyit: {confirm_status}\n"
         f"Binance sembol: {binance_symbol}\n"
@@ -1965,12 +2282,17 @@ def build_heartbeat_message() -> str:
     last_sig = safe_float(memory.get("last_signal_ts", 0))
     last_sig_txt = tr_str(last_sig) if last_sig else "Yok"
     ma_perf = ma_performance_summary()
+    oi_coins_tracked = len(oi_history)
     return (
         f"💓 {VERSION_NAME} DURUM\n"
         f"Saat: {tr_str()}\n"
         f"KALDIRAÇ: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f}\n"
         f"Toplam coin: {len(COINS)} / hedef {MA_COIN_LIMIT}\n"
         f"MA motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
+        f"🐋 Whale Eye: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'} | İzlenen coin: {oi_coins_tracked} | Lookback: {WHALE_OI_LOOKBACK_MIN}dk\n"
+        f"🐋 OI çağrı/fail: {stats['whale_oi_calls']} / {stats['whale_oi_fail']}\n"
+        f"🐋 Divergence hit: {stats['whale_divergence_hit']} (bearish={stats['whale_bearish_divergence']}, pileup={stats['whale_short_pileup']})\n"
+        f"🐋 Soft hit: {stats['whale_soft_hit']} | Warmup skip: {stats['whale_warmup_skip']}\n"
         f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
         f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"Sıcak coin: {hot_count}\n"
@@ -2371,6 +2693,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/hot - sıcak coinler\n"
         "/ma BTCUSDT - MA7/MA25 1H tek coin\n"
         "/ma_status - MA7/MA25 motor durumu\n"
+        "/whale - 🐋 Whale Eye genel durum\n"
+        "/whale BTCUSDT - 🐋 coin bazlı OI/divergence\n"
         "Not: Veri OKX SWAP, işlem teyidi Binance tarafında."
     )
 
@@ -2476,6 +2800,67 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"MA analiz: {memory.get('stats', {}).get('ma_analyzed', 0)}"
     )
+
+
+async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """🐋 Tek coin için OI/divergence durumu sorgulamak"""
+    if not WHALE_EYE_ENABLED:
+        await update.message.reply_text("🐋 Whale Eye motoru kapalı (WHALE_EYE_ENABLED=false)")
+        return
+    if not context.args:
+        # Argüman yoksa genel Whale Eye durumu
+        await update.message.reply_text(
+            f"🐋 WHALE EYE DURUM\n"
+            f"Motor: AÇIK\n"
+            f"Lookback: {WHALE_OI_LOOKBACK_MIN} dk\n"
+            f"İzlenen coin: {len(oi_history)}\n"
+            f"OI çağrı toplam: {stats['whale_oi_calls']}\n"
+            f"OI fail: {stats['whale_oi_fail']}\n"
+            f"Toplam divergence hit: {stats['whale_divergence_hit']}\n"
+            f"  - Bearish (fiyat↑/OI↓): {stats['whale_bearish_divergence']}\n"
+            f"  - Short pileup (fiyat↓/OI↑): {stats['whale_short_pileup']}\n"
+            f"Soft hit: {stats['whale_soft_hit']}\n"
+            f"Warmup skip: {stats['whale_warmup_skip']}\n"
+            f"Eşikler: fiyat ≥%{WHALE_MIN_PRICE_MOVE_PCT:.2f}, OI ≥%{WHALE_MIN_OI_MOVE_PCT:.2f}\n"
+            f"Bonus: +{WHALE_DIVERGENCE_BONUS:.0f} (hard), +{WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT:.1f} (soft)\n"
+            f"Kullanım: /whale BTCUSDT"
+        )
+        return
+
+    symbol = normalize_symbol(context.args[0])
+    oi_now = await fetch_oi(symbol)
+    if oi_now <= 0:
+        await update.message.reply_text(f"🐋 {symbol} için OI verisi alınamadı.")
+        return
+    record_oi_snapshot(symbol, oi_now)
+
+    # Fiyat değişimini de hesapla (lookback penceresi için)
+    k1 = await get_klines(symbol, "1m", WHALE_OI_LOOKBACK_MIN + 5)
+    if len(k1) < WHALE_OI_LOOKBACK_MIN + 1:
+        await update.message.reply_text(
+            f"🐋 {symbol}\nOI şimdi: {oi_now:,.2f}\nFiyat verisi yetersiz."
+        )
+        return
+    c = closes(k1)
+    price_change = pct_change(c[-(WHALE_OI_LOOKBACK_MIN + 1)], c[-1])
+    payload = detect_whale_divergence(symbol, price_change)
+
+    hist = oi_history.get(symbol, [])
+    warmup_min = (time.time() - hist[0][0]) / 60 if hist else 0
+
+    await update.message.reply_text(
+        f"🐋 WHALE EYE — {symbol}\n"
+        f"Saat: {tr_str()}\n"
+        f"OI şimdi: {oi_now:,.2f} (oiCcy)\n"
+        f"OI history snapshot: {len(hist)} (warmup: {warmup_min:.1f}dk)\n"
+        f"Fiyat son {WHALE_OI_LOOKBACK_MIN}dk: %{price_change:+.2f}\n"
+        f"OI son {WHALE_OI_LOOKBACK_MIN}dk: %{payload.get('oi_change_pct', 0):+.2f}\n"
+        f"Durum: {payload.get('type', 'NONE')}\n"
+        f"Bonus: +{payload.get('bonus', 0):.1f} puan\n"
+        f"Not: {payload.get('note') or '-'}"
+    )
+
+
 # =========================================================
 # BAŞLATMA
 # =========================================================
@@ -2489,13 +2874,15 @@ async def post_init(application) -> None:
             f"Coin sayısı: {active_count}\n"
             f"Çıkarılan coin: {pruned_count}\n"
             f"Veri kaynağı: OKX {OKX_INST_TYPE}\n"
-            f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA7/MA25 1H\n"
+            f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA7/MA25 1H + 🐋 Whale Eye\n"
             f"MA7/MA25: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'} | hedef coin={MA_COIN_LIMIT}\n"
             f"MA LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | MA SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
             f"MA TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
             f"MA Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
+            f"🐋 Whale Eye: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'} | Lookback: {WHALE_OI_LOOKBACK_MIN}dk | Bonus: +{WHALE_DIVERGENCE_BONUS:.0f} puan\n"
+            f"🐋 Eşikler: fiyat ≥%{WHALE_MIN_PRICE_MOVE_PCT:.2f} & OI ≥%{WHALE_MIN_OI_MOVE_PCT:.2f} | OI cache: {WHALE_OI_CACHE_SEC}sn\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"V5.2.8 FIX: MA sinyal fonksiyonu eklendi + likidasyon birim hatası + memory lock + repaint guard\n"
+            f"V8 PRO MAX: V5.2.8 omurga + Whale Eye OI Divergence motoru entegre\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
@@ -2533,6 +2920,7 @@ def build_app():
     application.add_handler(CommandHandler("hot", cmd_hot))
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
+    application.add_handler(CommandHandler("whale", cmd_whale))
     return application
 
 
