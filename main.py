@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -13,20 +12,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# =========================================================
-# BALINA AVCISI V5.2.7 HIBRIT ONAYLI - TEK PARCA SURUM
-# Amac:
-# - Bilindik / buyuk coinleri cikarmak
-# - Ayni coin icin surekli SHORT AL tekrarini kapatmak
-# - Veri tarafini koruyup API fail patlamasini azaltmak
-# - Ana analiz mantigina minimum dokunmak
-# =========================================================
-
 VERSION_NAME = "Balina Avcısı V8.1 ULTIMATE (OI + Funding Institutional Eye)"
 
-# -------------------------
-# ENV / AYARLAR
-# -------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -60,7 +47,6 @@ SETUP_COOLDOWN_MIN = int(float(os.getenv("SETUP_COOLDOWN_MIN", "45")))
 MAX_HOT_CANDIDATES = int(float(os.getenv("MAX_HOT_CANDIDATES", "16")))
 MAX_DEEP_ANALYSIS_PER_CYCLE = int(float(os.getenv("MAX_DEEP_ANALYSIS_PER_CYCLE", "12")))
 
-# Eski V5.2.7 mantigi korunuyor
 MIN_CANDIDATE_SCORE = float(os.getenv("MIN_CANDIDATE_SCORE", "34"))
 MIN_READY_SCORE = float(os.getenv("MIN_READY_SCORE", "50"))
 MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "68"))
@@ -74,7 +60,6 @@ KLINE_CACHE_SEC = int(float(os.getenv("KLINE_CACHE_SEC", "5")))
 TICKER_CACHE_SEC = int(float(os.getenv("TICKER_CACHE_SEC", "8")))
 HTTP_TIMEOUT = int(float(os.getenv("HTTP_TIMEOUT", "12")))
 
-# Veri koruma katmani
 OKX_INSTRUMENT_CACHE_SEC = int(float(os.getenv("OKX_INSTRUMENT_CACHE_SEC", "1800")))
 AUTO_SYMBOL_REFRESH_SEC = int(float(os.getenv("AUTO_SYMBOL_REFRESH_SEC", "1800")))
 SYMBOL_FAIL_BLOCK_SEC = int(float(os.getenv("SYMBOL_FAIL_BLOCK_SEC", "900")))
@@ -83,8 +68,6 @@ SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1200000"))
 
-# MA7/MA25 1H 200 COIN MOTORU
-# Bu bölüm ikinci dosyadaki MA7/MA25 1 saatlik LONG/SHORT motorunu korur.
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
@@ -103,48 +86,32 @@ MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() =
 MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOKBACK", "50")))
 MA_FOLLOWUP_ENABLED = os.getenv("MA_FOLLOWUP_ENABLED", "true").lower() == "true"
 
-# =========================================================
-# YÜKSEK KALDIRAÇ RİSK YÖNETİMİ (20x-30x)
-# =========================================================
 LEVERAGE = float(os.getenv("LEVERAGE", "1"))
-MAX_POSITION_RISK_PCT = float(os.getenv("MAX_POSITION_RISK_PCT", "2.0"))  # Pozisyon başına max risk %
-MIN_STOP_PCT = float(os.getenv("MIN_STOP_PCT", "0.003"))  # Wick koruması için min %0.3
-MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "0.012"))   # Max %1.2
-# DİKKAT: pct_change() yüzde döndürür (×100). Buffer da yüzde puanında olmalı.
-# Örnek: 2.0 = stop ile likidasyon arası min %2 mesafe. Önceki 0.15 = %0.15 = pratikte koruma yoktu.
-LIQUIDATION_BUFFER = float(os.getenv("LIQUIDATION_BUFFER", "2.0"))  # Yüzde puanı (% point)
-DEFAULT_MARGIN_USDT = float(os.getenv("DEFAULT_MARGIN_USDT", "100"))  # Örnek marj miktarı
+MAX_POSITION_RISK_PCT = float(os.getenv("MAX_POSITION_RISK_PCT", "2.0"))
+MIN_STOP_PCT = float(os.getenv("MIN_STOP_PCT", "0.003"))
+MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "0.012"))
+LIQUIDATION_BUFFER = float(os.getenv("LIQUIDATION_BUFFER", "2.0"))
+DEFAULT_MARGIN_USDT = float(os.getenv("DEFAULT_MARGIN_USDT", "100"))
 
-# =========================================================
-# 🐋💰 V8.1 INSTITUTIONAL EYE - OI + FUNDING RATE CONFIG
-# Kullanıcının net kuralları:
-#   SHORT: Fiyat yatay/yukarı + OI düşüş ≥ %1.5  → +25 puan
-#   SHORT EXTRA: Funding > +0.0005             → +20 puan
-#   LONG mirror: Fiyat yatay/aşağı + OI yükseliş ≥ %1.5 → +25 puan
-#   LONG mirror: Funding < -0.0005             → +20 puan
-# =========================================================
 WHALE_EYE_ENABLED = os.getenv("WHALE_EYE_ENABLED", "true").lower() == "true"
 FUNDING_EYE_ENABLED = os.getenv("FUNDING_EYE_ENABLED", "true").lower() == "true"
 
-WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "20")))      # OI değişim penceresi (dk)
-WHALE_OI_CACHE_SEC = int(float(os.getenv("WHALE_OI_CACHE_SEC", "30")))            # OI anlık cache
-WHALE_OI_HISTORY_MAX = int(float(os.getenv("WHALE_OI_HISTORY_MAX", "180")))       # symbol başına max snapshot
-WHALE_OI_BEARISH_DROP_PCT = float(os.getenv("WHALE_OI_BEARISH_DROP_PCT", "-1.5")) # OI bu kadar veya daha çok düşerse SHORT
-WHALE_OI_BULLISH_RISE_PCT = float(os.getenv("WHALE_OI_BULLISH_RISE_PCT", "1.5"))  # OI bu kadar veya daha çok yükselirse LONG
-WHALE_PRICE_FLAT_UP_MIN_PCT = float(os.getenv("WHALE_PRICE_FLAT_UP_MIN_PCT", "-0.1"))   # SHORT için fiyat ≥ bu (yatay/yukarı)
-WHALE_PRICE_FLAT_DOWN_MAX_PCT = float(os.getenv("WHALE_PRICE_FLAT_DOWN_MAX_PCT", "0.1")) # LONG için fiyat ≤ bu (yatay/aşağı)
-WHALE_SHORT_BONUS = float(os.getenv("WHALE_SHORT_BONUS", "25"))                   # SHORT için +25 (kullanıcı talebi)
-WHALE_LONG_BONUS = float(os.getenv("WHALE_LONG_BONUS", "25"))                     # LONG mirror için +25
+WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "20")))
+WHALE_OI_CACHE_SEC = int(float(os.getenv("WHALE_OI_CACHE_SEC", "30")))
+WHALE_OI_HISTORY_MAX = int(float(os.getenv("WHALE_OI_HISTORY_MAX", "180")))
+WHALE_OI_BEARISH_DROP_PCT = float(os.getenv("WHALE_OI_BEARISH_DROP_PCT", "-1.5"))
+WHALE_OI_BULLISH_RISE_PCT = float(os.getenv("WHALE_OI_BULLISH_RISE_PCT", "1.5"))
+WHALE_PRICE_FLAT_UP_MIN_PCT = float(os.getenv("WHALE_PRICE_FLAT_UP_MIN_PCT", "-0.1"))
+WHALE_PRICE_FLAT_DOWN_MAX_PCT = float(os.getenv("WHALE_PRICE_FLAT_DOWN_MAX_PCT", "0.1"))
+WHALE_SHORT_BONUS = float(os.getenv("WHALE_SHORT_BONUS", "25"))
+WHALE_LONG_BONUS = float(os.getenv("WHALE_LONG_BONUS", "25"))
 
-FUNDING_CACHE_SEC = int(float(os.getenv("FUNDING_CACHE_SEC", "1800")))            # Funding 8h settle olduğu için 30dk cache
-FUNDING_BEARISH_THRESHOLD = float(os.getenv("FUNDING_BEARISH_THRESHOLD", "0.0005"))   # Üstü = SHORT bonus
-FUNDING_BULLISH_THRESHOLD = float(os.getenv("FUNDING_BULLISH_THRESHOLD", "-0.0005"))  # Altı = LONG bonus
-FUNDING_SHORT_BONUS = float(os.getenv("FUNDING_SHORT_BONUS", "20"))               # SHORT için +20 (kullanıcı talebi)
-FUNDING_LONG_BONUS = float(os.getenv("FUNDING_LONG_BONUS", "20"))                 # LONG mirror için +20
+FUNDING_CACHE_SEC = int(float(os.getenv("FUNDING_CACHE_SEC", "1800")))
+FUNDING_BEARISH_THRESHOLD = float(os.getenv("FUNDING_BEARISH_THRESHOLD", "0.0005"))
+FUNDING_BULLISH_THRESHOLD = float(os.getenv("FUNDING_BULLISH_THRESHOLD", "-0.0005"))
+FUNDING_SHORT_BONUS = float(os.getenv("FUNDING_SHORT_BONUS", "20"))
+FUNDING_LONG_BONUS = float(os.getenv("FUNDING_LONG_BONUS", "20"))
 
-# DÜZELTME: Yüksek kaldıraçta stop'u daraltmak yanlış (her trade wick'lenir).
-# Doğrusu: stop piyasa yapısına/ATR'ye göre belirlenir, pozisyon boyutu kaldıraçla ayarlanır.
-# Burada sadece MIN/MAX güvenlik sınırlarını uyguluyoruz; kaldıraçla daraltma yok.
 def calc_leveraged_stop_pct(base_pct: float) -> float:
     return max(MIN_STOP_PCT, min(MAX_STOP_PCT, base_pct))
 
@@ -174,12 +141,12 @@ def check_stop_vs_liquidation(entry: float, stop: float, direction: str) -> Tupl
         gap = abs(pct_change(liq, stop))
         safe = stop < liq and gap >= LIQUIDATION_BUFFER
     return safe, gap
+
 MA_FOLLOWUP_INTERVAL_SEC = int(float(os.getenv("MA_FOLLOWUP_INTERVAL_SEC", "60")))
 DYNAMIC_TOP_200_COIN_POOL = os.getenv("DYNAMIC_TOP_200_COIN_POOL", "true").lower() == "true"
 ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "true").lower() == "true"
 RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
-# Buyuk / bilindik coinler silinmis liste
 DEFAULT_COINS = [
     "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
     "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
@@ -198,9 +165,6 @@ DEFAULT_COINS = [
 ]
 COINS = [x.strip().upper() for x in (RAW_COINS_ENV or ",".join(DEFAULT_COINS)).split(",") if x.strip()]
 
-# -------------------------
-# LOGGING
-# -------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -211,9 +175,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("balina_avcisi_v527_hibrit_onayli")
 
-# -------------------------
-# GLOBAL STATE
-# -------------------------
 TZ = ZoneInfo(TIMEZONE_NAME)
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "BalinaAvcisiV527HibritOnayli/1.0"})
@@ -224,10 +185,9 @@ instrument_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 okx_live_symbols: Dict[str, Dict[str, Any]] = {}
 symbol_fail_state: Dict[str, Dict[str, Any]] = {}
 
-# 🐋💰 V8.1 INSTITUTIONAL EYE state - in-memory (restart'ta warmup gerekli, kasıtlı)
-oi_history: Dict[str, List[Tuple[float, float]]] = {}   # symbol -> [(ts, oi_value), ...]
-oi_cache: Dict[str, Tuple[float, float]] = {}            # symbol -> (fetch_ts, oi_value)
-funding_cache: Dict[str, Tuple[float, float]] = {}       # symbol -> (fetch_ts, funding_rate)
+oi_history: Dict[str, List[Tuple[float, float]]] = {}
+oi_cache: Dict[str, Tuple[float, float]] = {}
+funding_cache: Dict[str, Tuple[float, float]] = {}
 
 memory: Dict[str, Any] = {
     "hot": {},
@@ -271,51 +231,36 @@ stats: Dict[str, Any] = {
     "ma_long_sent": 0,
     "ma_short_sent": 0,
     "ma_analyzed": 0,
-    # 🐋 WHALE EYE counters
     "whale_oi_calls": 0,
     "whale_oi_fail": 0,
     "whale_divergence_hit": 0,
     "whale_bearish_divergence": 0,
     "whale_bullish_divergence": 0,
     "whale_warmup_skip": 0,
-    # 💰 FUNDING EYE counters
     "funding_calls": 0,
     "funding_fail": 0,
     "funding_short_bonus_hit": 0,
     "funding_long_bonus_hit": 0,
-    # 🐋💰 INSTITUTIONAL COMBO
     "institutional_combo_hit": 0,
 }
 
 app = None
 deep_pointer = 0
-
-# FIX: Memory ve cache concurrent access koruması
-# Birden fazla scan loop ve save_loop aynı anda memory'ye yazıyor.
-# json.dump sırasında dict değişimi RuntimeError fırlatabilir.
 memory_lock = asyncio.Lock()
 
-
-# =========================================================
-# GENEL YARDIMCILAR
-# =========================================================
 def tr_now() -> datetime:
     return datetime.now(TZ)
-
 
 def tr_str(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts, TZ) if ts else tr_now()
     return dt.strftime("%d.%m.%Y %H:%M:%S")
 
-
 def tr_day_key(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts, TZ) if ts else tr_now()
     return dt.strftime("%Y-%m-%d")
 
-
 def clamp(x: float, low: float, high: float) -> float:
     return max(low, min(high, x))
-
 
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
@@ -323,18 +268,15 @@ def safe_float(v: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
-
 def pct_change(a: float, b: float) -> float:
     if a == 0:
         return 0.0
     return ((b - a) / a) * 100.0
 
-
 def avg(values: List[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
-
 
 def ensure_memory_shape() -> None:
     global memory
@@ -346,7 +288,7 @@ def ensure_memory_shape() -> None:
     memory.setdefault("stats", {})
     memory.setdefault("ma_signals", {})
     memory.setdefault("ma_follows", {})
-    memory.setdefault("ma_last_candle_ts", {})  # FIX: repaint guard state
+    memory.setdefault("ma_last_candle_ts", {})
     memory.setdefault("daily_short_sent", {})
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("last_diag_ts", 0.0)
@@ -356,13 +298,11 @@ def ensure_memory_shape() -> None:
     memory["stats"].setdefault("ma_tp", 0)
     memory["stats"].setdefault("ma_stop", 0)
     memory["stats"].setdefault("ma_followup", 0)
-    # 🐋💰 V8.1 institutional sayaçları
     memory["stats"].setdefault("whale_bearish_divergence", 0)
     memory["stats"].setdefault("whale_bullish_divergence", 0)
     memory["stats"].setdefault("funding_short_bonus_hit", 0)
     memory["stats"].setdefault("funding_long_bonus_hit", 0)
     memory["stats"].setdefault("institutional_combo_hit", 0)
-
 
 def load_memory() -> None:
     global memory
@@ -381,13 +321,7 @@ def load_memory() -> None:
     else:
         ensure_memory_shape()
 
-
 def save_memory() -> None:
-    """Sync save. RuntimeError'den kaçınmak için snapshot alır.
-    
-    FIX: deepcopy sırasında başka coroutine memory'yi değiştirirse
-    RuntimeError patlar. 3 kez retry, sonra pes et (bir sonraki cycle'da yine denenir).
-    """
     last_err = None
     for attempt in range(3):
         try:
@@ -396,11 +330,9 @@ def save_memory() -> None:
             tmp_path = MEMORY_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            # Atomic replace - kısmi yazılmış dosya bırakmaz
             os.replace(tmp_path, MEMORY_FILE)
             return
         except RuntimeError as e:
-            # "dictionary changed size during iteration" - retry
             last_err = e
             time.sleep(0.05)
         except Exception as e:
@@ -408,12 +340,9 @@ def save_memory() -> None:
             return
     logger.warning("Memory snapshot 3 denemede de başarısız: %s", last_err)
 
-
 async def save_memory_async() -> None:
-    """Event loop'u bloke etmeden kaydet."""
     async with memory_lock:
         await asyncio.to_thread(save_memory)
-
 
 def cleanup_symbol_fail_state() -> None:
     now_ts = time.time()
@@ -426,7 +355,6 @@ def cleanup_symbol_fail_state() -> None:
             rec["streak"] = 0
         if last_ts and now_ts - last_ts > SYMBOL_FAIL_FORGET_SEC:
             symbol_fail_state.pop(sym, None)
-
 
 def cleanup_memory() -> None:
     now_ts = time.time()
@@ -456,9 +384,7 @@ def cleanup_memory() -> None:
     cleanup_symbol_fail_state()
     cleanup_whale_funding_state()
 
-
 def cleanup_whale_funding_state() -> None:
-    """🐋💰 OI history + Funding cache temizliği"""
     now_ts = time.time()
     cutoff = now_ts - (WHALE_OI_LOOKBACK_MIN * 60 * 3)
     for sym in list(oi_history.keys()):
@@ -471,7 +397,6 @@ def cleanup_whale_funding_state() -> None:
         ts, _ = funding_cache[sym]
         if ts < funding_cutoff:
             funding_cache.pop(sym, None)
-
 
 def note_symbol_fail(symbol: str, reason: str = "") -> None:
     now_ts = time.time()
@@ -486,7 +411,6 @@ def note_symbol_fail(symbol: str, reason: str = "") -> None:
             stats["okx_symbol_fail_block"] += 1
             logger.warning("Coin geçici bloklandı %s | sebep=%s", symbol, rec["last_reason"])
 
-
 def note_symbol_success(symbol: str) -> None:
     rec = symbol_fail_state.get(symbol)
     if not rec:
@@ -495,20 +419,14 @@ def note_symbol_success(symbol: str) -> None:
     rec["block_until"] = 0.0
     rec["last_reason"] = ""
 
-
 def symbol_temporarily_blocked(symbol: str) -> bool:
     rec = symbol_fail_state.get(symbol, {})
     return time.time() < safe_float(rec.get("block_until", 0))
-
 
 def get_blocked_symbol_count() -> int:
     now_ts = time.time()
     return sum(1 for rec in symbol_fail_state.values() if now_ts < safe_float(rec.get("block_until", 0)))
 
-
-# =========================================================
-# TELEGRAM GÖNDERİMİ
-# =========================================================
 def _telegram_api_send(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Telegram token/chat_id eksik")
@@ -527,7 +445,6 @@ def _telegram_api_send(text: str) -> bool:
         logger.error("Telegram API hata: code=%s body=%s", resp.status_code, resp.text[:500])
     return ok
 
-
 async def safe_send_telegram(text: str, retry: int = 3, delay_sec: float = 1.5) -> bool:
     for i in range(1, retry + 1):
         try:
@@ -540,10 +457,6 @@ async def safe_send_telegram(text: str, retry: int = 3, delay_sec: float = 1.5) 
     stats["telegram_fail"] += 1
     return False
 
-
-# =========================================================
-# OKX DATA
-# =========================================================
 def normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper().replace("/", "-")
     if s.endswith("-SWAP"):
@@ -557,9 +470,7 @@ def normalize_symbol(symbol: str) -> str:
         return f"{s}-USDT-SWAP"
     return s
 
-
 def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
-    """OKX v5 GET wrapper. Transient hatalar (429, 5xx, timeout) için retry yapar."""
     url = f"{OKX_BASE_URL}{path}"
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
@@ -586,7 +497,6 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
         raise last_err
     return []
 
-
 def _okx_to_kline(row: List[Any]) -> List[Any]:
     return [
         row[0], row[1], row[2], row[3], row[4], row[5],
@@ -594,7 +504,6 @@ def _okx_to_kline(row: List[Any]) -> List[Any]:
         row[7] if len(row) > 7 else row[6] if len(row) > 6 else row[5],
         row[8] if len(row) > 8 else "1",
     ]
-
 
 async def get_okx_instruments(force: bool = False) -> Dict[str, Dict[str, Any]]:
     cached = instrument_cache.get("okx_instruments")
@@ -618,7 +527,6 @@ async def get_okx_instruments(force: bool = False) -> Dict[str, Dict[str, Any]]:
         stats["api_fail"] += 1
         logger.warning("OKX instruments alınamadı: %s", e)
         return cached[1] if cached else {}
-
 
 async def refresh_coin_pool(force: bool = False) -> Tuple[int, int]:
     global COINS, okx_live_symbols
@@ -660,7 +568,6 @@ async def refresh_coin_pool(force: bool = False) -> Tuple[int, int]:
     logger.info("Aktif coin havuzu yenilendi | aktif=%s | çıkarılan=%s", len(COINS), len(invalid))
     return len(COINS), len(invalid)
 
-
 async def symbol_refresh_loop() -> None:
     while True:
         try:
@@ -668,7 +575,6 @@ async def symbol_refresh_loop() -> None:
         except Exception as e:
             logger.exception("symbol_refresh_loop hata: %s", e)
         await asyncio.sleep(max(300, AUTO_SYMBOL_REFRESH_SEC))
-
 
 async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[Any]]:
     symbol = normalize_symbol(symbol)
@@ -706,7 +612,6 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
         logger.warning("OKX kline alınamadı %s %s: %s", symbol, interval, e)
         return []
 
-
 async def get_24h_tickers() -> Dict[str, Dict[str, Any]]:
     cached = ticker_cache.get("24hr")
     now_ts = time.time()
@@ -722,13 +627,11 @@ async def get_24h_tickers() -> Dict[str, Dict[str, Any]]:
         logger.warning("OKX 24h ticker alınamadı: %s", e)
         return cached[1] if cached else {}
 
-
 def quote_volume_from_ticker(row: Dict[str, Any]) -> float:
     last = safe_float(row.get("last", 0))
     vol24h = safe_float(row.get("vol24h", 0))
     vol_ccy_24h = safe_float(row.get("volCcy24h", 0))
     return max(vol_ccy_24h, vol24h * max(last, 1e-12))
-
 
 def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: Dict[str, Dict[str, Any]]) -> List[str]:
     rows: List[Tuple[str, float]] = []
@@ -742,7 +645,6 @@ def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: D
     rows.sort(key=lambda x: x[1], reverse=True)
     return [sym for sym, _ in rows[:MA_COIN_LIMIT]]
 
-
 def normalize_binance_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     parts = s.split("-")
@@ -750,13 +652,11 @@ def normalize_binance_symbol(symbol: str) -> str:
         return f"{parts[0]}{parts[1]}"
     return s.replace("-", "")
 
-
 def _binance_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{BINANCE_CONFIRM_BASE_URL}{path}"
     resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
-
 
 async def get_binance_klines(symbol: str, interval: str, limit: int = 120) -> List[List[Any]]:
     symbol = normalize_binance_symbol(symbol)
@@ -777,7 +677,6 @@ async def get_binance_klines(symbol: str, interval: str, limit: int = 120) -> Li
         logger.warning("Binance teyit kline alınamadı %s %s: %s", symbol, interval, e)
         return []
 
-
 async def get_binance_last_price(symbol: str) -> float:
     symbol = normalize_binance_symbol(symbol)
     cache_key = f"BIN_PRICE:{symbol}"
@@ -793,7 +692,6 @@ async def get_binance_last_price(symbol: str) -> float:
     except Exception as e:
         logger.warning("Binance teyit fiyatı alınamadı %s: %s", symbol, e)
         return 0.0
-
 
 async def confirm_signal_on_binance(res: Dict[str, Any]) -> Dict[str, Any]:
     if not BINANCE_CONFIRM_ENABLED:
@@ -909,22 +807,11 @@ async def confirm_signal_on_binance(res: Dict[str, Any]) -> Dict[str, Any]:
         "reason": " | ".join(reasons[:8]) if reasons else "Binance teyit nedeni yok.",
     }
 
-
-# =========================================================
-# 🐋💰 V8.1 INSTITUTIONAL EYE - OI + FUNDING RATE MOTORLARI
-# Kullanıcının net kuralları:
-#   SHORT: Fiyat ≥ -%0.1 (yatay/yukarı) + OI ≤ -%1.5 (sert düşüş)  → +25
-#   SHORT EXTRA: Funding > +0.0005 (extreme positive)              → +20
-#   LONG mirror: Fiyat ≤ +%0.1 (yatay/aşağı) + OI ≥ +%1.5 (sert yükseliş) → +25
-#   LONG mirror: Funding < -0.0005 (extreme negative)              → +20
-# =========================================================
-
 async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
     """
-    OKX /api/v5/market/open-interest?instId={symbol}
-    
-    Kullanıcının milimetrik kuralı: enstrüman kodu UPPERCASE + -SWAP, SADECE instId paramı.
-    JSON yanıt data[0].oi try-except ile güvenli okunur, float dönülür.
+    OKX /api/v5/public/open-interest?instType=SWAP&instId={symbol}
+    OKX v5 kuralları: instType (ZORUNLU) + instId (ZORUNLU) birlikte gönderilir.
+    JSON yanıt data[0].oi / data[0].oiCcy try-except içinde güvenli okunur, float döner.
     """
     symbol = normalize_symbol(symbol)
     if not symbol or "-" not in symbol:
@@ -939,35 +826,42 @@ async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
 
     stats["whale_oi_calls"] += 1
     try:
-        # KULLANICI KURALI: sadece instId, instType YOK
         data = await asyncio.to_thread(
             _okx_get,
-            "/api/v5/market/open-interest",
-            {"instId": symbol},
+            "/api/v5/public/open-interest",
+            {"instType": "SWAP", "instId": symbol},
         )
-        if not data:
+        if not isinstance(data, list) or len(data) == 0:
             stats["whale_oi_fail"] += 1
             return None
-        # data[0].oi'yi try-except ile güvenli oku
-        try:
-            row = data[0] if isinstance(data, list) else data
-            oi_str = row.get("oi") if isinstance(row, dict) else None
-            oi_val = float(oi_str) if oi_str is not None else 0.0
-            # oiCcy varsa onu tercih et (currency cinsinden, coinler arası karşılaştırılabilir)
+
+        row = data[0]
+        if not isinstance(row, dict):
+            stats["whale_oi_fail"] += 1
+            return None
+
+        oi_val = 0.0
+        oi_str = row.get("oi")
+        if oi_str is not None and str(oi_str).strip() != "":
             try:
-                oi_ccy_val = float(row.get("oiCcy", 0) or 0)
-                if oi_ccy_val > 0:
-                    oi_val = oi_ccy_val
+                oi_val = float(oi_str)
             except (TypeError, ValueError):
                 pass
-        except (TypeError, ValueError, KeyError, IndexError) as e:
-            logger.warning("OI JSON parse hatası %s: %s", symbol, e)
-            stats["whale_oi_fail"] += 1
-            return None
+
+        if oi_val <= 0:
+            oi_ccy_str = row.get("oiCcy")
+            if oi_ccy_str is not None and str(oi_ccy_str).strip() != "":
+                try:
+                    oi_ccy_val = float(oi_ccy_str)
+                    if oi_ccy_val > 0:
+                        oi_val = oi_ccy_val
+                except (TypeError, ValueError):
+                    pass
 
         if oi_val > 0:
             oi_cache[symbol] = (now_ts, oi_val)
             return oi_val
+
         stats["whale_oi_fail"] += 1
         return None
     except Exception as e:
@@ -975,14 +869,7 @@ async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
         logger.warning("OKX OI alınamadı %s: %s", symbol, e)
         return None
 
-
 async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
-    """
-    OKX /api/v5/public/funding-rate?instId={symbol}
-    
-    Anlık fundingRate döner (örn 0.0001 = %0.01/8h). 8 saatte bir settle olduğu için
-    cache agresif (FUNDING_CACHE_SEC default 30dk).
-    """
     symbol = normalize_symbol(symbol)
     if not symbol or "-" not in symbol:
         return None
@@ -1012,7 +899,6 @@ async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
             stats["funding_fail"] += 1
             return None
 
-        # Mantıklı funding rate aralığı: ±%5 arası
         if -0.05 < rate < 0.05:
             funding_cache[symbol] = (now_ts, rate)
             return rate
@@ -1023,9 +909,7 @@ async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
         logger.warning("OKX funding alınamadı %s: %s", symbol, e)
         return None
 
-
 def record_oi_snapshot(symbol: str, oi_val: float) -> None:
-    """OI history'sine snapshot ekle, sliding window."""
     if oi_val <= 0:
         return
     now_ts = time.time()
@@ -1040,9 +924,7 @@ def record_oi_snapshot(symbol: str, oi_val: float) -> None:
             new_hist = new_hist[-WHALE_OI_HISTORY_MAX:]
         oi_history[symbol] = new_hist
 
-
 def calc_oi_change_pct(symbol: str, lookback_sec: float) -> Optional[float]:
-    """Verilen pencere için OI değişim yüzdesi. None = warmup."""
     hist = oi_history.get(symbol, [])
     if len(hist) < 2:
         return None
@@ -1063,13 +945,7 @@ def calc_oi_change_pct(symbol: str, lookback_sec: float) -> Optional[float]:
     latest = hist[-1]
     return pct_change(old_entry[1], latest[1])
 
-
 def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, Any]:
-    """
-    KULLANICI KURAL-BAZLI DIVERGENCE:
-      SHORT: price >= -0.1% AND oi_change <= -1.5%  → short_bonus +25
-      LONG: price <= +0.1%  AND oi_change >= +1.5%  → long_bonus +25
-    """
     base = {
         "divergence": False,
         "type": "NONE",
@@ -1092,7 +968,6 @@ def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, A
 
     base["oi_change_pct"] = round(oi_change, 2)
 
-    # SHORT: BEARISH DIVERGENCE
     if price_change_pct >= WHALE_PRICE_FLAT_UP_MIN_PCT and oi_change <= WHALE_OI_BEARISH_DROP_PCT:
         stats["whale_bearish_divergence"] += 1
         stats["whale_divergence_hit"] += 1
@@ -1106,7 +981,6 @@ def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, A
             "note": f"🐋 BEARISH DIVERGENCE: Fiyat %{price_change_pct:+.2f} (yatay/yukarı) + OI %{oi_change:+.2f} (sert düşüş) → SHORT +{WHALE_SHORT_BONUS:.0f}",
         }
 
-    # LONG: BULLISH DIVERGENCE (mirror)
     if price_change_pct <= WHALE_PRICE_FLAT_DOWN_MAX_PCT and oi_change >= WHALE_OI_BULLISH_RISE_PCT:
         stats["whale_bullish_divergence"] += 1
         stats["whale_divergence_hit"] += 1
@@ -1128,13 +1002,7 @@ def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, A
     base["type"] = "QUIET"
     return base
 
-
 def detect_funding_signal(funding_rate: Optional[float]) -> Dict[str, Any]:
-    """
-    KULLANICI KURAL-BAZLI FUNDING:
-      SHORT: funding > +0.0005 → short_bonus +20
-      LONG: funding < -0.0005  → long_bonus +20
-    """
     base = {
         "type": "DISABLED" if not FUNDING_EYE_ENABLED else "NO_DATA",
         "funding_rate": 0.0,
@@ -1173,34 +1041,24 @@ def detect_funding_signal(funding_rate: Optional[float]) -> Dict[str, Any]:
     base["type"] = "NEUTRAL"
     return base
 
-
 async def update_whale_oi(symbol: str) -> Tuple[Optional[float], Optional[float]]:
-    """OI çek + history'ye kaydet + lookback değişim. Convenience wrapper."""
     oi_now = await fetch_okx_open_interest(symbol)
     if oi_now and oi_now > 0:
         record_oi_snapshot(symbol, oi_now)
     oi_change = calc_oi_change_pct(symbol, WHALE_OI_LOOKBACK_MIN * 60)
     return oi_now, oi_change
 
-
-# =========================================================
-# TEKNİK HESAPLAR
-# =========================================================
 def closes(klines: List[List[Any]]) -> List[float]:
     return [safe_float(x[4]) for x in klines]
-
 
 def highs(klines: List[List[Any]]) -> List[float]:
     return [safe_float(x[2]) for x in klines]
 
-
 def lows(klines: List[List[Any]]) -> List[float]:
     return [safe_float(x[3]) for x in klines]
 
-
 def volumes(klines: List[List[Any]]) -> List[float]:
     return [safe_float(x[5]) for x in klines]
-
 
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
@@ -1214,7 +1072,6 @@ def ema(values: List[float], period: int) -> List[float]:
         out.append((v * alpha) + (out[-1] * (1 - alpha)))
     pad = [out[0]] * (len(values) - len(out))
     return pad + out
-
 
 def rsi(values: List[float], period: int = 14) -> List[float]:
     if len(values) < period + 1:
@@ -1233,7 +1090,6 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
             rsis[i] = 100 - (100 / (1 + rs))
     return rsis
 
-
 def true_ranges(klines: List[List[Any]]) -> List[float]:
     if len(klines) < 2:
         return [0.0 for _ in klines]
@@ -1246,11 +1102,9 @@ def true_ranges(klines: List[List[Any]]) -> List[float]:
         trs.append(tr)
     return trs
 
-
 def atr(klines: List[List[Any]], period: int = 14) -> List[float]:
     trs = true_ranges(klines)
     return ema(trs, period)
-
 
 def candle_rejection_score(kline: List[Any]) -> float:
     o = safe_float(kline[1])
@@ -1268,20 +1122,17 @@ def candle_rejection_score(kline: List[Any]) -> float:
         score += 5.0
     return score
 
-
 def lower_highs(values: List[float], n: int = 3) -> bool:
     if len(values) < n:
         return False
     sub = values[-n:]
     return all(sub[i] < sub[i - 1] for i in range(1, len(sub)))
 
-
 def lower_lows(values: List[float], n: int = 3) -> bool:
     if len(values) < n:
         return False
     sub = values[-n:]
     return all(sub[i] < sub[i - 1] for i in range(1, len(sub)))
-
 
 def hot_memory_bonus(symbol: str, price: float) -> Tuple[float, float, float, List[str]]:
     rec = memory.get("hot", {}).get(symbol, {})
@@ -1320,10 +1171,6 @@ def hot_memory_bonus(symbol: str, price: float) -> Tuple[float, float, float, Li
 
     return cand_bonus, ready_bonus, verify_bonus, reasons
 
-
-# =========================================================
-# ANALİZ
-# =========================================================
 async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
 
@@ -1500,14 +1347,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     verify_score += verify_bonus
     reasons.extend(bonus_reasons)
 
-    # =========================================================
-    # 🐋💰 V8.1 INSTITUTIONAL EYE — OI DIVERGENCE + FUNDING (SHORT YÖNÜ)
-    # Kullanıcının net kuralları:
-    #   SHORT: Fiyat ≥ -%0.1 (yatay/yukarı) + OI ≤ -%1.5  → +25
-    #   SHORT EXTRA: Funding > +0.0005                    → +20
-    # verify_score'a eklenir (teyit aşaması).
-    # =========================================================
-    # OI lookback fiyat değişimi (net delta)
     if WHALE_EYE_ENABLED and len(c1) >= WHALE_OI_LOOKBACK_MIN + 1:
         price_change_for_whale = pct_change(c1[-(WHALE_OI_LOOKBACK_MIN + 1)], last_price)
     else:
@@ -1549,7 +1388,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         except Exception as e:
             logger.warning("Funding Eye hata %s: %s", symbol, e)
 
-    # 🐋💰 KOMBO: hem OI hem Funding SHORT yönünde teyit verdiyse
     institutional_combo_short = (
         whale_payload.get("type") == "BEARISH_DIVERGENCE"
         and funding_payload.get("type") == "SHORT_BONUS"
@@ -1588,7 +1426,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
 
     entry = last_price
 
-    # Kaldıraçlı stop hesaplama (SHORT yönde)
     base_stop_dist = last_atr1 * 2.5
     base_stop_pct = base_stop_dist / entry
     adjusted_stop_pct = calc_leveraged_stop_pct(base_stop_pct)
@@ -1600,7 +1437,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     tp3 = entry - (adjusted_stop_dist * 4.0)
     rr = (entry - tp1) / max(stop - entry, 1e-9)
 
-    # Likidasyon kontrolü (SHORT) - 1x'te likidasyon yok, sadece kaldıraçlıda kontrol et
     liq_safe_v5, liq_gap_v5 = check_stop_vs_liquidation(entry, stop, "SHORT")
     if not liq_safe_v5 and LEVERAGE > 1:
         logger.warning("V5 sinyal RED (likidasyon riski): %s | kaldıraç=%sx | gap=%.2f%%", symbol, LEVERAGE, liq_gap_v5)
@@ -1633,7 +1469,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "vol_ratio_1m": round(vol_ratio_1m, 2),
         "vol_ratio_5m": round(vol_ratio_5m, 2),
         "quote_volume": quote_vol,
-        # 🐋 WHALE EYE
         "whale_enabled": WHALE_EYE_ENABLED,
         "whale_divergence": bool(whale_payload.get("divergence", False)),
         "whale_type": whale_payload.get("type", "NONE"),
@@ -1643,7 +1478,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "whale_short_bonus": safe_float(whale_payload.get("short_bonus", 0)),
         "whale_long_bonus": safe_float(whale_payload.get("long_bonus", 0)),
         "whale_note": whale_payload.get("note", ""),
-        # 💰 FUNDING EYE
         "funding_enabled": FUNDING_EYE_ENABLED,
         "funding_type": funding_payload.get("type", "NONE"),
         "funding_rate": safe_float(funding_payload.get("funding_rate", 0)),
@@ -1652,16 +1486,10 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "funding_short_bonus": safe_float(funding_payload.get("short_bonus", 0)),
         "funding_long_bonus": safe_float(funding_payload.get("long_bonus", 0)),
         "funding_note": funding_payload.get("note", ""),
-        # 🐋💰 KOMBO
         "institutional_combo": institutional_combo_short,
         "reason": " | ".join(reasons[:10]) if reasons else "Sebep yok",
     }
 
-
-
-# =========================================================
-# MA7 / MA25 1H 200 COIN MOTORU
-# =========================================================
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
     for i in range(len(values)):
@@ -1672,10 +1500,9 @@ def sma(values: List[float], period: int) -> List[float]:
             out.append(sum(window) / period)
     return out
 
-
 def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
     stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
-    tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)  # Minimum 1.8:1 RR
+    tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
     tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
     tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
 
@@ -1700,7 +1527,6 @@ def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
         "tp2_pct": round(tp2_pct * 100, 2),
         "tp3_pct": round(tp3_pct * 100, 2),
     }
-
 
 def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int = MA_SUPPORT_RESISTANCE_LOOKBACK) -> Dict[str, float]:
     prev_rows = klines[:-1]
@@ -1727,9 +1553,7 @@ def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int
         "resistance_diff_pct": round(resistance_diff, 4),
     }
 
-
 def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: List[float], ma25: List[float]) -> Optional[Dict[str, Any]]:
-    # Repainting önlemi: Sadece KAPANMIŞ mumları kullan
     if len(k1h) < 3 or len(ma7) < 3 or len(ma25) < 3:
         return None
 
@@ -1738,14 +1562,13 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     cur_ma7 = ma7[-2]
     cur_ma25 = ma25[-2]
 
-    last_candle = k1h[-2]  # [-1] açık mum, [-2] son KAPANMIŞ mum
+    last_candle = k1h[-2]
     candle_ts = str(last_candle[0])
     candle_open = safe_float(last_candle[1])
     candle_high = safe_float(last_candle[2])
     candle_low = safe_float(last_candle[3])
     last_price = safe_float(last_candle[4])
 
-    # Aynı mumda tekrar sinyal üretme (repainting önlemi)
     ts_key = f"{symbol}:{direction}"
     if memory.get("ma_last_candle_ts", {}).get(ts_key) == candle_ts:
         return None
@@ -1783,11 +1606,10 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
 
     targets = calc_ma_targets(entry, direction)
 
-    # Likidasyon güvenlik kontrolü - stop likidasyondan önce olmalı (1x'te likidasyon yok)
     liq_safe, liq_gap = check_stop_vs_liquidation(entry, targets["stop"], direction)
     if not liq_safe and LEVERAGE > 1:
         logger.warning("MA sinyal RED (likidasyon riski): %s %s | stop=%s liq=%s | kaldıraç=%sx | mesafe=%.2f%%",
-                       symbol, direction, fmt_num(targets["stop"]), 
+                       symbol, direction, fmt_num(targets["stop"]),
                        fmt_num(calc_liquidation_price(entry, direction)), LEVERAGE, liq_gap)
         return None
 
@@ -1850,7 +1672,6 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         "entry_note": entry_note,
     }
 
-
 async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], List[float], List[float]]]:
     symbol = normalize_symbol(symbol)
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 80)
@@ -1864,7 +1685,6 @@ async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], 
         return None
     return symbol, k1h, ma7, ma25
 
-
 async def analyze_ma_long_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
     if not prepared:
@@ -1872,14 +1692,12 @@ async def analyze_ma_long_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     sym, k1h, ma7, ma25 = prepared
     return _build_ma_result(sym, "LONG", k1h, ma7, ma25)
 
-
 async def analyze_ma_short_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
     if not prepared:
         return None
     sym, k1h, ma7, ma25 = prepared
     return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
-
 
 async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     prepared = await _prepare_ma_data(symbol)
@@ -1891,14 +1709,11 @@ async def analyze_ma_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return long_res
     return _build_ma_result(sym, "SHORT", k1h, ma7, ma25)
 
-
 def ma_signal_key(res: Dict[str, Any]) -> str:
     return f"MA:{res['symbol']}:{res['direction']}:{res['candle_ts']}"
 
-
 def ma_already_sent(res: Dict[str, Any]) -> bool:
     return bool(memory.get("ma_signals", {}).get(ma_signal_key(res)))
-
 
 def mark_ma_sent(res: Dict[str, Any]) -> None:
     key = ma_signal_key(res)
@@ -1934,27 +1749,9 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
         stats["ma_long_sent"] += 1
     stats["ma_signal_sent"] += 1
     memory["last_signal_ts"] = sent_ts
-    # Mum kapanışı takibi - repainting önlemi
     memory.setdefault("ma_last_candle_ts", {})[f"{res['symbol']}:{res['direction']}"] = res.get("candle_ts", "")
 
-
-# =========================================================
-# FIX KRİTİK: maybe_send_ma_signal fonksiyonu önceki sürümde HİÇ TANIMLI DEĞİLDİ.
-# ma_long_scan_loop ve ma_short_scan_loop bunu çağırıyordu, NameError fırlatıyordu,
-# ama try/except içinde sessizce yutuluyordu. Sonuç: hiç MA sinyali gönderilmedi.
-# =========================================================
-# =========================================================
-# 🐋💰 V8.1 MA INSTITUTIONAL ENRICHMENT
-# MA sinyaline (LONG veya SHORT) OI ve Funding teyidi ekler.
-# LONG için:
-#   - OI yükselişi ≥ +%1.5 (price flat/down iken) → BULLISH DIVERGENCE (+WHALE_LONG_BONUS)
-#   - Funding < -0.0005 → CROWDED SHORT (+FUNDING_LONG_BONUS)
-# SHORT için:
-#   - OI düşüşü ≤ -%1.5 (price flat/up iken) → BEARISH DIVERGENCE (+WHALE_SHORT_BONUS)
-#   - Funding > +0.0005 → CROWDED LONG (+FUNDING_SHORT_BONUS)
-# =========================================================
 async def enrich_ma_with_institutional(res: Dict[str, Any]) -> Dict[str, Any]:
-    """MA sonucuna OI + Funding teyidi ekler. Sinyali bloklamaz, zenginleştirir."""
     if not res:
         return res
     symbol = res.get("symbol", "")
@@ -2033,24 +1830,20 @@ async def enrich_ma_with_institutional(res: Dict[str, Any]) -> Dict[str, Any]:
 
     return res
 
-
 async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
     if not res:
         return
     symbol = res.get("symbol", "")
     direction = res.get("direction", "")
 
-    # Aynı mum + aynı yön için tekrar göndermeyi engelle
     if ma_already_sent(res):
         return
 
-    # 🐋💰 V8.1: MA sonucunu OI + Funding ile zenginleştir
     try:
         res = await enrich_ma_with_institutional(res)
     except Exception as e:
         logger.warning("MA institutional enrichment hata %s %s: %s", symbol, direction, e)
 
-    # Telegram mesajını oluştur ve gönder
     try:
         msg = build_ma_signal_message(res)
     except Exception as e:
@@ -2065,9 +1858,6 @@ async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
                     symbol, direction, fmt_num(safe_float(res.get("entry", 0))), res.get("candle_ts", "-"))
     else:
         logger.warning("MA TELEGRAM GÖNDERİLEMEDİ %s %s", symbol, direction)
-
-
-
 
 def ma_performance_summary() -> Dict[str, Any]:
     stats_mem = memory.setdefault("stats", {})
@@ -2127,14 +1917,12 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
     pos_val = safe_float(res.get('position_value_example', 0))
     max_risk = safe_float(res.get('max_risk_pct', MAX_POSITION_RISK_PCT))
 
-    # Kaldıraçlı pozisyon kaybı hesabı
     position_loss_at_stop = stop_pct * lev
 
     risk_warning = ""
     if lev >= 20:
         risk_warning = f"⚠️ YÜKSEK KALDIRAÇ {lev}x | Pozisyon kaybı stopta: %{position_loss_at_stop:.1f}\n"
 
-    # 🐋💰 V8.1 institutional enrichment badges
     institutional_block = ""
     inst_oi_bonus = safe_float(res.get("institutional_oi_bonus", 0))
     inst_funding_bonus = safe_float(res.get("institutional_funding_bonus", 0))
@@ -2182,6 +1970,7 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Likidasyon: {fmt_num(liq)} (stop ile arası: %{liq_gap:.2f})\n"
         f"Örnek: {pos_val:.0f} USDT pozisyon = {margin_ex:.2f} USDT marj"
     )
+
 def detect_ma_followup_result(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> Optional[Dict[str, Any]]:
     direction = str(rec.get("direction", "")).upper()
     sent_ts = safe_float(rec.get("sent_ts", 0))
@@ -2245,7 +2034,6 @@ def detect_ma_followup_result(rec: Dict[str, Any], klines_1m: List[List[Any]]) -
 
     return None
 
-
 def build_ma_followup_message(rec: Dict[str, Any], hit: Dict[str, Any]) -> str:
     direction = str(rec.get("direction", ""))
     entry = safe_float(rec.get("entry", 0))
@@ -2285,7 +2073,6 @@ def build_ma_followup_message(rec: Dict[str, Any], hit: Dict[str, Any]) -> str:
         f"Fiyat hareketi: %{pnl_pct:.2f}"
     )
 
-
 async def check_ma_followups() -> None:
     if not MA_FOLLOWUP_ENABLED:
         return
@@ -2318,26 +2105,19 @@ async def check_ma_followups() -> None:
                 memory["stats"]["ma_tp"] = int(memory["stats"].get("ma_tp", 0)) + 1
             await save_memory_async()
 
-# =========================================================
-# MEMORY / COOLDOWN
-# =========================================================
 def signal_key(symbol: str, stage: str) -> str:
     return f"{symbol}:{stage}"
-
 
 def get_signal_record(symbol: str, stage: str) -> Dict[str, Any]:
     return memory.get("signals", {}).get(signal_key(symbol, stage), {})
 
-
 def setup_record(symbol: str) -> Dict[str, Any]:
     return memory.get("signals", {}).get(f"setup:{symbol}", {})
-
 
 def setup_in_cooldown(symbol: str) -> bool:
     rec = setup_record(symbol)
     ts = safe_float(rec.get("ts", 0))
     return time.time() - ts < SETUP_COOLDOWN_MIN * 60
-
 
 def better_than_previous(symbol: str, stage: str, payload: Dict[str, Any]) -> bool:
     prev = get_signal_record(symbol, stage)
@@ -2353,14 +2133,11 @@ def better_than_previous(symbol: str, stage: str, payload: Dict[str, Any]) -> bo
         return True
     return False
 
-
 def daily_short_record(symbol: str, day_key: Optional[str] = None) -> Dict[str, Any]:
     return memory.get("daily_short_sent", {}).get(day_key or tr_day_key(), {}).get(symbol, {})
 
-
 def daily_short_already_sent(symbol: str, day_key: Optional[str] = None) -> bool:
     return bool(daily_short_record(symbol, day_key))
-
 
 def set_daily_short_sent(symbol: str, payload: Dict[str, Any]) -> None:
     day_key = tr_day_key()
@@ -2372,10 +2149,8 @@ def set_daily_short_sent(symbol: str, payload: Dict[str, Any]) -> None:
         "reason": payload.get("reason", ""),
     }
 
-
 def get_today_short_sent_count() -> int:
     return len(memory.get("daily_short_sent", {}).get(tr_day_key(), {}))
-
 
 def should_block_signal(symbol: str, stage: str, payload: Dict[str, Any]) -> bool:
     if stage == "SIGNAL" and daily_short_already_sent(symbol):
@@ -2398,7 +2173,6 @@ def should_block_signal(symbol: str, stage: str, payload: Dict[str, Any]) -> boo
 
     return False
 
-
 def set_signal_memory(symbol: str, stage: str, payload: Dict[str, Any]) -> None:
     memory.setdefault("signals", {})[signal_key(symbol, stage)] = {
         "ts": time.time(),
@@ -2415,7 +2189,6 @@ def set_signal_memory(symbol: str, stage: str, payload: Dict[str, Any]) -> None:
     if stage == "SIGNAL":
         set_daily_short_sent(symbol, payload)
     memory["last_signal_ts"] = time.time()
-
 
 def update_hot_memory(res: Dict[str, Any]) -> None:
     sym = res["symbol"]
@@ -2435,17 +2208,12 @@ def update_hot_memory(res: Dict[str, Any]) -> None:
         "last_rise_notice_ts": safe_float(rec.get("last_rise_notice_ts", 0)),
     }
 
-
-# =========================================================
-# MESAJ FORMATLARI
-# =========================================================
 def fmt_num(v: float) -> str:
     if v >= 1000:
         return f"{v:,.4f}".replace(",", "_").replace(".", ",").replace("_", ".")
     if v >= 1:
         return f"{v:.4f}"
     return f"{v:.6f}"
-
 
 def build_signal_message(res: Dict[str, Any]) -> str:
     confirm_status = str(res.get("binance_confirm_status", "YOK"))
@@ -2464,7 +2232,6 @@ def build_signal_message(res: Dict[str, Any]) -> str:
     if LEVERAGE >= 20:
         risk_line = f"⚠️ YÜKSEK KALDIRAÇ {LEVERAGE}x | Stopta pozisyon kaybı: %{pos_loss_v5:.1f}\n"
 
-    # 🐋 Whale Eye satırı
     whale_line = ""
     if res.get("whale_enabled"):
         whale_type = str(res.get("whale_type", "NONE"))
@@ -2481,7 +2248,6 @@ def build_signal_message(res: Dict[str, Any]) -> str:
         elif whale_type == "ALIGNED":
             whale_line = f"🐋 Whale Eye: OI ve fiyat aynı yönde (divergence yok)\n"
 
-    # 💰 Funding satırı
     funding_line = ""
     if res.get("funding_enabled"):
         funding_type = str(res.get("funding_type", "NONE"))
@@ -2496,7 +2262,6 @@ def build_signal_message(res: Dict[str, Any]) -> str:
         elif funding_type == "NEUTRAL":
             funding_line = f"💰 Funding: NEUTRAL (%{funding_pct_8h:+.4f}/8h)\n"
 
-    # 🐋💰 Kombo satırı
     combo_line = ""
     if res.get("institutional_combo"):
         combo_line = "🐋💰 KURUMSAL KOMBO TEYİDİ: OI Bearish + Funding Crowded Long\n"
@@ -2531,6 +2296,7 @@ def build_signal_message(res: Dict[str, Any]) -> str:
         f"Not: {res['reason']}\n"
         f"Binance notu: {binance_reason}"
     )
+
 def build_hot_message(res: Dict[str, Any]) -> str:
     return (
         f"🔥 SICAK TAKİP\n"
@@ -2542,7 +2308,6 @@ def build_hot_message(res: Dict[str, Any]) -> str:
         f"Not: {res['reason']}"
     )
 
-
 def build_ready_message(res: Dict[str, Any]) -> str:
     return (
         f"🟠 İNCE TAKİP\n"
@@ -2552,7 +2317,6 @@ def build_ready_message(res: Dict[str, Any]) -> str:
         f"Fiyat: {fmt_num(res['price'])}\n"
         f"Not: Zemin oluşuyor ama son teyit bekleniyor. {res['reason']}"
     )
-
 
 def build_heartbeat_message() -> str:
     hot_count = len(memory.get("hot", {}))
@@ -2590,6 +2354,7 @@ def build_heartbeat_message() -> str:
         f"Telegram fail: {stats['telegram_fail']}\n"
         f"Red: weak_candidate={stats['weak_candidate_reject']}, weak_signal={stats['weak_signal_reject']}, cooldown={stats['cooldown_reject']}, daily_short={stats['daily_short_block']}, invalid={stats['invalid_symbol_skip']}, blocked={stats['blocked_symbol_skip']}"
     )
+
 def build_diagnostic_message() -> str:
     hot_count = len(memory.get("hot", {}))
     last_sig = safe_float(memory.get("last_signal_ts", 0))
@@ -2619,10 +2384,6 @@ def build_diagnostic_message() -> str:
         f"Yorum: Bu sürümde analiz mantığı korunur; sadece veri tarafı temizlenir ve aynı coin tekrar spam yapmaz."
     )
 
-
-# =========================================================
-# SİNYAL İŞLEME
-# =========================================================
 async def maybe_send_signal(res: Dict[str, Any]) -> None:
     symbol = res["symbol"]
     stage = res["stage"]
@@ -2703,7 +2464,6 @@ async def maybe_send_signal(res: Dict[str, Any]) -> None:
         update_hot_memory(res)
         return
 
-
 async def maybe_send_hot_rise_updates() -> None:
     hot = memory.get("hot", {})
     if not hot:
@@ -2731,7 +2491,6 @@ async def maybe_send_hot_rise_updates() -> None:
             ok = await safe_send_telegram(text)
             if ok:
                 rec["last_rise_notice_ts"] = now_ts
-
 
 async def check_followups() -> None:
     follows = memory.get("follows", {})
@@ -2772,15 +2531,10 @@ async def check_followups() -> None:
             stats["followup_sent"] += 1
             rec["done"] = True
 
-
-# =========================================================
-# TARAMA DÖNGÜLERİ
-# =========================================================
 def get_hot_symbols(limit: int = MAX_HOT_CANDIDATES) -> List[str]:
     hot = memory.get("hot", {})
     items = sorted(hot.items(), key=lambda x: safe_float(x[1].get("score", 0)), reverse=True)
     return [k for k, _ in items[:limit]]
-
 
 def pick_general_symbols(batch_size: int = MAX_DEEP_ANALYSIS_PER_CYCLE) -> List[str]:
     global deep_pointer
@@ -2792,7 +2546,6 @@ def pick_general_symbols(batch_size: int = MAX_DEEP_ANALYSIS_PER_CYCLE) -> List[
         out.append(COINS[deep_pointer % n])
         deep_pointer += 1
     return out
-
 
 async def hot_scan_loop() -> None:
     if not ORIGINAL_V527_ENGINE_ENABLED:
@@ -2817,7 +2570,6 @@ async def hot_scan_loop() -> None:
         except Exception as e:
             logger.exception("hot_scan_loop hata: %s", e)
         await asyncio.sleep(HOT_SCAN_INTERVAL_SEC)
-
 
 async def deep_scan_loop() -> None:
     if not ORIGINAL_V527_ENGINE_ENABLED:
@@ -2844,8 +2596,6 @@ async def deep_scan_loop() -> None:
             logger.exception("deep_scan_loop hata: %s", e)
         await asyncio.sleep(DEEP_SCAN_INTERVAL_SEC)
 
-
-
 async def ma_long_scan_loop() -> None:
     if not MA_ENGINE_ENABLED or not MA_LONG_ENGINE_ENABLED:
         return
@@ -2854,7 +2604,6 @@ async def ma_long_scan_loop() -> None:
             if not COINS:
                 await refresh_coin_pool(force=True)
 
-            # Paralel tarama - 8'li gruplar (gecikmeyi azaltır)
             batch_size = 8
             coins = list(COINS)[:MA_COIN_LIMIT]
             for i in range(0, len(coins), batch_size):
@@ -2869,11 +2618,10 @@ async def ma_long_scan_loop() -> None:
                     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
                     if res:
                         await maybe_send_ma_signal(res)
-                await asyncio.sleep(0.3)  # Rate limit koruması
+                await asyncio.sleep(0.3)
         except Exception as e:
             logger.exception("ma_long_scan_loop hata: %s", e)
         await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
-
 
 async def ma_short_scan_loop() -> None:
     if not MA_ENGINE_ENABLED or not MA_SHORT_ENGINE_ENABLED:
@@ -2883,7 +2631,6 @@ async def ma_short_scan_loop() -> None:
             if not COINS:
                 await refresh_coin_pool(force=True)
 
-            # Paralel tarama - 8'li gruplar (gecikmeyi azaltır)
             batch_size = 8
             coins = list(COINS)[:MA_COIN_LIMIT]
             for i in range(0, len(coins), batch_size):
@@ -2898,11 +2645,10 @@ async def ma_short_scan_loop() -> None:
                     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
                     if res:
                         await maybe_send_ma_signal(res)
-                await asyncio.sleep(0.3)  # Rate limit koruması
+                await asyncio.sleep(0.3)
         except Exception as e:
             logger.exception("ma_short_scan_loop hata: %s", e)
         await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
-
 
 async def ma_followup_loop() -> None:
     if not MA_FOLLOWUP_ENABLED:
@@ -2914,7 +2660,6 @@ async def ma_followup_loop() -> None:
             logger.exception("ma_followup_loop hata: %s", e)
         await asyncio.sleep(max(10, MA_FOLLOWUP_INTERVAL_SEC))
 
-
 async def heartbeat_loop() -> None:
     if not AUTO_HEARTBEAT:
         return
@@ -2924,7 +2669,6 @@ async def heartbeat_loop() -> None:
         except Exception as e:
             logger.exception("heartbeat_loop hata: %s", e)
         await asyncio.sleep(max(60, HEARTBEAT_INTERVAL_SEC))
-
 
 async def diagnostic_loop() -> None:
     while True:
@@ -2940,7 +2684,6 @@ async def diagnostic_loop() -> None:
             logger.exception("diagnostic_loop hata: %s", e)
         await asyncio.sleep(600)
 
-
 async def followup_loop() -> None:
     while True:
         try:
@@ -2948,7 +2691,6 @@ async def followup_loop() -> None:
         except Exception as e:
             logger.exception("followup_loop hata: %s", e)
         await asyncio.sleep(max(60, FOLLOWUP_CHECK_INTERVAL_SEC))
-
 
 async def save_loop() -> None:
     while True:
@@ -2958,10 +2700,6 @@ async def save_loop() -> None:
             logger.exception("save_loop hata: %s", e)
         await asyncio.sleep(max(20, MEMORY_SAVE_INTERVAL_SEC))
 
-
-# =========================================================
-# TELEGRAM KOMUTLARI
-# =========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
@@ -2979,15 +2717,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Not: Veri OKX SWAP, işlem teyidi Binance tarafında."
     )
 
-
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ok = await safe_send_telegram(f"✅ Test mesajı başarılı. Saat: {tr_str()}")
     await update.message.reply_text("Test mesajı gönderildi." if ok else "Test mesajı gönderilemedi.")
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(build_heartbeat_message())
-
 
 async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hot = memory.get("hot", {})
@@ -3002,7 +2737,6 @@ async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tickers24 = await get_24h_tickers()
     syms = pick_general_symbols(8)
@@ -3013,7 +2747,6 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
         out.append(f"- {sym} | {res['stage']} | skor={res['score']} | fiyat={fmt_num(res['price'])}")
     await update.message.reply_text("\n".join(out[:25]))
-
 
 async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -3045,8 +2778,6 @@ async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Sebep: {res.get('reason', 'Yok')}"
         )
 
-
-
 async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Kullanım: /ma BTCUSDT")
@@ -3057,7 +2788,6 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(build_ma_signal_message(res))
     else:
         await update.message.reply_text(f"{symbol} için şu an 1 saatlik MA7/MA25 temas-kesişim yok.")
-
 
 async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ma_perf = ma_performance_summary()
@@ -3082,9 +2812,7 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"MA analiz: {memory.get('stats', {}).get('ma_analyzed', 0)}"
     )
 
-
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🐋💰 Tek coin için OI + Funding kurumsal analizi"""
     if not WHALE_EYE_ENABLED and not FUNDING_EYE_ENABLED:
         await update.message.reply_text("🐋 Whale Eye ve Funding Eye motorları kapalı")
         return
@@ -3115,7 +2843,6 @@ async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     symbol = normalize_symbol(context.args[0])
 
-    # Paralel OI + Funding
     oi_task = fetch_okx_open_interest(symbol)
     funding_task = fetch_okx_funding_rate(symbol)
     oi_now, funding_rate = await asyncio.gather(oi_task, funding_task)
@@ -3172,9 +2899,7 @@ async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """💰 Sadece funding rate sorgusu"""
     if not FUNDING_EYE_ENABLED:
         await update.message.reply_text("💰 Funding Eye motoru kapalı (FUNDING_EYE_ENABLED=false)")
         return
@@ -3208,10 +2933,6 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Not: {f_signal.get('note', '-') or '-'}"
     )
 
-
-# =========================================================
-# BAŞLATMA
-# =========================================================
 async def post_init(application) -> None:
     active_count, pruned_count = await refresh_coin_pool(force=True)
 
@@ -3251,7 +2972,6 @@ async def post_init(application) -> None:
     asyncio.create_task(save_loop())
     logger.info("Arka plan döngüleri başlatıldı")
 
-
 def validate_config() -> None:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
@@ -3260,7 +2980,6 @@ def validate_config() -> None:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         raise RuntimeError(f"Eksik env: {', '.join(missing)}")
-
 
 def build_app():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
@@ -3276,7 +2995,6 @@ def build_app():
     application.add_handler(CommandHandler("funding", cmd_funding))
     return application
 
-
 def main() -> None:
     validate_config()
     load_memory()
@@ -3288,7 +3006,6 @@ def main() -> None:
     except (KeyboardInterrupt, SystemExit):
         logger.info("Kapanma sinyali alındı")
     finally:
-        # FIX: Graceful shutdown - memory'yi sync olarak kaydet, session'ı kapat
         try:
             save_memory()
             logger.info("Memory kapanışta kaydedildi")
@@ -3298,7 +3015,6 @@ def main() -> None:
             SESSION.close()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     main()
