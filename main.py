@@ -22,7 +22,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # - Ana analiz mantigina minimum dokunmak
 # =========================================================
 
-VERSION_NAME = "Balina Avcısı V8 PRO MAX (Whale Eye + OI Divergence)"
+VERSION_NAME = "Balina Avcısı V8.1 ULTIMATE (OI + Funding Institutional Eye)"
 
 # -------------------------
 # ENV / AYARLAR
@@ -122,6 +122,31 @@ WHALE_DIVERGENCE_BONUS = float(os.getenv("WHALE_DIVERGENCE_BONUS", "25"))       
 WHALE_SOFT_BONUS_PCT = float(os.getenv("WHALE_SOFT_BONUS_PCT", "0.4"))           # OI hareketi eşik altıysa ama divergence yönündeyse oran (0.4 = bonusun %40'ı)
 
 # =========================================================
+# 💰 V8.1 FUNDING EYE - OKX FUNDING RATE MOTORU
+# /api/v5/public/funding-rate?instId={symbol}
+# Mantık:
+#   • Funding > +0.0005 (extreme positive) = aşırı long crowd = SHORT için +20 bonus
+#   • Funding < -0.0005 (extreme negative) = aşırı short crowd = LONG için +20 bonus
+# 8 saatte bir settle olduğu için cache agresif (30dk default).
+# =========================================================
+FUNDING_EYE_ENABLED = os.getenv("FUNDING_EYE_ENABLED", "true").lower() == "true"
+FUNDING_CACHE_SEC = int(float(os.getenv("FUNDING_CACHE_SEC", "1800")))                  # 30 dk
+FUNDING_BEARISH_THRESHOLD = float(os.getenv("FUNDING_BEARISH_THRESHOLD", "0.0005"))     # Üstü = SHORT bonus (kullanıcının talebi)
+FUNDING_BULLISH_THRESHOLD = float(os.getenv("FUNDING_BULLISH_THRESHOLD", "-0.0005"))    # Altı = LONG bonus (mirror)
+FUNDING_SHORT_BONUS = float(os.getenv("FUNDING_SHORT_BONUS", "20"))                     # SHORT için extra +20 (kullanıcı talebi)
+FUNDING_LONG_BONUS = float(os.getenv("FUNDING_LONG_BONUS", "20"))                       # LONG mirror için extra +20
+
+# =========================================================
+# 🐋 V8.1 KURAL-BAZLI WHALE EYE THRESHOLDS (kullanıcının net kuralları)
+# =========================================================
+WHALE_OI_BEARISH_DROP_PCT = float(os.getenv("WHALE_OI_BEARISH_DROP_PCT", "-1.5"))    # OI bu kadar veya daha çok düşerse SHORT
+WHALE_OI_BULLISH_RISE_PCT = float(os.getenv("WHALE_OI_BULLISH_RISE_PCT", "1.5"))     # OI bu kadar veya daha çok yükselirse LONG
+WHALE_PRICE_FLAT_UP_MIN_PCT = float(os.getenv("WHALE_PRICE_FLAT_UP_MIN_PCT", "-0.1")) # SHORT için fiyat değişimi bu eşikten yukarıda olmalı (yatay/yukarı)
+WHALE_PRICE_FLAT_DOWN_MAX_PCT = float(os.getenv("WHALE_PRICE_FLAT_DOWN_MAX_PCT", "0.1")) # LONG için fiyat değişimi bu eşikten aşağıda olmalı (yatay/aşağı)
+WHALE_SHORT_BONUS = float(os.getenv("WHALE_SHORT_BONUS", "25"))                       # SHORT için +25 (kullanıcı talebi)
+WHALE_LONG_BONUS = float(os.getenv("WHALE_LONG_BONUS", "25"))                         # LONG mirror için +25
+
+# =========================================================
 # YÜKSEK KALDIRAÇ RİSK YÖNETİMİ (20x-30x)
 # =========================================================
 LEVERAGE = float(os.getenv("LEVERAGE", "1"))
@@ -219,6 +244,9 @@ symbol_fail_state: Dict[str, Dict[str, Any]] = {}
 oi_history: Dict[str, List[Tuple[float, float]]] = {}  # symbol -> [(ts, oi_value), ...]
 oi_cache: Dict[str, Tuple[float, float]] = {}          # symbol -> (fetch_ts, oi_value)
 
+# 💰 FUNDING EYE state - 8h settle, agresif cache
+funding_cache: Dict[str, Tuple[float, float]] = {}     # symbol -> (fetch_ts, funding_rate)
+
 memory: Dict[str, Any] = {
     "hot": {},
     "signals": {},
@@ -265,10 +293,18 @@ stats: Dict[str, Any] = {
     "whale_oi_calls": 0,
     "whale_oi_fail": 0,
     "whale_divergence_hit": 0,
-    "whale_bearish_divergence": 0,   # Fiyat ↑ + OI ↓
-    "whale_short_pileup": 0,         # Fiyat ↓ + OI ↑
+    "whale_bearish_divergence": 0,   # Fiyat ↑/yatay + OI ↓ (SHORT)
+    "whale_bullish_divergence": 0,   # Fiyat ↓/yatay + OI ↑ (LONG mirror)
+    "whale_short_pileup": 0,         # legacy alan, geriye uyum
     "whale_soft_hit": 0,             # Eşik altı ama yönü doğru
     "whale_warmup_skip": 0,          # History yetersiz
+    # 💰 FUNDING EYE counters
+    "funding_calls": 0,
+    "funding_fail": 0,
+    "funding_short_bonus_hit": 0,    # Funding > +0.0005 (SHORT için)
+    "funding_long_bonus_hit": 0,     # Funding < -0.0005 (LONG mirror için)
+    # 🐋💰 INSTITUTIONAL COMBO
+    "institutional_combo_hit": 0,    # OI + Funding aynı yönde teyit
 }
 
 app = None
@@ -436,7 +472,7 @@ def cleanup_memory() -> None:
 
 
 def cleanup_whale_oi_state() -> None:
-    """🐋 OI history'sinden artık takip edilmeyen coinleri temizle"""
+    """🐋💰 OI history + Funding cache temizliği - artık takip edilmeyen coinler"""
     now_ts = time.time()
     cutoff = now_ts - (WHALE_OI_LOOKBACK_MIN * 60 * 3)  # 3x lookback'ten eski coin verilerini sil
     for sym in list(oi_history.keys()):
@@ -444,6 +480,12 @@ def cleanup_whale_oi_state() -> None:
         if not hist or hist[-1][0] < cutoff:
             oi_history.pop(sym, None)
             oi_cache.pop(sym, None)
+    # Funding cache 2x cache süresinden eski olanları sil
+    funding_cutoff = now_ts - (FUNDING_CACHE_SEC * 2)
+    for sym in list(funding_cache.keys()):
+        ts, _ = funding_cache[sym]
+        if ts < funding_cutoff:
+            funding_cache.pop(sym, None)
 
 
 def note_symbol_fail(symbol: str, reason: str = "") -> None:
@@ -531,14 +573,35 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 
-def _okx_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
+    """OKX v5 GET wrapper. Transient hatalar (429, 5xx, timeout) için retry yapar."""
     url = f"{OKX_BASE_URL}{path}"
-    resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if str(data.get("code", "1")) != "0":
-        raise RuntimeError(f"OKX hata: code={data.get('code')} msg={data.get('msg')}")
-    return data.get("data", [])
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
+            # Rate limit veya geçici sunucu hataları için retry
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"HTTP {resp.status_code}")
+                if attempt < max_retries:
+                    time.sleep(0.5 + attempt * 0.5)
+                    continue
+                resp.raise_for_status()
+            resp.raise_for_status()
+            data = resp.json()
+            if str(data.get("code", "1")) != "0":
+                # Bazı OKX hataları (51001 = symbol bulunamadı) retry'a değmez
+                raise RuntimeError(f"OKX hata: code={data.get('code')} msg={data.get('msg')}")
+            return data.get("data", [])
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(0.5 + attempt * 0.5)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return []
 
 
 def _okx_to_kline(row: List[Any]) -> List[Any]:
@@ -867,48 +930,106 @@ async def confirm_signal_on_binance(res: Dict[str, Any]) -> Dict[str, Any]:
 # =========================================================
 # 🐋 WHALE EYE - OKX OPEN INTEREST DIVERGENCE MOTORU
 # =========================================================
-async def fetch_oi(symbol: str) -> float:
+# =========================================================
+# 🐋 V8.1 WHALE EYE - OKX OPEN INTEREST API LAYER
+# Kullanıcı talebi: tek instId paramı, UPPERCASE + -SWAP, hatasız iletişim
+# =========================================================
+async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
     """
-    OKX /api/v5/market/open-interest endpointinden anlık OI çek.
-    oiCcy (currency cinsinden) tercih edilir; yoksa oi (kontrat) kullanılır.
+    OKX /api/v5/market/open-interest?instId={symbol}
     
-    Cache stratejisi: WHALE_OI_CACHE_SEC saniyede bir gerçek API çağrısı.
-    OKX rate limit: 20 req / 2sec — cache bu pencerede tüm coin'ler için yeter.
+    Returns: float (oiCcy varsa onu, yoksa oi). API başarısızsa None.
+    UPPERCASE + -SWAP normalize edilir. okx_live_symbols pre-filter YOK
+    (kullanıcı manuel komutlarla herhangi bir coin için sorgulayabilmeli).
     """
     symbol = normalize_symbol(symbol)
-
-    # Geçersiz veya geçici bloklu coinler için API'ye gitme
-    if okx_live_symbols and symbol not in okx_live_symbols:
-        return 0.0
+    if not symbol or "-" not in symbol:
+        return None
     if symbol_temporarily_blocked(symbol):
-        return 0.0
+        return None
 
+    # Cache kontrolü
     cached = oi_cache.get(symbol)
     now_ts = time.time()
     if cached and now_ts - cached[0] <= WHALE_OI_CACHE_SEC:
         return cached[1]
 
+    stats["whale_oi_calls"] += 1
     try:
+        # KULLANICI KURALI: SADECE instId, instType YOK
         data = await asyncio.to_thread(
             _okx_get,
             "/api/v5/market/open-interest",
-            {"instId": symbol, "instType": OKX_INST_TYPE},
+            {"instId": symbol},
         )
-        stats["whale_oi_calls"] += 1
         if not data:
             stats["whale_oi_fail"] += 1
-            return 0.0
+            return None
         row = data[0] if isinstance(data, list) else data
         # oiCcy = currency cinsinden OI (BTC, ETH vb) — coinler arası karşılaştırılabilir
         # oi = kontrat sayısı (multiplier'a göre değişir)
         oi_val = safe_float(row.get("oiCcy", 0)) or safe_float(row.get("oi", 0))
         if oi_val > 0:
             oi_cache[symbol] = (now_ts, oi_val)
-        return oi_val
+            return oi_val
+        stats["whale_oi_fail"] += 1
+        return None
     except Exception as e:
         stats["whale_oi_fail"] += 1
         logger.warning("OKX OI alınamadı %s: %s", symbol, e)
-        return 0.0
+        return None
+
+
+async def fetch_oi(symbol: str) -> float:
+    """Geriye uyum wrapper'ı. fetch_okx_open_interest'in float-veya-0 versiyonu."""
+    val = await fetch_okx_open_interest(symbol)
+    return val if val is not None else 0.0
+
+
+# =========================================================
+# 💰 V8.1 FUNDING EYE - OKX FUNDING RATE API LAYER
+# /api/v5/public/funding-rate?instId={symbol}
+# =========================================================
+async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
+    """
+    OKX /api/v5/public/funding-rate?instId={symbol}
+    
+    Returns: float (anlık fundingRate, örn 0.0001 = %0.01/8h). API başarısızsa None.
+    Funding 8 saatte bir settle olduğu için cache agresif (FUNDING_CACHE_SEC default 30dk).
+    """
+    symbol = normalize_symbol(symbol)
+    if not symbol or "-" not in symbol:
+        return None
+    if symbol_temporarily_blocked(symbol):
+        return None
+
+    cached = funding_cache.get(symbol)
+    now_ts = time.time()
+    if cached and now_ts - cached[0] <= FUNDING_CACHE_SEC:
+        return cached[1]
+
+    stats["funding_calls"] += 1
+    try:
+        data = await asyncio.to_thread(
+            _okx_get,
+            "/api/v5/public/funding-rate",
+            {"instId": symbol},
+        )
+        if not data:
+            stats["funding_fail"] += 1
+            return None
+        row = data[0] if isinstance(data, list) else data
+        rate = safe_float(row.get("fundingRate", 0))
+        # OKX bazen "0" string dönebilir; -1 ile +1 arasında olmayan değerler garip
+        if -0.05 < rate < 0.05:  # %5'in altında olmalı (mantıklı funding rate aralığı)
+            funding_cache[symbol] = (now_ts, rate)
+            return rate
+        stats["funding_fail"] += 1
+        return None
+    except Exception as e:
+        stats["funding_fail"] += 1
+        logger.warning("OKX funding alınamadı %s: %s", symbol, e)
+        return None
 
 
 def record_oi_snapshot(symbol: str, oi_val: float) -> None:
@@ -967,21 +1088,35 @@ def calc_oi_change_pct(symbol: str, lookback_sec: float) -> Optional[float]:
 
 def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, Any]:
     """
-    Fiyat-OI uyumsuzluğu (divergence) tespiti.
+    V8.1 KURAL-BAZLI DIVERGENCE TESPİTİ — kullanıcının net kuralları:
+    
+    SHORT (Bearish Divergence):
+      - Fiyat yatay veya yukarı (price_change_pct >= WHALE_PRICE_FLAT_UP_MIN_PCT, default ≥ -0.1%)
+      - OI sert düşüş (oi_change_pct <= WHALE_OI_BEARISH_DROP_PCT, default ≤ -1.5%)
+      - → +WHALE_SHORT_BONUS (default +25) verify_score'a
+    
+    LONG (Bullish Divergence — mirror):
+      - Fiyat yatay veya aşağı (price_change_pct <= WHALE_PRICE_FLAT_DOWN_MAX_PCT, default ≤ +0.1%)
+      - OI sert yükseliş (oi_change_pct >= WHALE_OI_BULLISH_RISE_PCT, default ≥ +1.5%)
+      - → +WHALE_LONG_BONUS (default +25) LONG için
     
     Returns dict:
-      - divergence: bool
-      - type: BEARISH_DIVERGENCE | SHORT_PILEUP | ALIGNED | QUIET | NO_DATA | DISABLED
+      - divergence: bool (hard hit yakalandı mı)
+      - type: BEARISH_DIVERGENCE | BULLISH_DIVERGENCE | ALIGNED | QUIET | NO_DATA | DISABLED
       - oi_change_pct: float
       - price_change_pct: float
-      - bonus: float (skora eklenecek puan)
-      - note: str (Telegram mesajına eklenecek not)
+      - short_bonus: float (SHORT motoru için)
+      - long_bonus: float (LONG mirror motoru için)
+      - bonus: float (geriye uyum - genelde SHORT bonus)
+      - note: str
     """
     base = {
         "divergence": False,
         "type": "NONE",
         "oi_change_pct": 0.0,
         "price_change_pct": round(price_change_pct, 2),
+        "short_bonus": 0.0,
+        "long_bonus": 0.0,
         "bonus": 0.0,
         "note": "",
     }
@@ -999,67 +1134,107 @@ def detect_whale_divergence(symbol: str, price_change_pct: float) -> Dict[str, A
 
     base["oi_change_pct"] = round(oi_change, 2)
 
-    price_strong = abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT
-    oi_strong = abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT
+    # SHORT - BEARISH DIVERGENCE
+    # Fiyat ≥ -0.1% (yatay veya yukarı) AND OI ≤ -1.5% (sert düşüş)
+    if price_change_pct >= WHALE_PRICE_FLAT_UP_MIN_PCT and oi_change <= WHALE_OI_BEARISH_DROP_PCT:
+        stats["whale_bearish_divergence"] += 1
+        stats["whale_divergence_hit"] += 1
+        return {
+            "divergence": True,
+            "type": "BEARISH_DIVERGENCE",
+            "oi_change_pct": round(oi_change, 2),
+            "price_change_pct": round(price_change_pct, 2),
+            "short_bonus": WHALE_SHORT_BONUS,
+            "long_bonus": 0.0,
+            "bonus": WHALE_SHORT_BONUS,  # geriye uyum
+            "note": f"🐋 BEARISH DIVERGENCE: Fiyat %{price_change_pct:+.2f} (yatay/yukarı) ⇄ OI %{oi_change:+.2f} (sert düşüş) → SHORT +{WHALE_SHORT_BONUS:.0f}",
+        }
 
-    # BEARISH DIVERGENCE: Fiyat ↑ + OI ↓  → Balinalar long kapatıyor / shortlar yapılıyor sessizce
-    if price_change_pct > 0 and oi_change < 0:
-        if price_strong and oi_strong:
-            stats["whale_bearish_divergence"] += 1
-            stats["whale_divergence_hit"] += 1
-            return {
-                "divergence": True,
-                "type": "BEARISH_DIVERGENCE",
-                "oi_change_pct": round(oi_change, 2),
-                "price_change_pct": round(price_change_pct, 2),
-                "bonus": WHALE_DIVERGENCE_BONUS,
-                "note": f"🐋 BALINA BEARISH DIVERGENCE: Fiyat +%{price_change_pct:.2f} ⇄ OI %{oi_change:.2f} (long kapatma)",
-            }
-        # Yönü doğru ama eşik altı - soft bonus
-        if abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT * 0.5 and abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT * 0.5:
-            stats["whale_soft_hit"] += 1
-            soft_bonus = WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT
-            return {
-                "divergence": False,
-                "type": "BEARISH_SOFT",
-                "oi_change_pct": round(oi_change, 2),
-                "price_change_pct": round(price_change_pct, 2),
-                "bonus": soft_bonus,
-                "note": f"🐋 BALINA bearish ipucu (soft): Fiyat +%{price_change_pct:.2f} ⇄ OI %{oi_change:.2f}",
-            }
+    # LONG - BULLISH DIVERGENCE (mirror)
+    # Fiyat ≤ +0.1% (yatay veya aşağı) AND OI ≥ +1.5% (sert yükseliş)
+    if price_change_pct <= WHALE_PRICE_FLAT_DOWN_MAX_PCT and oi_change >= WHALE_OI_BULLISH_RISE_PCT:
+        stats["whale_bullish_divergence"] += 1
+        stats["whale_divergence_hit"] += 1
+        return {
+            "divergence": True,
+            "type": "BULLISH_DIVERGENCE",
+            "oi_change_pct": round(oi_change, 2),
+            "price_change_pct": round(price_change_pct, 2),
+            "short_bonus": 0.0,
+            "long_bonus": WHALE_LONG_BONUS,
+            "bonus": 0.0,
+            "note": f"🐋 BULLISH DIVERGENCE: Fiyat %{price_change_pct:+.2f} (yatay/aşağı) ⇄ OI %{oi_change:+.2f} (sert yükseliş) → LONG +{WHALE_LONG_BONUS:.0f}",
+        }
 
-    # SHORT PILEUP: Fiyat ↓ + OI ↑  → Yeni shortlar yığılıyor, downtrend onaylı
-    if price_change_pct < 0 and oi_change > 0:
-        if price_strong and oi_strong:
-            stats["whale_short_pileup"] += 1
-            stats["whale_divergence_hit"] += 1
-            return {
-                "divergence": True,
-                "type": "SHORT_PILEUP",
-                "oi_change_pct": round(oi_change, 2),
-                "price_change_pct": round(price_change_pct, 2),
-                "bonus": WHALE_DIVERGENCE_BONUS,
-                "note": f"🐋 BALINA SHORT PILEUP: Fiyat %{price_change_pct:.2f} + OI +%{oi_change:.2f} (yeni shortlar)",
-            }
-        if abs(price_change_pct) >= WHALE_MIN_PRICE_MOVE_PCT * 0.5 and abs(oi_change) >= WHALE_MIN_OI_MOVE_PCT * 0.5:
-            stats["whale_soft_hit"] += 1
-            soft_bonus = WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT
-            return {
-                "divergence": False,
-                "type": "PILEUP_SOFT",
-                "oi_change_pct": round(oi_change, 2),
-                "price_change_pct": round(price_change_pct, 2),
-                "bonus": soft_bonus,
-                "note": f"🐋 BALINA short yığılma ipucu (soft): Fiyat %{price_change_pct:.2f} + OI +%{oi_change:.2f}",
-            }
-
-    # Aynı yön (price↑+OI↑ veya price↓+OI↓) = momentum confirmation, divergence YOK
+    # Aynı yön - momentum, divergence yok
     if (price_change_pct > 0 and oi_change > 0) or (price_change_pct < 0 and oi_change < 0):
         base["type"] = "ALIGNED"
-        base["note"] = f"OI ile fiyat aynı yönde (%{oi_change:.2f} / %{price_change_pct:.2f})"
+        base["note"] = f"OI ile fiyat aynı yönde (%{oi_change:+.2f} / %{price_change_pct:+.2f})"
         return base
 
     base["type"] = "QUIET"
+    return base
+
+
+def detect_funding_signal(funding_rate: Optional[float]) -> Dict[str, Any]:
+    """
+    V8.1 KURAL-BAZLI FUNDING SİNYALİ — kullanıcının net kuralları:
+    
+    SHORT:
+      - funding_rate > FUNDING_BEARISH_THRESHOLD (+0.0005) → +FUNDING_SHORT_BONUS (+20)
+    
+    LONG (mirror):
+      - funding_rate < FUNDING_BULLISH_THRESHOLD (-0.0005) → +FUNDING_LONG_BONUS (+20)
+    
+    Returns dict:
+      - type: SHORT_BONUS | LONG_BONUS | NEUTRAL | NO_DATA | DISABLED
+      - funding_rate: float (0.0001 = %0.01/8h)
+      - funding_pct_8h: float
+      - annual_pct: float (yıllıklandırılmış)
+      - short_bonus: float
+      - long_bonus: float
+      - note: str
+    """
+    base = {
+        "type": "DISABLED" if not FUNDING_EYE_ENABLED else "NO_DATA",
+        "funding_rate": 0.0,
+        "funding_pct_8h": 0.0,
+        "annual_pct": 0.0,
+        "short_bonus": 0.0,
+        "long_bonus": 0.0,
+        "note": "",
+    }
+
+    if not FUNDING_EYE_ENABLED:
+        return base
+    if funding_rate is None:
+        return base
+
+    base["funding_rate"] = funding_rate
+    base["funding_pct_8h"] = round(funding_rate * 100, 4)
+    base["annual_pct"] = round(funding_rate * 100 * 3 * 365, 2)  # 3 funding/gün × 365
+
+    if funding_rate > FUNDING_BEARISH_THRESHOLD:
+        stats["funding_short_bonus_hit"] += 1
+        return {
+            **base,
+            "type": "SHORT_BONUS",
+            "short_bonus": FUNDING_SHORT_BONUS,
+            "long_bonus": 0.0,
+            "note": f"💰 EXTREME POSITIVE FUNDING %{funding_rate*100:+.4f}/8h (yıllık ≈%{base['annual_pct']:+.0f}) → SHORT +{FUNDING_SHORT_BONUS:.0f}",
+        }
+
+    if funding_rate < FUNDING_BULLISH_THRESHOLD:
+        stats["funding_long_bonus_hit"] += 1
+        return {
+            **base,
+            "type": "LONG_BONUS",
+            "short_bonus": 0.0,
+            "long_bonus": FUNDING_LONG_BONUS,
+            "note": f"💰 EXTREME NEGATIVE FUNDING %{funding_rate*100:+.4f}/8h (yıllık ≈%{base['annual_pct']:+.0f}) → LONG +{FUNDING_LONG_BONUS:.0f}",
+        }
+
+    base["type"] = "NEUTRAL"
     return base
 
 
@@ -1402,26 +1577,56 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     reasons.extend(bonus_reasons)
 
     # =========================================================
-    # 🐋 WHALE EYE - OI DIVERGENCE SKOR ENTEGRASYONU
-    # Fiyat-OI uyumsuzluğu varsa +WHALE_DIVERGENCE_BONUS (default +25) puan
-    # verify_score'a eklenir çünkü divergence bir TEYİT sinyalidir, aday değil.
+    # 🐋💰 V8.1 INSTITUTIONAL EYE - OI DIVERGENCE + FUNDING RATE
+    # Kullanıcının net kuralları:
+    #   SHORT: Fiyat yatay/yukarı + OI %1.5'ten fazla düşüş → +25
+    #   SHORT EXTRA: Funding > +0.0005 → +20
+    # Skor verify_score'a eklenir (TEYİT aşaması).
     # =========================================================
     whale_oi_value = 0.0
     whale_payload: Dict[str, Any] = {
         "divergence": False, "type": "DISABLED", "oi_change_pct": 0.0,
-        "price_change_pct": round(price_change_for_whale, 2), "bonus": 0.0, "note": "",
+        "price_change_pct": round(price_change_for_whale, 2),
+        "short_bonus": 0.0, "long_bonus": 0.0, "bonus": 0.0, "note": "",
     }
+    funding_rate_value: Optional[float] = None
+    funding_payload: Dict[str, Any] = {
+        "type": "DISABLED", "funding_rate": 0.0, "funding_pct_8h": 0.0,
+        "annual_pct": 0.0, "short_bonus": 0.0, "long_bonus": 0.0, "note": "",
+    }
+
     if WHALE_EYE_ENABLED:
         try:
             whale_oi_value, _ = await update_whale_oi(symbol)
             whale_payload = detect_whale_divergence(symbol, price_change_for_whale)
-            whale_bonus = safe_float(whale_payload.get("bonus", 0))
-            if whale_bonus > 0:
-                verify_score += whale_bonus
+            whale_short_bonus = safe_float(whale_payload.get("short_bonus", 0))
+            if whale_short_bonus > 0:
+                verify_score += whale_short_bonus
                 if whale_payload.get("note"):
                     reasons.append(whale_payload["note"])
         except Exception as e:
             logger.warning("Whale Eye hata %s: %s", symbol, e)
+
+    if FUNDING_EYE_ENABLED:
+        try:
+            funding_rate_value = await fetch_okx_funding_rate(symbol)
+            funding_payload = detect_funding_signal(funding_rate_value)
+            funding_short_bonus = safe_float(funding_payload.get("short_bonus", 0))
+            if funding_short_bonus > 0:
+                verify_score += funding_short_bonus
+                if funding_payload.get("note"):
+                    reasons.append(funding_payload["note"])
+        except Exception as e:
+            logger.warning("Funding Eye hata %s: %s", symbol, e)
+
+    # 🐋💰 KOMBO TEYİT - hem OI hem Funding SHORT yönünde sinyal verdiyse
+    institutional_combo_short = (
+        whale_payload.get("type") == "BEARISH_DIVERGENCE"
+        and funding_payload.get("type") == "SHORT_BONUS"
+    )
+    if institutional_combo_short:
+        stats["institutional_combo_hit"] += 1
+        reasons.append("🐋💰 KURUMSAL KOMBO: OI Bearish Divergence + Extreme Positive Funding")
 
     if pump_10m < 0.55 and pump_20m < 1.0:
         candidate_score -= 4
@@ -1505,8 +1710,21 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "whale_oi_value": whale_oi_value,
         "whale_oi_change_pct": safe_float(whale_payload.get("oi_change_pct", 0)),
         "whale_price_change_pct": safe_float(whale_payload.get("price_change_pct", 0)),
+        "whale_short_bonus": safe_float(whale_payload.get("short_bonus", 0)),
+        "whale_long_bonus": safe_float(whale_payload.get("long_bonus", 0)),
         "whale_bonus": safe_float(whale_payload.get("bonus", 0)),
         "whale_note": whale_payload.get("note", ""),
+        # 💰 FUNDING EYE fields
+        "funding_enabled": FUNDING_EYE_ENABLED,
+        "funding_type": funding_payload.get("type", "NONE"),
+        "funding_rate": safe_float(funding_payload.get("funding_rate", 0)),
+        "funding_pct_8h": safe_float(funding_payload.get("funding_pct_8h", 0)),
+        "funding_annual_pct": safe_float(funding_payload.get("annual_pct", 0)),
+        "funding_short_bonus": safe_float(funding_payload.get("short_bonus", 0)),
+        "funding_long_bonus": safe_float(funding_payload.get("long_bonus", 0)),
+        "funding_note": funding_payload.get("note", ""),
+        # 🐋💰 KOMBO
+        "institutional_combo": institutional_combo_short,
         "reason": " | ".join(reasons[:10]) if reasons else "Sebep yok",
     }
 
@@ -1796,6 +2014,107 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
 # ma_long_scan_loop ve ma_short_scan_loop bunu çağırıyordu, NameError fırlatıyordu,
 # ama try/except içinde sessizce yutuluyordu. Sonuç: hiç MA sinyali gönderilmedi.
 # =========================================================
+# =========================================================
+# 🐋💰 V8.1 MA INSTITUTIONAL ENRICHMENT
+# MA sinyaline (LONG veya SHORT) OI ve Funding teyidi ekler.
+# LONG için:
+#   - OI yükselişi >= +1.5% (price flat/down iken) → BULLISH DIVERGENCE (+WHALE_LONG_BONUS)
+#   - Funding < -0.0005 (extreme negative) → CROWDED SHORT (+FUNDING_LONG_BONUS)
+# SHORT için:
+#   - OI düşüşü <= -1.5% (price flat/up iken) → BEARISH DIVERGENCE (+WHALE_SHORT_BONUS)
+#   - Funding > +0.0005 (extreme positive) → CROWDED LONG (+FUNDING_SHORT_BONUS)
+# =========================================================
+async def enrich_ma_with_institutional(res: Dict[str, Any]) -> Dict[str, Any]:
+    """MA sonucuna OI + Funding analizini ekler. Sinyali bloklamaz, sadece zenginleştirir."""
+    if not res:
+        return res
+    symbol = res.get("symbol", "")
+    direction = res.get("direction", "")
+    if not symbol or not direction:
+        return res
+
+    # Bilgi alanlarının varsayılan değerleri
+    res.setdefault("institutional_oi_change_pct", 0.0)
+    res.setdefault("institutional_oi_bonus", 0.0)
+    res.setdefault("institutional_funding_rate", 0.0)
+    res.setdefault("institutional_funding_pct_8h", 0.0)
+    res.setdefault("institutional_funding_annual_pct", 0.0)
+    res.setdefault("institutional_funding_bonus", 0.0)
+    res.setdefault("institutional_total_bonus", 0.0)
+    res.setdefault("institutional_confirmed", False)
+    res.setdefault("institutional_notes", [])
+
+    # OI snapshot + history
+    if WHALE_EYE_ENABLED:
+        try:
+            oi_now = await fetch_okx_open_interest(symbol)
+            if oi_now and oi_now > 0:
+                record_oi_snapshot(symbol, oi_now)
+            oi_change = calc_oi_change_pct(symbol, WHALE_OI_LOOKBACK_MIN * 60)
+            if oi_change is not None:
+                res["institutional_oi_change_pct"] = round(oi_change, 2)
+                # Fiyat değişimini son lookback dakikalık periyot için al
+                k1m = await get_klines(symbol, "1m", WHALE_OI_LOOKBACK_MIN + 5)
+                if len(k1m) >= WHALE_OI_LOOKBACK_MIN + 1:
+                    c = closes(k1m)
+                    price_change = pct_change(c[-(WHALE_OI_LOOKBACK_MIN + 1)], c[-1])
+
+                    if direction == "LONG":
+                        # LONG mirror: Fiyat yatay/aşağı + OI sert yükseliş
+                        if (price_change <= WHALE_PRICE_FLAT_DOWN_MAX_PCT
+                                and oi_change >= WHALE_OI_BULLISH_RISE_PCT):
+                            res["institutional_oi_bonus"] = WHALE_LONG_BONUS
+                            res["institutional_notes"].append(
+                                f"🐋 BULLISH DIVERGENCE: Fiyat %{price_change:+.2f} + OI %{oi_change:+.2f} → +{WHALE_LONG_BONUS:.0f}"
+                            )
+                            stats["whale_bullish_divergence"] += 1
+                            stats["whale_divergence_hit"] += 1
+
+                    elif direction == "SHORT":
+                        # SHORT: Fiyat yatay/yukarı + OI sert düşüş
+                        if (price_change >= WHALE_PRICE_FLAT_UP_MIN_PCT
+                                and oi_change <= WHALE_OI_BEARISH_DROP_PCT):
+                            res["institutional_oi_bonus"] = WHALE_SHORT_BONUS
+                            res["institutional_notes"].append(
+                                f"🐋 BEARISH DIVERGENCE: Fiyat %{price_change:+.2f} + OI %{oi_change:+.2f} → +{WHALE_SHORT_BONUS:.0f}"
+                            )
+                            stats["whale_bearish_divergence"] += 1
+                            stats["whale_divergence_hit"] += 1
+        except Exception as e:
+            logger.warning("MA institutional OI enrichment hata %s: %s", symbol, e)
+
+    # Funding rate
+    if FUNDING_EYE_ENABLED:
+        try:
+            funding_rate = await fetch_okx_funding_rate(symbol)
+            if funding_rate is not None:
+                res["institutional_funding_rate"] = funding_rate
+                res["institutional_funding_pct_8h"] = round(funding_rate * 100, 4)
+                res["institutional_funding_annual_pct"] = round(funding_rate * 100 * 3 * 365, 2)
+                funding_signal = detect_funding_signal(funding_rate)
+
+                if direction == "LONG" and funding_signal.get("type") == "LONG_BONUS":
+                    res["institutional_funding_bonus"] = FUNDING_LONG_BONUS
+                    res["institutional_notes"].append(funding_signal.get("note", ""))
+                elif direction == "SHORT" and funding_signal.get("type") == "SHORT_BONUS":
+                    res["institutional_funding_bonus"] = FUNDING_SHORT_BONUS
+                    res["institutional_notes"].append(funding_signal.get("note", ""))
+        except Exception as e:
+            logger.warning("MA institutional funding enrichment hata %s: %s", symbol, e)
+
+    # Toplam bonus + kombo tespiti
+    total_bonus = res["institutional_oi_bonus"] + res["institutional_funding_bonus"]
+    res["institutional_total_bonus"] = total_bonus
+    if res["institutional_oi_bonus"] > 0 and res["institutional_funding_bonus"] > 0:
+        res["institutional_confirmed"] = True
+        stats["institutional_combo_hit"] += 1
+        res["institutional_notes"].append(
+            f"🐋💰 KURUMSAL KOMBO TEYİDİ — OI + Funding aynı yönde (+{total_bonus:.0f} toplam bonus)"
+        )
+
+    return res
+
+
 async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
     if not res:
         return
@@ -1805,6 +2124,12 @@ async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
     # Aynı mum + aynı yön için tekrar göndermeyi engelle
     if ma_already_sent(res):
         return
+
+    # 🐋💰 V8.1: MA sonucunu OI + Funding ile zenginleştir
+    try:
+        res = await enrich_ma_with_institutional(res)
+    except Exception as e:
+        logger.warning("MA institutional enrichment hata %s %s: %s", symbol, direction, e)
 
     # Telegram mesajını oluştur ve gönder
     try:
@@ -1892,6 +2217,25 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
     if lev >= 20:
         risk_warning = f"⚠️ YÜKSEK KALDIRAÇ {lev}x | Pozisyon kaybı stopta: %{position_loss_at_stop:.1f}\n"
 
+    # 🐋💰 V8.1 INSTITUTIONAL ENRICHMENT BADGES
+    institutional_block = ""
+    inst_oi_bonus = safe_float(res.get("institutional_oi_bonus", 0))
+    inst_funding_bonus = safe_float(res.get("institutional_funding_bonus", 0))
+    inst_total = safe_float(res.get("institutional_total_bonus", 0))
+    inst_oi_change = safe_float(res.get("institutional_oi_change_pct", 0))
+    inst_funding_pct = safe_float(res.get("institutional_funding_pct_8h", 0))
+    inst_funding_annual = safe_float(res.get("institutional_funding_annual_pct", 0))
+    inst_notes = res.get("institutional_notes", []) or []
+
+    if inst_oi_bonus > 0 or inst_funding_bonus > 0:
+        institutional_block += "---\n"
+        if res.get("institutional_confirmed"):
+            institutional_block += f"🐋💰 KURUMSAL KOMBO TEYİDİ (toplam +{inst_total:.0f} bonus)\n"
+        if inst_oi_bonus > 0:
+            institutional_block += f"🐋 OI Divergence: +{inst_oi_bonus:.0f} | OI {WHALE_OI_LOOKBACK_MIN}dk: %{inst_oi_change:+.2f}\n"
+        if inst_funding_bonus > 0:
+            institutional_block += f"💰 Funding bonus: +{inst_funding_bonus:.0f} | %{inst_funding_pct:+.4f}/8h (yıllık ≈%{inst_funding_annual:+.0f})\n"
+
     return (
         f"🚨 {VERSION_NAME} - MA7/MA25 {res['timeframe']} - {res['direction']} AL\n"
         f"Saat: {tr_str()}\n"
@@ -1910,6 +2254,7 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Direnç: {fmt_num(safe_float(res.get('resistance', 0)))} | fark %{safe_float(res.get('resistance_diff_pct', 0)):.2f}\n"
         f"SHORT S/R: direnç max %{SHORT_MAX_RESISTANCE_DIFF_PCT:.2f} | destek min %{SHORT_MIN_SUPPORT_DIFF_PCT:.2f}\n"
         f"LONG S/R: destek max %{LONG_MAX_SUPPORT_DIFF_PCT:.2f} | direnç min %{LONG_MIN_RESISTANCE_DIFF_PCT:.2f}\n"
+        f"{institutional_block}"
         f"---\n"
         f"KALDIRAÇ: {lev}x | Max Risk/Pozisyon: %{max_risk:.1f}\n"
         f"{risk_warning}"
@@ -2203,28 +2548,42 @@ def build_signal_message(res: Dict[str, Any]) -> str:
     if LEVERAGE >= 20:
         risk_line = f"⚠️ YÜKSEK KALDIRAÇ {LEVERAGE}x | Stopta pozisyon kaybı: %{pos_loss_v5:.1f}\n"
 
-    # 🐋 WHALE EYE satırı
+    # 🐋 WHALE EYE satırı (V8.1 kural-bazlı)
     whale_line = ""
     if res.get("whale_enabled"):
         whale_type = str(res.get("whale_type", "NONE"))
         whale_oi_change = safe_float(res.get("whale_oi_change_pct", 0))
         whale_price_change = safe_float(res.get("whale_price_change_pct", 0))
-        whale_bonus = safe_float(res.get("whale_bonus", 0))
-        whale_note = str(res.get("whale_note", ""))
-        if res.get("whale_divergence"):
+        whale_short_bonus = safe_float(res.get("whale_short_bonus", 0))
+        if res.get("whale_divergence") and whale_short_bonus > 0:
             whale_line = (
-                f"🐋 BALINA EYE: {whale_type} (+{whale_bonus:.0f} puan)\n"
-                f"   Fiyat {WHALE_OI_LOOKBACK_MIN}dk: %{whale_price_change:+.2f} | OI: %{whale_oi_change:+.2f}\n"
-            )
-        elif whale_bonus > 0:
-            whale_line = (
-                f"🐋 Balina ipucu: {whale_type} (+{whale_bonus:.1f} soft puan)\n"
-                f"   Fiyat {WHALE_OI_LOOKBACK_MIN}dk: %{whale_price_change:+.2f} | OI: %{whale_oi_change:+.2f}\n"
+                f"🐋 BEARISH DIVERGENCE (+{whale_short_bonus:.0f} puan)\n"
+                f"   Fiyat {WHALE_OI_LOOKBACK_MIN}dk: %{whale_price_change:+.2f} (yatay/yukarı) | OI: %{whale_oi_change:+.2f} (sert düşüş)\n"
             )
         elif whale_type == "NO_DATA":
             whale_line = f"🐋 Balina Eye: OI warmup devam ediyor\n"
         elif whale_type == "ALIGNED":
             whale_line = f"🐋 Balina Eye: OI ve fiyat aynı yönde (divergence yok)\n"
+
+    # 💰 FUNDING EYE satırı
+    funding_line = ""
+    if res.get("funding_enabled"):
+        funding_type = str(res.get("funding_type", "NONE"))
+        funding_pct_8h = safe_float(res.get("funding_pct_8h", 0))
+        funding_annual = safe_float(res.get("funding_annual_pct", 0))
+        funding_short_bonus = safe_float(res.get("funding_short_bonus", 0))
+        if funding_type == "SHORT_BONUS" and funding_short_bonus > 0:
+            funding_line = (
+                f"💰 EXTREME POSITIVE FUNDING (+{funding_short_bonus:.0f} puan)\n"
+                f"   Funding: %{funding_pct_8h:+.4f}/8h | Yıllık ≈%{funding_annual:+.1f}\n"
+            )
+        elif funding_type == "NEUTRAL":
+            funding_line = f"💰 Funding: NEUTRAL (%{funding_pct_8h:+.4f}/8h)\n"
+
+    # 🐋💰 KOMBO satırı
+    combo_line = ""
+    if res.get("institutional_combo"):
+        combo_line = f"🐋💰 KURUMSAL KOMBO TEYİDİ: OI Divergence + Funding Crowded Long\n"
 
     return (
         f"🚨 {VERSION_NAME} SHORT AL\n"
@@ -2233,6 +2592,8 @@ def build_signal_message(res: Dict[str, Any]) -> str:
         f"KALDIRAÇ: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f}\n"
         f"{risk_line}"
         f"{whale_line}"
+        f"{funding_line}"
+        f"{combo_line}"
         f"Veri motoru: {data_engine}\n"
         f"Binance teyit: {confirm_status}\n"
         f"Binance sembol: {binance_symbol}\n"
@@ -2291,8 +2652,12 @@ def build_heartbeat_message() -> str:
         f"MA motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'}\n"
         f"🐋 Whale Eye: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'} | İzlenen coin: {oi_coins_tracked} | Lookback: {WHALE_OI_LOOKBACK_MIN}dk\n"
         f"🐋 OI çağrı/fail: {stats['whale_oi_calls']} / {stats['whale_oi_fail']}\n"
-        f"🐋 Divergence hit: {stats['whale_divergence_hit']} (bearish={stats['whale_bearish_divergence']}, pileup={stats['whale_short_pileup']})\n"
-        f"🐋 Soft hit: {stats['whale_soft_hit']} | Warmup skip: {stats['whale_warmup_skip']}\n"
+        f"🐋 Bearish/Bullish div: {stats['whale_bearish_divergence']} / {stats['whale_bullish_divergence']}\n"
+        f"🐋 Warmup skip: {stats['whale_warmup_skip']}\n"
+        f"💰 Funding Eye: {'AÇIK' if FUNDING_EYE_ENABLED else 'KAPALI'}\n"
+        f"💰 Funding çağrı/fail: {stats['funding_calls']} / {stats['funding_fail']}\n"
+        f"💰 SHORT/LONG bonus hit: {stats['funding_short_bonus_hit']} / {stats['funding_long_bonus_hit']}\n"
+        f"🐋💰 Kurumsal Kombo: {stats['institutional_combo_hit']}\n"
         f"LONG sinyal: {ma_perf['long_sent']} | Başarı: %{ma_perf['long_success']:.1f} | TP={ma_perf['long_tp']} Stop={ma_perf['long_stop']}\n"
         f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"Sıcak coin: {hot_count}\n"
@@ -2694,7 +3059,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ma BTCUSDT - MA7/MA25 1H tek coin\n"
         "/ma_status - MA7/MA25 motor durumu\n"
         "/whale - 🐋 Whale Eye genel durum\n"
-        "/whale BTCUSDT - 🐋 coin bazlı OI/divergence\n"
+        "/whale BTC - 🐋 coin bazlı OI + Funding analizi\n"
+        "/funding BTC - 💰 coin bazlı funding rate\n"
         "Not: Veri OKX SWAP, işlem teyidi Binance tarafında."
     )
 
@@ -2803,61 +3169,133 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """🐋 Tek coin için OI/divergence durumu sorgulamak"""
-    if not WHALE_EYE_ENABLED:
-        await update.message.reply_text("🐋 Whale Eye motoru kapalı (WHALE_EYE_ENABLED=false)")
+    """🐋💰 Tek coin için OI + Funding kurumsal analizi"""
+    if not WHALE_EYE_ENABLED and not FUNDING_EYE_ENABLED:
+        await update.message.reply_text("🐋 Whale Eye ve Funding Eye motorları kapalı")
         return
     if not context.args:
-        # Argüman yoksa genel Whale Eye durumu
+        # Argüman yoksa genel durum
         await update.message.reply_text(
-            f"🐋 WHALE EYE DURUM\n"
-            f"Motor: AÇIK\n"
-            f"Lookback: {WHALE_OI_LOOKBACK_MIN} dk\n"
-            f"İzlenen coin: {len(oi_history)}\n"
-            f"OI çağrı toplam: {stats['whale_oi_calls']}\n"
-            f"OI fail: {stats['whale_oi_fail']}\n"
-            f"Toplam divergence hit: {stats['whale_divergence_hit']}\n"
-            f"  - Bearish (fiyat↑/OI↓): {stats['whale_bearish_divergence']}\n"
-            f"  - Short pileup (fiyat↓/OI↑): {stats['whale_short_pileup']}\n"
-            f"Soft hit: {stats['whale_soft_hit']}\n"
+            f"🐋💰 INSTITUTIONAL EYE DURUM\n"
+            f"Whale OI: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'}\n"
+            f"Funding: {'AÇIK' if FUNDING_EYE_ENABLED else 'KAPALI'}\n"
+            f"OI Lookback: {WHALE_OI_LOOKBACK_MIN} dk\n"
+            f"İzlenen coin (OI history): {len(oi_history)}\n"
+            f"--- OI ---\n"
+            f"OI çağrı: {stats['whale_oi_calls']} | fail: {stats['whale_oi_fail']}\n"
+            f"Bearish divergence (SHORT): {stats['whale_bearish_divergence']}\n"
+            f"Bullish divergence (LONG):  {stats['whale_bullish_divergence']}\n"
             f"Warmup skip: {stats['whale_warmup_skip']}\n"
-            f"Eşikler: fiyat ≥%{WHALE_MIN_PRICE_MOVE_PCT:.2f}, OI ≥%{WHALE_MIN_OI_MOVE_PCT:.2f}\n"
-            f"Bonus: +{WHALE_DIVERGENCE_BONUS:.0f} (hard), +{WHALE_DIVERGENCE_BONUS * WHALE_SOFT_BONUS_PCT:.1f} (soft)\n"
-            f"Kullanım: /whale BTCUSDT"
+            f"--- FUNDING ---\n"
+            f"Funding çağrı: {stats['funding_calls']} | fail: {stats['funding_fail']}\n"
+            f"SHORT bonus hit: {stats['funding_short_bonus_hit']}\n"
+            f"LONG bonus hit: {stats['funding_long_bonus_hit']}\n"
+            f"--- KOMBO ---\n"
+            f"Kurumsal kombo: {stats['institutional_combo_hit']}\n"
+            f"---\n"
+            f"Eşikler: OI ±{abs(WHALE_OI_BEARISH_DROP_PCT):.1f}%, Funding ±{FUNDING_BEARISH_THRESHOLD*100:.4f}%\n"
+            f"Bonus: OI +{WHALE_SHORT_BONUS:.0f}, Funding +{FUNDING_SHORT_BONUS:.0f}\n"
+            f"Kullanım: /whale BTC veya /whale BTC-USDT-SWAP"
         )
         return
 
     symbol = normalize_symbol(context.args[0])
-    oi_now = await fetch_oi(symbol)
-    if oi_now <= 0:
-        await update.message.reply_text(f"🐋 {symbol} için OI verisi alınamadı.")
-        return
-    record_oi_snapshot(symbol, oi_now)
 
-    # Fiyat değişimini de hesapla (lookback penceresi için)
-    k1 = await get_klines(symbol, "1m", WHALE_OI_LOOKBACK_MIN + 5)
-    if len(k1) < WHALE_OI_LOOKBACK_MIN + 1:
+    # Paralel OI + Funding çek
+    oi_task = fetch_okx_open_interest(symbol)
+    funding_task = fetch_okx_funding_rate(symbol)
+    oi_now, funding_rate = await asyncio.gather(oi_task, funding_task)
+
+    if oi_now is None and funding_rate is None:
         await update.message.reply_text(
-            f"🐋 {symbol}\nOI şimdi: {oi_now:,.2f}\nFiyat verisi yetersiz."
+            f"🐋💰 {symbol}\nVeri çekilemedi (geçersiz coin veya API hatası).\n"
+            f"OKX'te bu coin SWAP olarak listeleniyor mu? '/coin {context.args[0]}' ile teyit edebilirsiniz."
         )
         return
-    c = closes(k1)
-    price_change = pct_change(c[-(WHALE_OI_LOOKBACK_MIN + 1)], c[-1])
-    payload = detect_whale_divergence(symbol, price_change)
 
-    hist = oi_history.get(symbol, [])
-    warmup_min = (time.time() - hist[0][0]) / 60 if hist else 0
+    lines = [f"🐋💰 INSTITUTIONAL EYE — {symbol}", f"Saat: {tr_str()}"]
 
+    # OI bloğu
+    if oi_now is not None and oi_now > 0:
+        record_oi_snapshot(symbol, oi_now)
+        hist = oi_history.get(symbol, [])
+        warmup_min = (time.time() - hist[0][0]) / 60 if hist else 0
+        lines.append(f"--- 🐋 OPEN INTEREST ---")
+        lines.append(f"OI şimdi: {oi_now:,.2f} (oiCcy)")
+        lines.append(f"Snapshot: {len(hist)} (warmup: {warmup_min:.1f}dk)")
+
+        # Fiyat değişimini de hesapla
+        try:
+            k1 = await get_klines(symbol, "1m", WHALE_OI_LOOKBACK_MIN + 5)
+            if len(k1) >= WHALE_OI_LOOKBACK_MIN + 1:
+                c = closes(k1)
+                price_change = pct_change(c[-(WHALE_OI_LOOKBACK_MIN + 1)], c[-1])
+                payload = detect_whale_divergence(symbol, price_change)
+                lines.append(f"Fiyat son {WHALE_OI_LOOKBACK_MIN}dk: %{price_change:+.2f}")
+                lines.append(f"OI son {WHALE_OI_LOOKBACK_MIN}dk: %{payload.get('oi_change_pct', 0):+.2f}")
+                lines.append(f"Durum: {payload.get('type', 'NONE')}")
+                if payload.get('short_bonus', 0) > 0:
+                    lines.append(f"→ SHORT bonus: +{payload['short_bonus']:.0f}")
+                if payload.get('long_bonus', 0) > 0:
+                    lines.append(f"→ LONG bonus: +{payload['long_bonus']:.0f}")
+            else:
+                lines.append(f"Fiyat verisi yetersiz")
+        except Exception as e:
+            lines.append(f"Fiyat verisi hata: {e}")
+    else:
+        lines.append(f"--- 🐋 OPEN INTEREST ---")
+        lines.append(f"OI verisi alınamadı")
+
+    # Funding bloğu
+    lines.append(f"--- 💰 FUNDING RATE ---")
+    if funding_rate is not None:
+        f_signal = detect_funding_signal(funding_rate)
+        lines.append(f"Funding: %{funding_rate*100:+.4f}/8h")
+        lines.append(f"Yıllık ≈ %{f_signal.get('annual_pct', 0):+.1f}")
+        lines.append(f"Durum: {f_signal.get('type', 'NONE')}")
+        if f_signal.get('short_bonus', 0) > 0:
+            lines.append(f"→ SHORT bonus: +{f_signal['short_bonus']:.0f}")
+        if f_signal.get('long_bonus', 0) > 0:
+            lines.append(f"→ LONG bonus: +{f_signal['long_bonus']:.0f}")
+    else:
+        lines.append(f"Funding verisi alınamadı")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """💰 Sadece funding rate sorgusu"""
+    if not FUNDING_EYE_ENABLED:
+        await update.message.reply_text("💰 Funding Eye motoru kapalı (FUNDING_EYE_ENABLED=false)")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"💰 FUNDING EYE\n"
+            f"Çağrı: {stats['funding_calls']} | fail: {stats['funding_fail']}\n"
+            f"SHORT bonus hit: {stats['funding_short_bonus_hit']}\n"
+            f"LONG bonus hit: {stats['funding_long_bonus_hit']}\n"
+            f"Eşikler: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}% | LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
+            f"Bonus: SHORT +{FUNDING_SHORT_BONUS:.0f} | LONG +{FUNDING_LONG_BONUS:.0f}\n"
+            f"Kullanım: /funding BTC"
+        )
+        return
+
+    symbol = normalize_symbol(context.args[0])
+    funding_rate = await fetch_okx_funding_rate(symbol)
+    if funding_rate is None:
+        await update.message.reply_text(f"💰 {symbol} için funding verisi alınamadı.")
+        return
+
+    f_signal = detect_funding_signal(funding_rate)
     await update.message.reply_text(
-        f"🐋 WHALE EYE — {symbol}\n"
+        f"💰 FUNDING — {symbol}\n"
         f"Saat: {tr_str()}\n"
-        f"OI şimdi: {oi_now:,.2f} (oiCcy)\n"
-        f"OI history snapshot: {len(hist)} (warmup: {warmup_min:.1f}dk)\n"
-        f"Fiyat son {WHALE_OI_LOOKBACK_MIN}dk: %{price_change:+.2f}\n"
-        f"OI son {WHALE_OI_LOOKBACK_MIN}dk: %{payload.get('oi_change_pct', 0):+.2f}\n"
-        f"Durum: {payload.get('type', 'NONE')}\n"
-        f"Bonus: +{payload.get('bonus', 0):.1f} puan\n"
-        f"Not: {payload.get('note') or '-'}"
+        f"Funding: %{funding_rate*100:+.4f} / 8h\n"
+        f"Yıllık ≈ %{f_signal.get('annual_pct', 0):+.1f}\n"
+        f"Durum: {f_signal.get('type', 'NONE')}\n"
+        f"SHORT bonus: +{f_signal.get('short_bonus', 0):.0f}\n"
+        f"LONG bonus: +{f_signal.get('long_bonus', 0):.0f}\n"
+        f"Not: {f_signal.get('note', '-') or '-'}"
     )
 
 
@@ -2879,10 +3317,14 @@ async def post_init(application) -> None:
             f"MA LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | MA SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
             f"MA TP/Stop takip: {'AÇIK' if MA_FOLLOWUP_ENABLED else 'KAPALI'}\n"
             f"MA Entry: SHORT tepeye max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın | LONG dibe max %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın\n"
-            f"🐋 Whale Eye: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'} | Lookback: {WHALE_OI_LOOKBACK_MIN}dk | Bonus: +{WHALE_DIVERGENCE_BONUS:.0f} puan\n"
-            f"🐋 Eşikler: fiyat ≥%{WHALE_MIN_PRICE_MOVE_PCT:.2f} & OI ≥%{WHALE_MIN_OI_MOVE_PCT:.2f} | OI cache: {WHALE_OI_CACHE_SEC}sn\n"
+            f"🐋 Whale Eye: {'AÇIK' if WHALE_EYE_ENABLED else 'KAPALI'} | Lookback: {WHALE_OI_LOOKBACK_MIN}dk\n"
+            f"🐋 OI eşikleri: SHORT için OI ≤ {WHALE_OI_BEARISH_DROP_PCT:.1f}%, LONG için OI ≥ +{WHALE_OI_BULLISH_RISE_PCT:.1f}%\n"
+            f"🐋 OI bonus: SHORT +{WHALE_SHORT_BONUS:.0f}, LONG +{WHALE_LONG_BONUS:.0f}\n"
+            f"💰 Funding Eye: {'AÇIK' if FUNDING_EYE_ENABLED else 'KAPALI'}\n"
+            f"💰 Funding eşik: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}%, LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
+            f"💰 Funding bonus: SHORT +{FUNDING_SHORT_BONUS:.0f}, LONG +{FUNDING_LONG_BONUS:.0f}\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"V8 PRO MAX: V5.2.8 omurga + Whale Eye OI Divergence motoru entegre\n"
+            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API, /whale + /funding\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
@@ -2921,6 +3363,7 @@ def build_app():
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
     application.add_handler(CommandHandler("whale", cmd_whale))
+    application.add_handler(CommandHandler("funding", cmd_funding))
     return application
 
 
