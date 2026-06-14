@@ -1590,7 +1590,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = f"SHORT giriş: güncel fiyat 1 saatlik mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
+        entry_note = f"SHORT giriş: güncel fiyat {MA_KLINE_INTERVAL} mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
 
     elif direction == "LONG":
         if not (prev_ma7 <= prev_ma25 and cur_ma7 >= cur_ma25):
@@ -1601,7 +1601,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         if entry_diff_pct > MA_ENTRY_MAX_DIFF_PCT:
             return None
         entry = last_price
-        entry_note = f"LONG giriş: güncel fiyat 1 saatlik mum dibine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
+        entry_note = f"LONG giriş: güncel fiyat {MA_KLINE_INTERVAL} mum dibine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
     else:
         return None
 
@@ -1695,8 +1695,11 @@ async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], 
         return None
 
     c = closes(k1h)
-    ma7 = ema(c, 7)
-    ma25 = ema(c, 25)
+    # DÜZELTME: Grafikteki MA7/MA25 çizgileri SMA'dır (basit ortalama).
+    # Önceden ema() kullanılıyordu — bu, grafikte görünen MA ile farklı değer
+    # ürettiği için "grafikte cross yok ama bot sinyal atıyor" sorununa yol açıyordu.
+    ma7 = sma(c, 7)
+    ma25 = sma(c, 25)
     if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
         return None
     return symbol, k1h, ma7, ma25
@@ -1969,7 +1972,7 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Saat: {tr_str()}\n"
         f"Coin: {res['symbol']}\n"
         f"Motor: {res['direction']} MOTORU\n"
-        f"Zaman dilimi: 1 saat\n"
+        f"Zaman dilimi: {res.get('timeframe', MA_KLINE_INTERVAL)}\n"
         f"Kural: MA7 / MA25 KAPANMIŞ mum kesişimi (repainting önlendi)\n"
         f"{res['entry_note']}\n"
         f"MA7: {fmt_num(res['ma7'])}\n"
