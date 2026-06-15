@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcisi V8.4 MEXC-ONLY MA5/MA10"
+VERSION_NAME = "Balina Avcisi V8.5 ANLIK KESISIM MEXC"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -113,6 +113,9 @@ MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
 MA_KLINE_INTERVAL = os.getenv("MA_KLINE_INTERVAL", "1H").strip()
 MA_FAST_PERIOD = int(float(os.getenv("MA_FAST_PERIOD", "5")))    # hızlı MA (grafikte MA5)
 MA_SLOW_PERIOD = int(float(os.getenv("MA_SLOW_PERIOD", "10")))   # yavaş MA (grafikte MA10)
+# Anlık kesişim modu: mum kapanışı beklemeden, kesişim anında sinyal.
+# S/R ve mum-yakınlık filtrelerini atlar. Yön değişene kadar tekrar atmaz.
+MA_INSTANT_CROSS = os.getenv("MA_INSTANT_CROSS", "false").lower() == "true"
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
@@ -1662,6 +1665,75 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     if len(k1h) < 3 or len(ma7) < 3 or len(ma25) < 3:
         return None
 
+    # ============================================================
+    # ANLIK KESİŞİM MODU (MA_INSTANT_CROSS=true)
+    # - Mum kapanışı BEKLENMEZ: canlı mum [-1] kullanılır
+    # - Kesişim olur olmaz sinyal
+    # - S/R, mum yakınlığı (%0.60) filtreleri ATLANIR
+    # - Aynı yönde tekrar atmama: yön değişene kadar yeni sinyal yok
+    # ============================================================
+    if MA_INSTANT_CROSS:
+        prev_ma7 = ma7[-2]   # bir önceki (kapalı) mum
+        prev_ma25 = ma25[-2]
+        cur_ma7 = ma7[-1]    # canlı mum
+        cur_ma25 = ma25[-1]
+
+        live_candle = k1h[-1]
+        candle_ts = str(live_candle[0])
+        candle_high = safe_float(live_candle[2])
+        candle_low = safe_float(live_candle[3])
+        last_price = safe_float(live_candle[4])
+        if last_price <= 0:
+            return None
+
+        # Kesişim kontrolü
+        if direction == "SHORT":
+            if not (prev_ma7 > prev_ma25 and cur_ma7 <= cur_ma25):
+                return None
+        elif direction == "LONG":
+            if not (prev_ma7 < prev_ma25 and cur_ma7 >= cur_ma25):
+                return None
+        else:
+            return None
+
+        # Yön değişimi koruması: son sinyal aynı yönse, ters kesişim olana kadar atma
+        last_dir = memory.get("ma_instant_last_dir", {}).get(symbol, "")
+        if last_dir == direction:
+            return None
+
+        entry = last_price
+        entry_note = f"{direction} anlık kesişim ({MA_KLINE_INTERVAL}) — mum kapanışı beklenmedi"
+        targets = calc_ma_targets(entry, direction)
+
+        # Likidasyon güvenliği (tek koruma olarak kalsın)
+        liq_safe, liq_gap = check_stop_vs_liquidation(entry, targets["stop"], direction)
+        if not liq_safe and LEVERAGE > 1:
+            return None
+
+        sr = calc_support_resistance(k1h, entry)  # bilgi amaçlı, filtre değil
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry,
+            "stop": targets["stop"],
+            "tp1": targets["tp1"], "tp2": targets["tp2"], "tp3": targets["tp3"],
+            "stop_pct": targets["stop_pct"], "tp1_pct": targets["tp1_pct"],
+            "tp2_pct": targets["tp2_pct"], "tp3_pct": targets["tp3_pct"],
+            "ma7": cur_ma7, "ma25": cur_ma25,
+            "prev_ma7": prev_ma7, "prev_ma25": prev_ma25,
+            "candle_high": candle_high, "candle_low": candle_low,
+            "candle_ts": candle_ts,
+            "timeframe": MA_KLINE_INTERVAL,
+            "entry_note": entry_note,
+            "support": sr.get("support", 0), "resistance": sr.get("resistance", 0),
+            "support_diff_pct": sr.get("support_diff_pct", 0),
+            "resistance_diff_pct": sr.get("resistance_diff_pct", 0),
+            "instant": True,
+        }
+    # ============================================================
+    # NORMAL MOD (kapanmış mum, S/R + yakınlık filtreli) — değişmedi
+    # ============================================================
+
     prev_ma7 = ma7[-3]
     prev_ma25 = ma25[-3]
     cur_ma7 = ma7[-2]
@@ -1868,6 +1940,9 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
     stats["ma_signal_sent"] += 1
     memory["last_signal_ts"] = sent_ts
     memory.setdefault("ma_last_candle_ts", {})[f"{res['symbol']}:{res['direction']}"] = res.get("candle_ts", "")
+    # Anlık kesişim modu: bu coinin son yönünü kaydet, yön değişene kadar tekrar atma
+    if res.get("instant"):
+        memory.setdefault("ma_instant_last_dir", {})[res["symbol"]] = res["direction"]
 
     # /hafiza için sayaç
     h = memory.setdefault("ma_hafiza", {})
