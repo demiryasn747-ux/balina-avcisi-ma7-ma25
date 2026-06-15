@@ -12,13 +12,52 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V8.3 MA5/MA10 (Gercek SMA + Hafiza)"
+VERSION_NAME = "Balina Avcisi V8.4 MEXC-ONLY MA5/MA10"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").strip().rstrip("/")
 OKX_INST_TYPE = os.getenv("OKX_INST_TYPE", "SWAP").strip().upper()
+
+# ============================================================
+# MEXC TEK VERİ KAYNAĞI — OKX tamamen devre dışı.
+# Tüm mum/ticker/OI/funding verisi MEXC contract API'den gelir.
+# Sembol içeride OKX formatında (BTC-USDT-SWAP) tutulur,
+# MEXC'e giderken BTC_USDT'ye çevrilir; böylece kodun geri kalanı değişmez.
+# ============================================================
+MEXC_CONTRACT_BASE_URL = os.getenv("MEXC_CONTRACT_BASE_URL", "https://contract.mexc.com").strip().rstrip("/")
+MEXC_HTTP_TIMEOUT_CONNECT = float(os.getenv("MEXC_HTTP_TIMEOUT_CONNECT", "4.0"))
+MEXC_HTTP_TIMEOUT_READ = float(os.getenv("MEXC_HTTP_TIMEOUT_READ", "10.0"))
+MEXC_KLINE_RETRY = int(float(os.getenv("MEXC_KLINE_RETRY", "2")))
+
+# OKX bar formatı -> MEXC interval. MEXC'te 3m yok, 5m'e düşülür.
+_MEXC_INTERVAL_MAP = {
+    "1m": "Min1", "3m": "Min5", "5m": "Min5", "15m": "Min15",
+    "30m": "Min30", "60m": "Min60", "1H": "Min60", "1h": "Min60",
+    "4H": "Hour4", "4h": "Hour4", "8H": "Hour8", "8h": "Hour8",
+    "1D": "Day1", "1d": "Day1", "1W": "Week1", "1w": "Week1",
+}
+_MEXC_INTERVAL_SEC = {
+    "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
+    "Min60": 3600, "Hour4": 14400, "Hour8": 28800, "Day1": 86400, "Week1": 604800,
+}
+
+
+def okx_sym_to_mexc(symbol: str) -> str:
+    """BTC-USDT-SWAP -> BTC_USDT (MEXC contract sembolü)."""
+    s = (symbol or "").upper().strip()
+    if s.endswith("-SWAP"):
+        s = s[:-5]
+    return s.replace("-", "_")
+
+
+def mexc_sym_to_okx(symbol: str) -> str:
+    """BTC_USDT -> BTC-USDT-SWAP (içerideki standart format)."""
+    s = (symbol or "").upper().strip().replace("_", "-")
+    if s.endswith("-USDT") or s.endswith("-USDC"):
+        return f"{s}-SWAP"
+    return s
 
 BINANCE_CONFIRM_ENABLED = os.getenv("BINANCE_CONFIRM_ENABLED", "true").lower() == "true"
 BINANCE_CONFIRM_REQUIRED = os.getenv("BINANCE_CONFIRM_REQUIRED", "false").lower() == "true"
@@ -477,11 +516,23 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
-    url = f"{OKX_BASE_URL}{path}"
+    """ARTIK MEXC. İsim geriye uyumluluk için _okx_get kaldı ama MEXC'e gider.
+    path: MEXC contract endpoint (örn /api/v1/contract/kline/BTC_USDT)
+    Dönüş: MEXC 'data' alanı.
+    """
+    url = f"{MEXC_CONTRACT_BASE_URL}{path}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (BalinaAvcisi) Python/requests",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
-            resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
+            try:
+                resp = SESSION.get(url, params=params or {}, timeout=(MEXC_HTTP_TIMEOUT_CONNECT, MEXC_HTTP_TIMEOUT_READ), headers=headers)
+            except TypeError:
+                resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT, headers=headers)
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HTTP {resp.status_code}")
                 if attempt < max_retries:
@@ -490,9 +541,13 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
                 resp.raise_for_status()
             resp.raise_for_status()
             data = resp.json()
-            if str(data.get("code", "1")) != "0":
-                raise RuntimeError(f"OKX hata: code={data.get('code')} msg={data.get('msg')}")
-            return data.get("data", [])
+            if isinstance(data, dict):
+                success = data.get("success", True)
+                code = data.get("code", 0)
+                if success is False or str(code) not in ("0", "200", "None"):
+                    raise RuntimeError(f"MEXC hata: code={code} msg={data.get('message') or data.get('msg')}")
+                return data.get("data", data)
+            return data
         except (requests.RequestException, ValueError) as e:
             last_err = e
             if attempt < max_retries:
@@ -512,26 +567,35 @@ def _okx_to_kline(row: List[Any]) -> List[Any]:
     ]
 
 async def get_okx_instruments(force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """ARTIK MEXC. MEXC contract listesini OKX-stili anahtarla (BTC-USDT-SWAP) döner."""
     cached = instrument_cache.get("okx_instruments")
     now_ts = time.time()
     if cached and not force and now_ts - cached[0] <= OKX_INSTRUMENT_CACHE_SEC:
         return cached[1]
     try:
-        data = await asyncio.to_thread(_okx_get, "/api/v5/public/instruments", {"instType": OKX_INST_TYPE})
+        data = await asyncio.to_thread(_okx_get, "/api/v1/contract/detail", {})
+        rows = data if isinstance(data, list) else (data.get("data", []) if isinstance(data, dict) else [])
         mp: Dict[str, Dict[str, Any]] = {}
-        for row in data:
-            inst_id = str(row.get("instId", "")).upper().strip()
-            state = str(row.get("state", "live")).lower().strip()
-            if not inst_id:
+        for row in rows or []:
+            mexc_sym = str(row.get("symbol", "")).upper().strip()
+            if not mexc_sym.endswith("_USDT"):
                 continue
-            if state and state not in ("live", "normal"):
-                continue
-            mp[inst_id] = row
-        instrument_cache["okx_instruments"] = (now_ts, mp)
-        return mp
+            # MEXC state: 0=enabled. Diğerleri (delist/suspend) atla.
+            try:
+                if int(safe_float(row.get("state", 0))) != 0:
+                    continue
+            except Exception:
+                pass
+            okx_key = mexc_sym_to_okx(mexc_sym)
+            row["instId"] = okx_key       # kodun beklediği alan
+            row["state"] = "live"
+            mp[okx_key] = row
+        if mp:
+            instrument_cache["okx_instruments"] = (now_ts, mp)
+        return mp if mp else (cached[1] if cached else {})
     except Exception as e:
         stats["api_fail"] += 1
-        logger.warning("OKX instruments alınamadı: %s", e)
+        logger.warning("MEXC instruments alınamadı: %s", e)
         return cached[1] if cached else {}
 
 async def refresh_coin_pool(force: bool = False) -> Tuple[int, int]:
@@ -598,39 +662,92 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
     now_ts = time.time()
     if cached and now_ts - cached[0] <= KLINE_CACHE_SEC:
         return cached[1]
-    try:
-        data = await asyncio.to_thread(
-            _okx_get,
-            "/api/v5/market/candles",
-            {"instId": symbol, "bar": interval, "limit": min(limit, 300)},
-        )
-        rows = [_okx_to_kline(x) for x in reversed(data)]
-        if not rows:
-            stats["api_fail"] += 1
-            note_symbol_fail(symbol, f"{interval}:empty")
-            return []
-        note_symbol_success(symbol)
-        kline_cache[cache_key] = (now_ts, rows)
-        return rows
-    except Exception as e:
-        stats["api_fail"] += 1
-        note_symbol_fail(symbol, f"{interval}:{e}")
-        logger.warning("OKX kline alınamadı %s %s: %s", symbol, interval, e)
+
+    mexc_sym = okx_sym_to_mexc(symbol)
+    mexc_interval = _MEXC_INTERVAL_MAP.get(interval, "Min15")
+    sec = _MEXC_INTERVAL_SEC.get(mexc_interval, 900)
+    end_ts = int(time.time())
+    start_ts = max(0, end_ts - sec * max(limit + 10, 80))
+
+    last_err: Optional[Exception] = None
+    for attempt in range(max(1, MEXC_KLINE_RETRY)):
+        try:
+            data = await asyncio.to_thread(
+                _okx_get,
+                f"/api/v1/contract/kline/{mexc_sym}",
+                {"interval": mexc_interval, "start": start_ts, "end": end_ts},
+            )
+            rows = _mexc_kline_to_rows(data if isinstance(data, dict) else {}, limit)
+            if not rows:
+                last_err = RuntimeError("empty")
+                break  # boş = pasif sembol, retry yapma
+            note_symbol_success(symbol)
+            kline_cache[cache_key] = (now_ts, rows)
+            return rows
+        except Exception as e:
+            last_err = e
+            if attempt < MEXC_KLINE_RETRY - 1:
+                time.sleep(0.4 * (attempt + 1))
+    stats["api_fail"] += 1
+    note_symbol_fail(symbol, f"{interval}:{last_err}")
+    return cached[1] if cached else []
+
+
+def _mexc_kline_to_rows(data: Any, limit: int) -> List[List[Any]]:
+    """MEXC kline yanıtını OKX-uyumlu satıra çevirir.
+    MEXC: {"time":[...],"open":[...],"close":[...],"high":[...],"low":[...],"vol":[...],"amount":[...]}
+    OKX satır: [ts_ms, o, h, l, c, vol, vol_quote, vol_alt, confirm]  (artan zaman)
+    """
+    if not isinstance(data, dict):
         return []
+    times = data.get("time", []) or []
+    opens = data.get("open", []) or []
+    closes_ = data.get("close", []) or []
+    highs_ = data.get("high", []) or []
+    lows_ = data.get("low", []) or []
+    vols = data.get("vol", []) or []
+    amounts = data.get("amount", []) or vols
+    n = min(len(times), len(opens), len(closes_), len(highs_), len(lows_), len(vols))
+    if n <= 0:
+        return []
+    rows: List[List[Any]] = []
+    for i in range(n):
+        ts = int(safe_float(times[i]) * 1000)  # MEXC saniye -> OKX ms
+        o = safe_float(opens[i]); h = safe_float(highs_[i])
+        l = safe_float(lows_[i]); c = safe_float(closes_[i])
+        v = safe_float(vols[i]); q = safe_float(amounts[i] if i < len(amounts) else v)
+        rows.append([str(ts), str(o), str(h), str(l), str(c), str(v), str(q), str(q), "1"])
+    if limit and len(rows) > limit:
+        rows = rows[-limit:]
+    return rows
 
 async def get_24h_tickers() -> Dict[str, Dict[str, Any]]:
+    """ARTIK MEXC. OKX-uyumlu alanlarla (instId, last, vol24h, volCcy24h) döner."""
     cached = ticker_cache.get("24hr")
     now_ts = time.time()
     if cached and now_ts - cached[0] <= TICKER_CACHE_SEC:
         return cached[1]
     try:
-        data = await asyncio.to_thread(_okx_get, "/api/v5/market/tickers", {"instType": OKX_INST_TYPE})
-        mp = {str(x.get("instId", "")).upper(): x for x in data if x.get("instId")}
-        ticker_cache["24hr"] = (now_ts, mp)
-        return mp
+        data = await asyncio.to_thread(_okx_get, "/api/v1/contract/ticker", {})
+        rows = data if isinstance(data, list) else (data.get("data", []) if isinstance(data, dict) else [])
+        mp: Dict[str, Dict[str, Any]] = {}
+        for row in rows or []:
+            mexc_sym = str(row.get("symbol", "")).upper().strip()
+            if not mexc_sym.endswith("_USDT"):
+                continue
+            okx_key = mexc_sym_to_okx(mexc_sym)
+            mp[okx_key] = {
+                "instId": okx_key,
+                "last": safe_float(row.get("lastPrice", row.get("fairPrice", 0))),
+                "vol24h": safe_float(row.get("volume24", 0)),
+                "volCcy24h": safe_float(row.get("amount24", 0)),
+            }
+        if mp:
+            ticker_cache["24hr"] = (now_ts, mp)
+        return mp if mp else (cached[1] if cached else {})
     except Exception as e:
         stats["api_fail"] += 1
-        logger.warning("OKX 24h ticker alınamadı: %s", e)
+        logger.warning("MEXC 24h ticker alınamadı: %s", e)
         return cached[1] if cached else {}
 
 def quote_volume_from_ticker(row: Dict[str, Any]) -> float:
@@ -815,9 +932,9 @@ async def confirm_signal_on_binance(res: Dict[str, Any]) -> Dict[str, Any]:
 
 async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
     """
-    OKX /api/v5/public/open-interest?instType=SWAP&instId={symbol}
-    OKX v5 kuralları: instType (ZORUNLU) + instId (ZORUNLU) birlikte gönderilir.
-    JSON yanıt data[0].oi / data[0].oiCcy try-except içinde güvenli okunur, float döner.
+    MEXC contract ticker holdVol = open interest
+    MEXC: holdVol alanı kontrat adedi cinsinden açık pozisyon.
+    Güvenli okunur, float döner.
     """
     symbol = normalize_symbol(symbol)
     if not symbol or "-" not in symbol:
@@ -832,38 +949,19 @@ async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
 
     stats["whale_oi_calls"] += 1
     try:
+        mexc_sym = okx_sym_to_mexc(symbol)
         data = await asyncio.to_thread(
             _okx_get,
-            "/api/v5/public/open-interest",
-            {"instType": "SWAP", "instId": symbol},
+            f"/api/v1/contract/ticker",
+            {"symbol": mexc_sym},
         )
-        if not isinstance(data, list) or len(data) == 0:
-            stats["whale_oi_fail"] += 1
-            return None
-
-        row = data[0]
+        # MEXC ticker holdVol = open interest (kontrat adedi)
+        row = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
         if not isinstance(row, dict):
             stats["whale_oi_fail"] += 1
             return None
 
-        oi_val = 0.0
-        oi_str = row.get("oi")
-        if oi_str is not None and str(oi_str).strip() != "":
-            try:
-                oi_val = float(oi_str)
-            except (TypeError, ValueError):
-                pass
-
-        if oi_val <= 0:
-            oi_ccy_str = row.get("oiCcy")
-            if oi_ccy_str is not None and str(oi_ccy_str).strip() != "":
-                try:
-                    oi_ccy_val = float(oi_ccy_str)
-                    if oi_ccy_val > 0:
-                        oi_val = oi_ccy_val
-                except (TypeError, ValueError):
-                    pass
-
+        oi_val = safe_float(row.get("holdVol", 0))
         if oi_val > 0:
             oi_cache[symbol] = (now_ts, oi_val)
             return oi_val
@@ -872,7 +970,7 @@ async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
         return None
     except Exception as e:
         stats["whale_oi_fail"] += 1
-        logger.warning("OKX OI alınamadı %s: %s", symbol, e)
+        logger.warning("MEXC OI alınamadı %s: %s", symbol, e)
         return None
 
 async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
@@ -889,16 +987,17 @@ async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
 
     stats["funding_calls"] += 1
     try:
+        mexc_sym = okx_sym_to_mexc(symbol)
         data = await asyncio.to_thread(
             _okx_get,
-            "/api/v5/public/funding-rate",
-            {"instId": symbol},
+            f"/api/v1/contract/funding_rate/{mexc_sym}",
+            {},
         )
         if not data:
             stats["funding_fail"] += 1
             return None
         try:
-            row = data[0] if isinstance(data, list) else data
+            row = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else {})
             rate = float(row.get("fundingRate", 0) or 0)
         except (TypeError, ValueError, KeyError, IndexError) as e:
             logger.warning("Funding JSON parse hatası %s: %s", symbol, e)
@@ -912,7 +1011,7 @@ async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
         return None
     except Exception as e:
         stats["funding_fail"] += 1
-        logger.warning("OKX funding alınamadı %s: %s", symbol, e)
+        logger.warning("MEXC funding alınamadı %s: %s", symbol, e)
         return None
 
 def record_oi_snapshot(symbol: str, oi_val: float) -> None:
@@ -2379,7 +2478,7 @@ def build_signal_message(res: Dict[str, Any]) -> str:
     binance_price = safe_float(res.get("binance_price", 0))
     binance_gap = safe_float(res.get("binance_price_gap_pct", 0))
     binance_reason = str(res.get("binance_confirm_reason", "-"))
-    data_engine = str(res.get("data_engine", "OKX SWAP"))
+    data_engine = str(res.get("data_engine", "MEXC SWAP"))
 
     stop_pct_v5 = abs(pct_change(res['price'], res['stop']))
     pos_loss_v5 = stop_pct_v5 * LEVERAGE
@@ -2438,9 +2537,9 @@ def build_signal_message(res: Dict[str, Any]) -> str:
         f"Binance sembol: {binance_symbol}\n"
         f"Skor: {res['score']}\n"
         f"Aday/Hazır/Doğrula: {res['candidate_score']} / {res['ready_score']} / {res['verify_score']}\n"
-        f"OKX fiyat: {fmt_num(res['price'])}\n"
+        f"MEXC fiyat: {fmt_num(res['price'])}\n"
         f"Binance fiyat: {fmt_num(binance_price) if binance_price > 0 else '-'}\n"
-        f"OKX-Binance farkı: %{binance_gap:.2f}\n"
+        f"MEXC-Binance farki: %{binance_gap:.2f}\n"
         f"Entry: {fmt_num(res['price'])}\n"
         f"Stop: {fmt_num(res['stop'])} (%{stop_pct_v5:.2f})\n"
         f"TP1: {fmt_num(res['tp1'])}\n"
@@ -2555,7 +2654,7 @@ async def maybe_send_signal(res: Dict[str, Any]) -> None:
             return
 
         confirm = await confirm_signal_on_binance(res)
-        res["data_engine"] = "OKX SWAP"
+        res["data_engine"] = "MEXC SWAP"
         res["binance_confirm_status"] = confirm.get("status", "YOK")
         res["binance_confirm_score"] = confirm.get("score", 0)
         res["binance_symbol"] = confirm.get("binance_symbol", normalize_binance_symbol(symbol))
@@ -2872,7 +2971,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/whale - 🐋 Whale Eye genel durum\n"
         "/whale BTC - 🐋 coin bazlı OI + Funding analizi\n"
         "/funding BTC - 💰 coin bazlı funding rate\n"
-        "Not: Veri OKX SWAP, işlem teyidi Binance tarafında."
+        "Not: Veri MEXC, islem teyidi Binance tarafinda."
     )
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2918,7 +3017,7 @@ async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if res["stage"] == "SIGNAL":
         confirm = await confirm_signal_on_binance(res)
-        res["data_engine"] = "OKX SWAP"
+        res["data_engine"] = "MEXC SWAP"
         res["binance_confirm_status"] = confirm.get("status", "YOK")
         res["binance_symbol"] = confirm.get("binance_symbol", normalize_binance_symbol(symbol))
         res["binance_price"] = confirm.get("binance_price", 0)
@@ -3064,7 +3163,7 @@ async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if oi_now is None and funding_rate is None:
         await update.message.reply_text(
             f"🐋💰 {symbol}\nVeri çekilemedi (geçersiz coin veya API hatası).\n"
-            f"OKX'te bu coin SWAP olarak listeleniyor mu kontrol edin."
+            f"MEXC'te bu coin USDT-M olarak listeleniyor mu kontrol edin."
         )
         return
 
@@ -3156,7 +3255,7 @@ async def post_init(application) -> None:
             f"Saat: {tr_str()}\n"
             f"Coin sayısı: {active_count}\n"
             f"Çıkarılan coin: {pruned_count}\n"
-            f"Veri kaynağı: OKX {OKX_INST_TYPE}\n"
+            f"Veri kaynagi: MEXC {OKX_INST_TYPE}\n"
             f"Motorlar: sıcak takip + derin analiz + teşhis + heartbeat + symbol refresh + MA + 🐋💰 Institutional Eye\n"
             f"MA: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI'} | hedef coin={MA_COIN_LIMIT}\n"
             f"MA LONG motor: {'AÇIK' if MA_LONG_ENGINE_ENABLED else 'KAPALI'} | MA SHORT motor: {'AÇIK' if MA_SHORT_ENGINE_ENABLED else 'KAPALI'}\n"
@@ -3169,7 +3268,7 @@ async def post_init(application) -> None:
             f"💰 Funding eşik: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}%, LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
             f"💰 Funding bonus: SHORT +{FUNDING_SHORT_BONUS:.0f}, LONG +{FUNDING_LONG_BONUS:.0f}\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API\n"
+            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'li MEXC API\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
