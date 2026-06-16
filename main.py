@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcisi V8.6 ANLIK FIX + API"
+VERSION_NAME = "Balina Avcisi V8.7 MEXC KLINE FIX"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -118,6 +118,7 @@ MA_SLOW_PERIOD = int(float(os.getenv("MA_SLOW_PERIOD", "10")))   # yavaş MA (gr
 MA_INSTANT_CROSS = os.getenv("MA_INSTANT_CROSS", "false").lower() == "true"
 # Anlık modda kesişimi son kaç bar içinde ararız (tam o saniyeyi kaçırsa da yakalar)
 MA_INSTANT_LOOKBACK = int(float(os.getenv("MA_INSTANT_LOOKBACK", "2")))
+_MEXC_KLINE_DEBUG_COUNT = 0  # ilk birkaç kline çağrısını loglamak için
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
@@ -683,6 +684,12 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
                 f"/api/v1/contract/kline/{mexc_sym}",
                 {"interval": mexc_interval, "start": start_ts, "end": end_ts},
             )
+            # TEŞHİS: ilk 3 çağrıda MEXC'in ne döndürdüğünü logla
+            global _MEXC_KLINE_DEBUG_COUNT
+            if _MEXC_KLINE_DEBUG_COUNT < 3:
+                _MEXC_KLINE_DEBUG_COUNT += 1
+                logger.warning("MEXC KLINE DEBUG %s (%s): tip=%s, içerik=%s",
+                               mexc_sym, mexc_interval, type(data).__name__, str(data)[:400])
             rows = _mexc_kline_to_rows(data if isinstance(data, dict) else {}, limit)
             if not rows:
                 empty_data = True
@@ -708,6 +715,8 @@ def _mexc_kline_to_rows(data: Any, limit: int) -> List[List[Any]]:
     """MEXC kline yanıtını OKX-uyumlu satıra çevirir.
     MEXC: {"time":[...],"open":[...],"close":[...],"high":[...],"low":[...],"vol":[...],"amount":[...]}
     OKX satır: [ts_ms, o, h, l, c, vol, vol_quote, vol_alt, confirm]  (artan zaman)
+    KRİTİK: Mumlar zaman damgasına göre ARTAN sıralanır, böylece rows[-1]
+    daima EN YENİ mumdur. MEXC'in dönüş sırasına güvenilmez.
     """
     if not isinstance(data, dict):
         return []
@@ -723,14 +732,18 @@ def _mexc_kline_to_rows(data: Any, limit: int) -> List[List[Any]]:
         return []
     rows: List[List[Any]] = []
     for i in range(n):
-        ts = int(safe_float(times[i]) * 1000)  # MEXC saniye -> OKX ms
+        ts_sec = safe_float(times[i])
+        ts = int(ts_sec * 1000)  # MEXC saniye -> OKX ms
         o = safe_float(opens[i]); h = safe_float(highs_[i])
         l = safe_float(lows_[i]); c = safe_float(closes_[i])
         v = safe_float(vols[i]); q = safe_float(amounts[i] if i < len(amounts) else v)
-        rows.append([str(ts), str(o), str(h), str(l), str(c), str(v), str(q), str(q), "1"])
-    if limit and len(rows) > limit:
-        rows = rows[-limit:]
-    return rows
+        rows.append((ts_sec, [str(ts), str(o), str(h), str(l), str(c), str(v), str(q), str(q), "1"]))
+    # Zaman damgasına göre ARTAN sırala (en eski -> en yeni)
+    rows.sort(key=lambda r: r[0])
+    out = [r[1] for r in rows]
+    if limit and len(out) > limit:
+        out = out[-limit:]
+    return out
 
 async def get_24h_tickers() -> Dict[str, Dict[str, Any]]:
     """ARTIK MEXC. OKX-uyumlu alanlarla (instId, last, vol24h, volCcy24h) döner."""
