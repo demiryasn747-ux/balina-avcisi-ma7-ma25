@@ -55,7 +55,6 @@ SCORE_OVERRIDE_GAP = float(os.getenv("SCORE_OVERRIDE_GAP", "8"))
 PRICE_OVERRIDE_MOVE_PCT = float(os.getenv("PRICE_OVERRIDE_MOVE_PCT", "0.55"))
 
 NO_SIGNAL_DIAG_SEC = int(float(os.getenv("NO_SIGNAL_DIAG_SEC", str(4 * 3600))))
-DIAGNOSTIC_LOOP_ENABLED = os.getenv("DIAGNOSTIC_LOOP_ENABLED", "false").lower() == "true"
 
 KLINE_CACHE_SEC = int(float(os.getenv("KLINE_CACHE_SEC", "5")))
 TICKER_CACHE_SEC = int(float(os.getenv("TICKER_CACHE_SEC", "8")))
@@ -79,20 +78,13 @@ MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
 MA_TP3_PCT = float(os.getenv("MA_TP3_PCT", "0.050"))
 MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
 SHORT_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MAX_RESISTANCE_DIFF_PCT", "0.30"))
-SHORT_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MIN_RESISTANCE_DIFF_PCT", "0"))   # 0 = limit yok; direnç min uzaklık
 SHORT_MIN_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MIN_SUPPORT_DIFF_PCT", "1.20"))
-SHORT_MAX_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MAX_SUPPORT_DIFF_PCT", "0"))         # 0 = limit yok; destek max uzaklık
+SHORT_MAX_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MAX_SUPPORT_DIFF_PCT", "0"))     # 0 = limit yok
 LONG_MAX_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MAX_SUPPORT_DIFF_PCT", "0.30"))
-LONG_MIN_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MIN_SUPPORT_DIFF_PCT", "0"))           # 0 = limit yok; destek min uzaklık
 LONG_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MIN_RESISTANCE_DIFF_PCT", "1.20"))
-LONG_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MAX_RESISTANCE_DIFF_PCT", "0"))     # 0 = limit yok; direnç max uzaklık
+LONG_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MAX_RESISTANCE_DIFF_PCT", "0"))  # 0 = limit yok
 MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
 MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
-MA_LONG_CROSS_MIN_GAP_PCT = float(os.getenv("MA_LONG_CROSS_MIN_GAP_PCT", "0.20"))
-MA_CANDLE_COLOR_FILTER = os.getenv("MA_CANDLE_COLOR_FILTER", "true").lower() == "true"
-MA_RECENT_TREND_FILTER = os.getenv("MA_RECENT_TREND_FILTER", "true").lower() == "true"
-MA_RECENT_TREND_LOOKBACK = int(float(os.getenv("MA_RECENT_TREND_LOOKBACK", "5")))
-MA_RECENT_TREND_MIN_RATIO = float(os.getenv("MA_RECENT_TREND_MIN_RATIO", "0.60"))
 MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOKBACK", "50")))
 MA_FOLLOWUP_ENABLED = os.getenv("MA_FOLLOWUP_ENABLED", "true").lower() == "true"
 
@@ -269,142 +261,6 @@ def tr_day_key(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts, TZ) if ts else tr_now()
     return dt.strftime("%Y-%m-%d")
 
-def month_key(ts: Optional[float] = None) -> str:
-    dt = datetime.fromtimestamp(ts, TZ) if ts else tr_now()
-    return dt.strftime("%Y-%m")
-
-def get_monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
-    if month is None:
-        month = month_key()
-    reports = memory.setdefault("monthly_reports", {})
-    rep = reports.setdefault(month, {})
-    rep.setdefault("signals_sent", 0)
-    rep.setdefault("ma_long_sent", 0)
-    rep.setdefault("ma_short_sent", 0)
-    rep.setdefault("v527_sent", 0)
-    rep.setdefault("stops", 0)
-    rep.setdefault("tp1", 0)
-    rep.setdefault("tp2", 0)
-    rep.setdefault("tp3", 0)
-    rep.setdefault("long_stop", 0)
-    rep.setdefault("long_tp1", 0)
-    rep.setdefault("long_tp2", 0)
-    rep.setdefault("long_tp3", 0)
-    rep.setdefault("short_stop", 0)
-    rep.setdefault("short_tp1", 0)
-    rep.setdefault("short_tp2", 0)
-    rep.setdefault("short_tp3", 0)
-    rep.setdefault("same_candle_stop_tp", 0)
-    rep.setdefault("stop_details", [])
-    return rep
-
-def record_monthly_signal_sent(direction: str = "", source: str = "MA") -> None:
-    try:
-        rep = get_monthly_report()
-        rep["signals_sent"] = int(rep.get("signals_sent", 0)) + 1
-        d = str(direction).upper()
-        s = str(source).upper()
-        if s == "MA" and d == "LONG":
-            rep["ma_long_sent"] = int(rep.get("ma_long_sent", 0)) + 1
-        elif s == "MA" and d == "SHORT":
-            rep["ma_short_sent"] = int(rep.get("ma_short_sent", 0)) + 1
-        elif s == "V527":
-            rep["v527_sent"] = int(rep.get("v527_sent", 0)) + 1
-    except Exception as e:
-        logger.warning("record_monthly_signal_sent hata: %s", e)
-
-def record_monthly_result(direction: str, result: str, symbol: str,
-                          stop_reason: str = "", entry: float = 0.0,
-                          stop_price: float = 0.0, hit_price: float = 0.0,
-                          source: str = "MA", touch_ts: float = 0.0) -> None:
-    try:
-        ref_ts = touch_ts if touch_ts and touch_ts > 0 else time.time()
-        rep = get_monthly_report(month_key(ref_ts))
-        d = str(direction).upper()
-        r = str(result).upper()
-
-        if r == "STOP":
-            rep["stops"] = int(rep.get("stops", 0)) + 1
-            if d == "LONG":
-                rep["long_stop"] = int(rep.get("long_stop", 0)) + 1
-            elif d == "SHORT":
-                rep["short_stop"] = int(rep.get("short_stop", 0)) + 1
-            details = rep.setdefault("stop_details", [])
-            details.append({
-                "ts": ref_ts,
-                "ts_str": tr_str(ref_ts),
-                "symbol": symbol,
-                "direction": d,
-                "entry": entry,
-                "stop": stop_price,
-                "reason": (stop_reason or "-")[:300],
-                "source": source,
-            })
-            if len(details) > 300:
-                del details[:len(details) - 300]
-        elif r == "AYNI_1M_MUMDA_STOP_TP":
-            rep["same_candle_stop_tp"] = int(rep.get("same_candle_stop_tp", 0)) + 1
-        elif r in ("TP1", "TP2", "TP3"):
-            key_total = r.lower()
-            rep[key_total] = int(rep.get(key_total, 0)) + 1
-            if d == "LONG":
-                kd = f"long_{key_total}"
-                rep[kd] = int(rep.get(kd, 0)) + 1
-            elif d == "SHORT":
-                kd = f"short_{key_total}"
-                rep[kd] = int(rep.get(kd, 0)) + 1
-    except Exception as e:
-        logger.warning("record_monthly_result hata: %s", e)
-
-def build_signal_reason_context(res: Dict[str, Any]) -> str:
-    try:
-        parts = []
-        score = res.get("score")
-        if score is not None:
-            parts.append(f"score={score}")
-        reason = str(res.get("reason", "")).strip()
-        if reason:
-            parts.append(reason)
-        be = res.get("binance_confirm_status")
-        if be:
-            parts.append(f"binance={be}")
-        wd = res.get("whale_divergence")
-        if wd:
-            parts.append(f"whale={wd}")
-        fd = res.get("funding_signal")
-        if fd:
-            parts.append(f"funding={fd}")
-        oic = res.get("oi_change_pct")
-        if oic is not None:
-            parts.append(f"oi%={oic}")
-        return " | ".join(parts)[:400] if parts else "-"
-    except Exception:
-        return "-"
-
-def build_ma_reason_context(res: Dict[str, Any]) -> str:
-    try:
-        parts = []
-        parts.append(f"{res.get('direction', '-')} MA7/MA25 {res.get('timeframe', MA_KLINE_INTERVAL)}")
-        en = str(res.get("entry_note", "")).strip()
-        if en:
-            parts.append(en)
-        sd = res.get("support_diff_pct")
-        rd = res.get("resistance_diff_pct")
-        if sd is not None and rd is not None:
-            parts.append(f"sup_diff%={sd} res_diff%={rd}")
-        wd = res.get("whale_divergence") or res.get("whale_eye")
-        if wd:
-            parts.append(f"whale={wd}")
-        fd = res.get("funding_signal") or res.get("funding_eye")
-        if fd:
-            parts.append(f"funding={fd}")
-        oic = res.get("oi_change_pct")
-        if oic is not None:
-            parts.append(f"oi%={oic}")
-        return " | ".join(parts)[:400] if parts else "-"
-    except Exception:
-        return "-"
-
 def clamp(x: float, low: float, high: float) -> float:
     return max(low, min(high, x))
 
@@ -436,7 +292,6 @@ def ensure_memory_shape() -> None:
     memory.setdefault("ma_follows", {})
     memory.setdefault("ma_last_candle_ts", {})
     memory.setdefault("daily_short_sent", {})
-    memory.setdefault("monthly_reports", {})
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("last_diag_ts", 0.0)
     memory["stats"].setdefault("ma_long", 0)
@@ -1649,10 +1504,9 @@ def sma(values: List[float], period: int) -> List[float]:
 
 def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
     stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
-    # TP çarpan zorlaması kaldırıldı — ENV'deki MA_TPx_PCT direkt kullanılır.
-    tp1_pct = MA_TP1_PCT
-    tp2_pct = MA_TP2_PCT
-    tp3_pct = MA_TP3_PCT
+    tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
+    tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
+    tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
 
     if direction == "SHORT":
         return {
@@ -1701,42 +1555,6 @@ def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int
         "resistance_diff_pct": round(resistance_diff, 4),
     }
 
-def _ma_human_filters_passed(direction: str, k1h: List[List[Any]], last_candle: List[Any]) -> Tuple[bool, str]:
-    candle_open = safe_float(last_candle[1])
-    candle_close = safe_float(last_candle[4])
-
-    if MA_CANDLE_COLOR_FILTER:
-        if direction == "LONG" and candle_close < candle_open:
-            return False, "candle_color_bearish_for_long"
-        if direction == "SHORT" and candle_close > candle_open:
-            return False, "candle_color_bullish_for_short"
-
-    if MA_RECENT_TREND_FILTER:
-        lookback = max(0, int(MA_RECENT_TREND_LOOKBACK))
-        if lookback > 0 and len(k1h) >= lookback + 2:
-            recent = k1h[-(lookback + 2):-2]
-            bullish = 0
-            bearish = 0
-            for c in recent:
-                co = safe_float(c[1])
-                cc = safe_float(c[4])
-                if cc > co:
-                    bullish += 1
-                elif cc < co:
-                    bearish += 1
-            directional = bullish + bearish
-            if directional > 0:
-                if direction == "LONG":
-                    ratio = bullish / directional
-                    if ratio < MA_RECENT_TREND_MIN_RATIO:
-                        return False, f"recent_trend_not_bullish ratio={ratio:.2f}<{MA_RECENT_TREND_MIN_RATIO:.2f}"
-                elif direction == "SHORT":
-                    ratio = bearish / directional
-                    if ratio < MA_RECENT_TREND_MIN_RATIO:
-                        return False, f"recent_trend_not_bearish ratio={ratio:.2f}<{MA_RECENT_TREND_MIN_RATIO:.2f}"
-
-    return True, ""
-
 def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: List[float], ma25: List[float]) -> Optional[Dict[str, Any]]:
     if len(k1h) < 3 or len(ma7) < 3 or len(ma25) < 3:
         return None
@@ -1764,9 +1582,6 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     if direction == "SHORT":
         if not (prev_ma7 >= prev_ma25 and cur_ma7 <= cur_ma25):
             return None
-        ok_human, reason_human = _ma_human_filters_passed("SHORT", k1h, last_candle)
-        if not ok_human:
-            return None
         if candle_high <= 0 or last_price <= 0:
             return None
         entry_diff_pct = abs(((candle_high - last_price) / candle_high) * 100.0)
@@ -1776,14 +1591,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         entry_note = f"SHORT giriş: güncel fiyat 1 saatlik mum tepesine en fazla %{MA_ENTRY_MAX_DIFF_PCT:.2f} yakın"
 
     elif direction == "LONG":
-        if not (prev_ma7 < prev_ma25 and cur_ma7 > cur_ma25):
-            return None
-        if cur_ma25 > 0:
-            cross_gap_pct = ((cur_ma7 - cur_ma25) / cur_ma25) * 100.0
-            if cross_gap_pct < MA_LONG_CROSS_MIN_GAP_PCT:
-                return None
-        ok_human, reason_human = _ma_human_filters_passed("LONG", k1h, last_candle)
-        if not ok_human:
+        if not (prev_ma7 <= prev_ma25 and cur_ma7 >= cur_ma25):
             return None
         if candle_low <= 0 or last_price <= 0:
             return None
@@ -1814,10 +1622,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
         if safe_float(sr.get("support_diff_pct", 0)) < SHORT_MIN_SUPPORT_DIFF_PCT:
             return None
-        # Yeni: direnç min uzaklık (0 = limit yok)
-        if SHORT_MIN_RESISTANCE_DIFF_PCT > 0 and safe_float(sr.get("resistance_diff_pct", 0)) < SHORT_MIN_RESISTANCE_DIFF_PCT:
-            return None
-        # Yeni: destek max uzaklık (0 = limit yok)
+        # Yeni: destek üst limiti (0 = limit yok)
         if SHORT_MAX_SUPPORT_DIFF_PCT > 0 and safe_float(sr.get("support_diff_pct", 0)) > SHORT_MAX_SUPPORT_DIFF_PCT:
             return None
 
@@ -1826,10 +1631,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
         if safe_float(sr.get("resistance_diff_pct", 0)) < LONG_MIN_RESISTANCE_DIFF_PCT:
             return None
-        # Yeni: destek min uzaklık (0 = limit yok)
-        if LONG_MIN_SUPPORT_DIFF_PCT > 0 and safe_float(sr.get("support_diff_pct", 0)) < LONG_MIN_SUPPORT_DIFF_PCT:
-            return None
-        # Yeni: direnç max uzaklık (0 = limit yok)
+        # Yeni: direnç üst limiti (0 = limit yok)
         if LONG_MAX_RESISTANCE_DIFF_PCT > 0 and safe_float(sr.get("resistance_diff_pct", 0)) > LONG_MAX_RESISTANCE_DIFF_PCT:
             return None
 
@@ -1945,7 +1747,6 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
         "support": res.get("support", 0),
         "resistance": res.get("resistance", 0),
         "timeframe": res.get("timeframe", MA_KLINE_INTERVAL),
-        "reason_context": build_ma_reason_context(res),
     }
     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0))
     if res["direction"] == "SHORT":
@@ -1957,7 +1758,14 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
     stats["ma_signal_sent"] += 1
     memory["last_signal_ts"] = sent_ts
     memory.setdefault("ma_last_candle_ts", {})[f"{res['symbol']}:{res['direction']}"] = res.get("candle_ts", "")
-    record_monthly_signal_sent(direction=res["direction"], source="MA")
+
+    # /hafiza için sayaç
+    h = memory.setdefault("ma_hafiza", {})
+    h["total_sent"] = int(h.get("total_sent", 0)) + 1
+    if res["direction"] == "SHORT":
+        h["short_sent"] = int(h.get("short_sent", 0)) + 1
+    else:
+        h["long_sent"] = int(h.get("long_sent", 0)) + 1
 
 async def enrich_ma_with_institutional(res: Dict[str, Any]) -> Dict[str, Any]:
     if not res:
@@ -2179,7 +1987,77 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Örnek: {pos_val:.0f} USDT pozisyon = {margin_ex:.2f} USDT marj"
     )
 
+def detect_ma_followup_events(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> List[Dict[str, Any]]:
+    """TP1/TP2/TP3 ve Stop olaylarını sırasıyla yakalar.
+    Daha önce kaydedilmemiş olayları döner. rec içine zaman damgalarını yazar.
+    """
+    direction = str(rec.get("direction", "")).upper()
+    entry = safe_float(rec.get("entry", 0))
+    stop = safe_float(rec.get("stop", 0))
+    tp1 = safe_float(rec.get("tp1", 0))
+    tp2 = safe_float(rec.get("tp2", 0))
+    tp3 = safe_float(rec.get("tp3", 0))
+    if direction not in ("LONG", "SHORT") or entry <= 0 or stop <= 0 or tp1 <= 0:
+        return []
+
+    sent_ts = safe_float(rec.get("sent_ts", 0))
+    start_ms = max(0.0, (sent_ts - 60.0) * 1000.0)
+
+    tp1_done = safe_float(rec.get("tp1_hit_ts", 0)) > 0
+    tp2_done = safe_float(rec.get("tp2_hit_ts", 0)) > 0
+    tp3_done = safe_float(rec.get("tp3_hit_ts", 0)) > 0
+
+    events: List[Dict[str, Any]] = []
+
+    for row in klines_1m:
+        row_ts_ms = safe_float(row[0])
+        if row_ts_ms < start_ms:
+            continue
+        ts_sec = row_ts_ms / 1000.0
+        high = safe_float(row[2])
+        low = safe_float(row[3])
+        if high <= 0 or low <= 0:
+            continue
+
+        hit_stop = (low <= stop) if direction == "LONG" else (high >= stop)
+
+        new_tps: List[Tuple[str, float]] = []
+        if direction == "LONG":
+            if not tp1_done and high >= tp1:
+                new_tps.append(("TP1", tp1)); tp1_done = True
+            if not tp2_done and high >= tp2:
+                new_tps.append(("TP2", tp2)); tp2_done = True
+            if not tp3_done and high >= tp3:
+                new_tps.append(("TP3", tp3)); tp3_done = True
+        else:
+            if not tp1_done and low <= tp1:
+                new_tps.append(("TP1", tp1)); tp1_done = True
+            if not tp2_done and low <= tp2:
+                new_tps.append(("TP2", tp2)); tp2_done = True
+            if not tp3_done and low <= tp3:
+                new_tps.append(("TP3", tp3)); tp3_done = True
+
+        for lvl, price in new_tps:
+            rec[f"{lvl.lower()}_hit_ts"] = ts_sec
+            events.append({"type": lvl, "price": price, "ts": ts_sec})
+
+        if hit_stop:
+            if tp1_done or tp2_done or tp3_done:
+                rec["stop_after_tp_ts"] = ts_sec
+                events.append({"type": "STOP_AFTER_TP", "price": stop, "ts": ts_sec})
+            else:
+                rec["stop_ts"] = ts_sec
+                events.append({"type": "STOP", "price": stop, "ts": ts_sec})
+            break
+
+        if tp3_done:
+            break
+
+    return events
+
+
 def detect_ma_followup_result(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> Optional[Dict[str, Any]]:
+    """Geriye uyumluluk: ilk olayı döndür (eski fonksiyonun davranışını korur)."""
     direction = str(rec.get("direction", "")).upper()
     sent_ts = safe_float(rec.get("sent_ts", 0))
     entry = safe_float(rec.get("entry", 0))
@@ -2297,32 +2175,82 @@ async def check_ma_followups() -> None:
         k1m = await get_klines(symbol, "1m", 300)
         if not k1m:
             continue
-        hit = detect_ma_followup_result(rec, k1m)
-        if not hit:
+
+        events = detect_ma_followup_events(rec, k1m)
+        if not events:
             continue
-        ok = await safe_send_telegram(build_ma_followup_message(rec, hit))
-        if ok:
-            rec["done"] = True
-            rec["result"] = hit.get("result")
-            rec["result_price"] = hit.get("price")
-            rec["touch_ts"] = hit.get("touch_ts")
-            memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
-            if str(hit.get("result")) == "STOP":
-                memory["stats"]["ma_stop"] = int(memory["stats"].get("ma_stop", 0)) + 1
-            elif str(hit.get("result")).startswith("TP"):
+
+        h = memory.setdefault("ma_hafiza", {})
+        direction_key = str(rec.get("direction", "")).lower()
+        any_msg = False
+
+        for ev in events:
+            ev_type = str(ev.get("type", ""))
+
+            if ev_type == "TP1":
+                # Eskisi gibi tam mesaj
+                msg = build_ma_followup_message(rec, {
+                    "result": "TP1", "level": "TP1",
+                    "price": ev["price"], "touch_ts": ev["ts"],
+                })
+                await safe_send_telegram(msg)
+                any_msg = True
+                h["total_tp1"] = int(h.get("total_tp1", 0)) + 1
+                h[f"{direction_key}_tp1"] = int(h.get(f"{direction_key}_tp1", 0)) + 1
+                # Eski sayaçları da çalıştır
+                memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
                 memory["stats"]["ma_tp"] = int(memory["stats"].get("ma_tp", 0)) + 1
-            record_monthly_result(
-                direction=str(rec.get("direction", "")),
-                result=str(hit.get("result", "")),
-                symbol=str(rec.get("symbol", "")),
-                stop_reason=str(rec.get("reason_context", "")),
-                entry=safe_float(rec.get("entry", 0)),
-                stop_price=safe_float(rec.get("stop", 0)),
-                hit_price=safe_float(hit.get("price", 0)),
-                source="MA",
-                touch_ts=safe_float(hit.get("touch_ts", 0)),
-            )
-            await save_memory_async()
+                rec["result"] = "TP1"
+                rec["result_price"] = ev["price"]
+                rec["touch_ts"] = ev["ts"]
+
+            elif ev_type == "TP2":
+                # Sessiz — sadece hafıza
+                h["total_tp2"] = int(h.get("total_tp2", 0)) + 1
+                h[f"{direction_key}_tp2"] = int(h.get(f"{direction_key}_tp2", 0)) + 1
+
+            elif ev_type == "TP3":
+                # Sessiz — sadece hafıza, takip biter
+                h["total_tp3"] = int(h.get("total_tp3", 0)) + 1
+                h[f"{direction_key}_tp3"] = int(h.get(f"{direction_key}_tp3", 0)) + 1
+                rec["done"] = True
+
+            elif ev_type == "STOP":
+                # Hiç TP yokken stop — tam mesaj
+                msg = build_ma_followup_message(rec, {
+                    "result": "STOP", "level": "STOP",
+                    "price": ev["price"], "touch_ts": ev["ts"],
+                })
+                await safe_send_telegram(msg)
+                any_msg = True
+                h["total_stop"] = int(h.get("total_stop", 0)) + 1
+                h[f"{direction_key}_stop"] = int(h.get(f"{direction_key}_stop", 0)) + 1
+                memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
+                memory["stats"]["ma_stop"] = int(memory["stats"].get("ma_stop", 0)) + 1
+                rec["result"] = "STOP"
+                rec["result_price"] = ev["price"]
+                rec["touch_ts"] = ev["ts"]
+                rec["done"] = True
+
+            elif ev_type == "STOP_AFTER_TP":
+                # Kısa mesaj — TP sonrası stop
+                tp_list = []
+                if safe_float(rec.get("tp1_hit_ts", 0)) > 0:
+                    tp_list.append("TP1")
+                if safe_float(rec.get("tp2_hit_ts", 0)) > 0:
+                    tp_list.append("TP2")
+                tp_str = "+".join(tp_list) if tp_list else "TP"
+                short_msg = (
+                    f"⚠️ {symbol} {rec.get('direction', '')}: {tp_str} sonrası STOP\n"
+                    f"Stop fiyat: {fmt_num(ev['price'])}"
+                )
+                await safe_send_telegram(short_msg)
+                any_msg = True
+                h["total_stop_after_tp"] = int(h.get("total_stop_after_tp", 0)) + 1
+                h[f"{direction_key}_stop_after_tp"] = int(h.get(f"{direction_key}_stop_after_tp", 0)) + 1
+                rec["done"] = True
+
+        await save_memory_async()
 
 def signal_key(symbol: str, stage: str) -> str:
     return f"{symbol}:{stage}"
@@ -2672,11 +2600,8 @@ async def maybe_send_signal(res: Dict[str, Any]) -> None:
                 "stage": "SIGNAL",
                 "done": False,
                 "sent_ts": time.time(),
-                "direction": res.get("direction", ""),
-                "reason_context": build_signal_reason_context(res),
             }
             memory.get("hot", {}).pop(symbol, None)
-            record_monthly_signal_sent(direction=res.get("direction", ""), source="V527")
         else:
             logger.warning("TELEGRAM GÖNDERİLEMEDİ %s", symbol)
         return
@@ -2752,18 +2677,6 @@ async def check_followups() -> None:
         if ok:
             stats["followup_sent"] += 1
             rec["done"] = True
-            if outcome == "STOP":
-                record_monthly_result(
-                    direction=str(rec.get("direction", "")),
-                    result="STOP",
-                    symbol=sym,
-                    stop_reason=str(rec.get("reason_context", "")),
-                    entry=entry,
-                    stop_price=stop,
-                    hit_price=cur,
-                    source="V527",
-                    touch_ts=time.time(),
-                )
 
 def get_hot_symbols(limit: int = MAX_HOT_CANDIDATES) -> List[str]:
     hot = memory.get("hot", {})
@@ -2905,9 +2818,6 @@ async def heartbeat_loop() -> None:
         await asyncio.sleep(max(60, HEARTBEAT_INTERVAL_SEC))
 
 async def diagnostic_loop() -> None:
-    if not DIAGNOSTIC_LOOP_ENABLED:
-        logger.info("diagnostic_loop kapalı (DIAGNOSTIC_LOOP_ENABLED=false)")
-        return
     while True:
         try:
             last_sig = safe_float(memory.get("last_signal_ts", 0))
@@ -3029,9 +2939,9 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ma_perf = ma_performance_summary()
     stop_pct_dyn = calc_leveraged_stop_pct(MA_STOP_PCT)
-    tp1_dyn = MA_TP1_PCT
-    tp2_dyn = MA_TP2_PCT
-    tp3_dyn = MA_TP3_PCT
+    tp1_dyn = max(MA_TP1_PCT, stop_pct_dyn * 1.8)
+    tp2_dyn = max(MA_TP2_PCT, stop_pct_dyn * 3.0)
+    tp3_dyn = max(MA_TP3_PCT, stop_pct_dyn * 4.5)
     await update.message.reply_text(
         f"💓 MA7/MA25 1H 200 COIN DURUM\n"
         f"Saat: {tr_str()}\n"
@@ -3048,6 +2958,62 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"SHORT sinyal: {ma_perf['short_sent']} | Başarı: %{ma_perf['short_success']:.1f} | TP={ma_perf['short_tp']} Stop={ma_perf['short_stop']}\n"
         f"MA analiz: {memory.get('stats', {}).get('ma_analyzed', 0)}"
     )
+
+
+async def cmd_hafiza(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    h = memory.get("ma_hafiza", {})
+
+    total_sent = int(h.get("total_sent", 0))
+    total_tp1 = int(h.get("total_tp1", 0))
+    total_tp2 = int(h.get("total_tp2", 0))
+    total_tp3 = int(h.get("total_tp3", 0))
+    total_stop = int(h.get("total_stop", 0))
+    total_stop_after_tp = int(h.get("total_stop_after_tp", 0))
+
+    long_sent = int(h.get("long_sent", 0))
+    long_tp1 = int(h.get("long_tp1", 0))
+    long_tp2 = int(h.get("long_tp2", 0))
+    long_tp3 = int(h.get("long_tp3", 0))
+    long_stop = int(h.get("long_stop", 0))
+    long_stop_after_tp = int(h.get("long_stop_after_tp", 0))
+
+    short_sent = int(h.get("short_sent", 0))
+    short_tp1 = int(h.get("short_tp1", 0))
+    short_tp2 = int(h.get("short_tp2", 0))
+    short_tp3 = int(h.get("short_tp3", 0))
+    short_stop = int(h.get("short_stop", 0))
+    short_stop_after_tp = int(h.get("short_stop_after_tp", 0))
+
+    # Tamamlanmış işlemler: TP1 olmuş veya direkt stop yemiş
+    completed = total_tp1 + total_stop
+    win_rate = (total_tp1 / completed * 100.0) if completed > 0 else 0.0
+    bekleyen = total_sent - completed
+
+    msg = (
+        f"📊 MA HAFIZA\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Toplam Sinyal: {total_sent}\n"
+        f"Bekleyen (henüz sonuç yok): {bekleyen}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"✅ TP1 olan: {total_tp1}\n"
+        f"   ↳ TP2'ye ulaşan: {total_tp2}\n"
+        f"   ↳ TP3'e ulaşan: {total_tp3}\n"
+        f"   ↳ TP sonrası stop: {total_stop_after_tp}\n"
+        f"❌ Direkt stop: {total_stop}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Win rate (TP1 yakalama): %{win_rate:.1f}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 LONG: {long_sent} sinyal\n"
+        f"   TP1: {long_tp1} | TP2: {long_tp2} | TP3: {long_tp3}\n"
+        f"   Stop: {long_stop} | TP sonrası stop: {long_stop_after_tp}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔴 SHORT: {short_sent} sinyal\n"
+        f"   TP1: {short_tp1} | TP2: {short_tp2} | TP3: {short_tp3}\n"
+        f"   Stop: {short_stop} | TP sonrası stop: {short_stop_after_tp}"
+    )
+
+    await update.message.reply_text(msg)
+
 
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not WHALE_EYE_ENABLED and not FUNDING_EYE_ENABLED:
@@ -3170,95 +3136,6 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Not: {f_signal.get('note', '-') or '-'}"
     )
 
-async def cmd_aylik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    reports = memory.get("monthly_reports", {}) or {}
-    if context.args:
-        target_month = str(context.args[0]).strip()
-    else:
-        target_month = month_key()
-
-    if target_month.lower() in ("liste", "list", "all", "hepsi"):
-        if not reports:
-            await update.message.reply_text("📅 Henüz aylık rapor yok.")
-            return
-        months_sorted = sorted(reports.keys())
-        lines = ["📅 KAYITLI AYLAR:"]
-        for m in months_sorted:
-            r = reports.get(m, {})
-            total_tp = int(r.get("tp1", 0)) + int(r.get("tp2", 0)) + int(r.get("tp3", 0))
-            lines.append(f"• {m} → sinyal={r.get('signals_sent', 0)} TP={total_tp} STOP={r.get('stops', 0)}")
-        lines.append("\nDetay: /aylik YYYY-MM")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    rep = reports.get(target_month)
-    if not rep:
-        avail = ", ".join(sorted(reports.keys())) if reports else "-"
-        await update.message.reply_text(
-            f"📅 {target_month} için aylık rapor bulunamadı.\n"
-            f"Mevcut aylar: {avail}\n"
-            f"Kullanım: /aylik | /aylik 2026-05 | /aylik liste"
-        )
-        return
-
-    total_tp = int(rep.get("tp1", 0)) + int(rep.get("tp2", 0)) + int(rep.get("tp3", 0))
-    total_stop = int(rep.get("stops", 0))
-    resolved = total_tp + total_stop
-    success_pct = (total_tp / resolved * 100.0) if resolved > 0 else 0.0
-
-    long_tp = int(rep.get("long_tp1", 0)) + int(rep.get("long_tp2", 0)) + int(rep.get("long_tp3", 0))
-    short_tp = int(rep.get("short_tp1", 0)) + int(rep.get("short_tp2", 0)) + int(rep.get("short_tp3", 0))
-    long_stop = int(rep.get("long_stop", 0))
-    short_stop = int(rep.get("short_stop", 0))
-    long_resolved = long_tp + long_stop
-    short_resolved = short_tp + short_stop
-    long_success = (long_tp / long_resolved * 100.0) if long_resolved > 0 else 0.0
-    short_success = (short_tp / short_resolved * 100.0) if short_resolved > 0 else 0.0
-
-    lines = [
-        f"📅 AYLIK RAPOR — {target_month}",
-        f"Saat: {tr_str()}",
-        f"━━━━━━━━━━━━━━━",
-        f"Toplam Sinyal: {int(rep.get('signals_sent', 0))}",
-        f"  • MA LONG: {int(rep.get('ma_long_sent', 0))}",
-        f"  • MA SHORT: {int(rep.get('ma_short_sent', 0))}",
-        f"  • V527: {int(rep.get('v527_sent', 0))}",
-        f"━━━━━━━━━━━━━━━",
-        f"TP1: {int(rep.get('tp1', 0))} | TP2: {int(rep.get('tp2', 0))} | TP3: {int(rep.get('tp3', 0))}",
-        f"STOP: {total_stop}",
-        f"Aynı 1m mum stop+tp teması: {int(rep.get('same_candle_stop_tp', 0))}",
-        f"Çözülen: {resolved} | Başarı: %{success_pct:.1f}",
-        f"━━━━━━━━━━━━━━━",
-        f"LONG → TP1={rep.get('long_tp1', 0)} TP2={rep.get('long_tp2', 0)} TP3={rep.get('long_tp3', 0)} STOP={long_stop} | Başarı: %{long_success:.1f}",
-        f"SHORT → TP1={rep.get('short_tp1', 0)} TP2={rep.get('short_tp2', 0)} TP3={rep.get('short_tp3', 0)} STOP={short_stop} | Başarı: %{short_success:.1f}",
-        f"━━━━━━━━━━━━━━━",
-    ]
-
-    details = rep.get("stop_details", []) or []
-    if details:
-        show_n = min(12, len(details))
-        lines.append(f"❌ STOP DETAYLARI (son {show_n} / toplam {len(details)}):")
-        for d in details[-show_n:]:
-            sym = d.get("symbol", "-")
-            dr = d.get("direction", "-")
-            entry_v = safe_float(d.get("entry", 0))
-            stop_v = safe_float(d.get("stop", 0))
-            src = d.get("source", "-")
-            ts_str = d.get("ts_str", "-")
-            reason_txt = str(d.get("reason", "-"))
-            if len(reason_txt) > 140:
-                reason_txt = reason_txt[:140] + "…"
-            lines.append(f"• [{src}] {sym} {dr} entry={fmt_num(entry_v)} stop={fmt_num(stop_v)}")
-            lines.append(f"   ⏱ {ts_str}")
-            lines.append(f"   sebep: {reason_txt}")
-    else:
-        lines.append("Bu ay STOP kaydı yok.")
-
-    msg = "\n".join(lines)
-    if len(msg) > 3900:
-        msg = msg[:3890] + "\n…"
-    await update.message.reply_text(msg)
-
 async def post_init(application) -> None:
     active_count, pruned_count = await refresh_coin_pool(force=True)
 
@@ -3317,9 +3194,9 @@ def build_app():
     application.add_handler(CommandHandler("hot", cmd_hot))
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
+    application.add_handler(CommandHandler("hafiza", cmd_hafiza))
     application.add_handler(CommandHandler("whale", cmd_whale))
     application.add_handler(CommandHandler("funding", cmd_funding))
-    application.add_handler(CommandHandler("aylik", cmd_aylik))
     return application
 
 def main() -> None:
