@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcisi V8.5 ANLIK KESISIM MEXC"
+VERSION_NAME = "Balina Avcisi V8.6 ANLIK FIX + API"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -116,6 +116,8 @@ MA_SLOW_PERIOD = int(float(os.getenv("MA_SLOW_PERIOD", "10")))   # yavaş MA (gr
 # Anlık kesişim modu: mum kapanışı beklemeden, kesişim anında sinyal.
 # S/R ve mum-yakınlık filtrelerini atlar. Yön değişene kadar tekrar atmaz.
 MA_INSTANT_CROSS = os.getenv("MA_INSTANT_CROSS", "false").lower() == "true"
+# Anlık modda kesişimi son kaç bar içinde ararız (tam o saniyeyi kaçırsa da yakalar)
+MA_INSTANT_LOOKBACK = int(float(os.getenv("MA_INSTANT_LOOKBACK", "2")))
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
@@ -673,6 +675,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
     start_ts = max(0, end_ts - sec * max(limit + 10, 80))
 
     last_err: Optional[Exception] = None
+    empty_data = False
     for attempt in range(max(1, MEXC_KLINE_RETRY)):
         try:
             data = await asyncio.to_thread(
@@ -682,8 +685,8 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
             )
             rows = _mexc_kline_to_rows(data if isinstance(data, dict) else {}, limit)
             if not rows:
-                last_err = RuntimeError("empty")
-                break  # boş = pasif sembol, retry yapma
+                empty_data = True
+                break  # boş = veri yok / pasif sembol, GERÇEK HATA DEĞİL
             note_symbol_success(symbol)
             kline_cache[cache_key] = (now_ts, rows)
             return rows
@@ -691,6 +694,11 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
             last_err = e
             if attempt < MEXC_KLINE_RETRY - 1:
                 time.sleep(0.4 * (attempt + 1))
+    # Boş veri api_fail sayılmaz (yeni/az işlemli coin) — sadece bu coini sessizce blokla
+    if empty_data and last_err is None:
+        note_symbol_fail(symbol, f"{interval}:empty_no_data")
+        return cached[1] if cached else []
+    # Gerçek hata (timeout, 429, bağlantı) → api_fail
     stats["api_fail"] += 1
     note_symbol_fail(symbol, f"{interval}:{last_err}")
     return cached[1] if cached else []
@@ -1673,11 +1681,6 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     # - Aynı yönde tekrar atmama: yön değişene kadar yeni sinyal yok
     # ============================================================
     if MA_INSTANT_CROSS:
-        prev_ma7 = ma7[-2]   # bir önceki (kapalı) mum
-        prev_ma25 = ma25[-2]
-        cur_ma7 = ma7[-1]    # canlı mum
-        cur_ma25 = ma25[-1]
-
         live_candle = k1h[-1]
         candle_ts = str(live_candle[0])
         candle_high = safe_float(live_candle[2])
@@ -1686,14 +1689,38 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         if last_price <= 0:
             return None
 
-        # Kesişim kontrolü
+        cur_ma7 = ma7[-1]
+        cur_ma21 = ma25[-1]
+
+        # Şu anki dizilim doğru yönde mi?
+        # LONG: MA9 şu an MA21'in üstünde | SHORT: MA9 şu an altında
         if direction == "SHORT":
-            if not (prev_ma7 > prev_ma25 and cur_ma7 <= cur_ma25):
+            if not (cur_ma7 <= cur_ma21):
                 return None
         elif direction == "LONG":
-            if not (prev_ma7 < prev_ma25 and cur_ma7 >= cur_ma25):
+            if not (cur_ma7 >= cur_ma21):
                 return None
         else:
+            return None
+
+        # Son MA_INSTANT_LOOKBACK bar içinde gerçekten KESİŞİM oldu mu?
+        # (Sadece "üstünde" olması yetmez — yakın zamanda karşı taraftan geçmiş olmalı.)
+        cross_found = False
+        look = max(2, MA_INSTANT_LOOKBACK)
+        # En yeni barlardan geriye doğru: bir bar diğer tarafta mı?
+        for i in range(1, look + 1):
+            idx = -1 - i
+            if -idx > len(ma7):
+                break
+            p7 = ma7[idx]
+            p21 = ma25[idx]
+            if direction == "SHORT" and p7 > p21:
+                cross_found = True  # önceki barda üstteydi, şimdi altta = aşağı kesişim
+                break
+            if direction == "LONG" and p7 < p21:
+                cross_found = True  # önceki barda alttaydı, şimdi üstte = yukarı kesişim
+                break
+        if not cross_found:
             return None
 
         # Yön değişimi koruması: son sinyal aynı yönse, ters kesişim olana kadar atma
@@ -1702,7 +1729,7 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
 
         entry = last_price
-        entry_note = f"{direction} anlık kesişim ({MA_KLINE_INTERVAL}) — mum kapanışı beklenmedi"
+        entry_note = f"{direction} anlık kesişim ({MA_KLINE_INTERVAL}, son {look} bar) — mum kapanışı beklenmedi"
         targets = calc_ma_targets(entry, direction)
 
         # Likidasyon güvenliği (tek koruma olarak kalsın)
@@ -1719,8 +1746,8 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             "tp1": targets["tp1"], "tp2": targets["tp2"], "tp3": targets["tp3"],
             "stop_pct": targets["stop_pct"], "tp1_pct": targets["tp1_pct"],
             "tp2_pct": targets["tp2_pct"], "tp3_pct": targets["tp3_pct"],
-            "ma7": cur_ma7, "ma25": cur_ma25,
-            "prev_ma7": prev_ma7, "prev_ma25": prev_ma25,
+            "ma7": cur_ma7, "ma25": cur_ma21,
+            "prev_ma7": ma7[-2], "prev_ma25": ma25[-2],
             "candle_high": candle_high, "candle_low": candle_low,
             "candle_ts": candle_ts,
             "timeframe": MA_KLINE_INTERVAL,
