@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V8.1 ULTIMATE (OI + Funding Institutional Eye)"
+VERSION_NAME = "Balina Avcisi V8.1 YON STOP (LONG/SHORT ayri stop-TP)"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -76,15 +76,21 @@ MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
 MA_TP3_PCT = float(os.getenv("MA_TP3_PCT", "0.050"))
+# Yöne özel stop/TP (0 = bu yön için genel MA_*_PCT kullanılır).
+# Bunlar 0'dan büyükse çarpan zorlaması atlanır, değer aynen uygulanır.
+MA_LONG_STOP_PCT = float(os.getenv("MA_LONG_STOP_PCT", "0"))
+MA_LONG_TP1_PCT = float(os.getenv("MA_LONG_TP1_PCT", "0"))
+MA_LONG_TP2_PCT = float(os.getenv("MA_LONG_TP2_PCT", "0"))
+MA_LONG_TP3_PCT = float(os.getenv("MA_LONG_TP3_PCT", "0"))
+MA_SHORT_STOP_PCT = float(os.getenv("MA_SHORT_STOP_PCT", "0"))
+MA_SHORT_TP1_PCT = float(os.getenv("MA_SHORT_TP1_PCT", "0"))
+MA_SHORT_TP2_PCT = float(os.getenv("MA_SHORT_TP2_PCT", "0"))
+MA_SHORT_TP3_PCT = float(os.getenv("MA_SHORT_TP3_PCT", "0"))
 MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
 SHORT_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MAX_RESISTANCE_DIFF_PCT", "0.30"))
-SHORT_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MIN_RESISTANCE_DIFF_PCT", "0"))   # 0 = kapalı; direnç min uzaklık
 SHORT_MIN_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MIN_SUPPORT_DIFF_PCT", "1.20"))
-SHORT_MAX_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MAX_SUPPORT_DIFF_PCT", "0"))     # 0 = limit yok
 LONG_MAX_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MAX_SUPPORT_DIFF_PCT", "0.30"))
-LONG_MIN_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MIN_SUPPORT_DIFF_PCT", "0"))           # 0 = kapalı; destek min uzaklık
 LONG_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MIN_RESISTANCE_DIFF_PCT", "1.20"))
-LONG_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MAX_RESISTANCE_DIFF_PCT", "0"))  # 0 = limit yok
 MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
 MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
 MA_SUPPORT_RESISTANCE_LOOKBACK = int(float(os.getenv("MA_SUPPORT_RESISTANCE_LOOKBACK", "50")))
@@ -1505,12 +1511,18 @@ def sma(values: List[float], period: int) -> List[float]:
     return out
 
 def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
-    stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
-    tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
-    tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
-    tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
-
     if direction == "SHORT":
+        # Yöne özel değer varsa onu aynen kullan (çarpan zorlaması yok); yoksa genel ayar + çarpan
+        if MA_SHORT_STOP_PCT > 0:
+            stop_pct = calc_leveraged_stop_pct(MA_SHORT_STOP_PCT)
+            tp1_pct = MA_SHORT_TP1_PCT if MA_SHORT_TP1_PCT > 0 else max(MA_TP1_PCT, stop_pct * 1.8)
+            tp2_pct = MA_SHORT_TP2_PCT if MA_SHORT_TP2_PCT > 0 else max(MA_TP2_PCT, stop_pct * 3.0)
+            tp3_pct = MA_SHORT_TP3_PCT if MA_SHORT_TP3_PCT > 0 else max(MA_TP3_PCT, stop_pct * 4.5)
+        else:
+            stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
+            tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
+            tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
+            tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
         return {
             "stop": entry * (1 + stop_pct),
             "tp1": entry * (1 - tp1_pct),
@@ -1521,6 +1533,18 @@ def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
             "tp2_pct": round(tp2_pct * 100, 2),
             "tp3_pct": round(tp3_pct * 100, 2),
         }
+
+    # LONG
+    if MA_LONG_STOP_PCT > 0:
+        stop_pct = calc_leveraged_stop_pct(MA_LONG_STOP_PCT)
+        tp1_pct = MA_LONG_TP1_PCT if MA_LONG_TP1_PCT > 0 else max(MA_TP1_PCT, stop_pct * 1.8)
+        tp2_pct = MA_LONG_TP2_PCT if MA_LONG_TP2_PCT > 0 else max(MA_TP2_PCT, stop_pct * 3.0)
+        tp3_pct = MA_LONG_TP3_PCT if MA_LONG_TP3_PCT > 0 else max(MA_TP3_PCT, stop_pct * 4.5)
+    else:
+        stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
+        tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
+        tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
+        tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
     return {
         "stop": entry * (1 - stop_pct),
         "tp1": entry * (1 + tp1_pct),
@@ -1624,23 +1648,11 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
         if safe_float(sr.get("support_diff_pct", 0)) < SHORT_MIN_SUPPORT_DIFF_PCT:
             return None
-        # Yeni: destek üst limiti (0 = limit yok)
-        if SHORT_MAX_SUPPORT_DIFF_PCT > 0 and safe_float(sr.get("support_diff_pct", 0)) > SHORT_MAX_SUPPORT_DIFF_PCT:
-            return None
-        # Yeni: direnç alt limiti (0 = kapalı)
-        if SHORT_MIN_RESISTANCE_DIFF_PCT > 0 and safe_float(sr.get("resistance_diff_pct", 0)) < SHORT_MIN_RESISTANCE_DIFF_PCT:
-            return None
 
     if direction == "LONG":
         if safe_float(sr.get("support_diff_pct", 0)) > LONG_MAX_SUPPORT_DIFF_PCT:
             return None
         if safe_float(sr.get("resistance_diff_pct", 0)) < LONG_MIN_RESISTANCE_DIFF_PCT:
-            return None
-        # Yeni: direnç üst limiti (0 = limit yok)
-        if LONG_MAX_RESISTANCE_DIFF_PCT > 0 and safe_float(sr.get("resistance_diff_pct", 0)) > LONG_MAX_RESISTANCE_DIFF_PCT:
-            return None
-        # Yeni: destek alt limiti (0 = kapalı)
-        if LONG_MIN_SUPPORT_DIFF_PCT > 0 and safe_float(sr.get("support_diff_pct", 0)) < LONG_MIN_SUPPORT_DIFF_PCT:
             return None
 
     liq_price = calc_liquidation_price(entry, direction)
@@ -1766,14 +1778,6 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
     stats["ma_signal_sent"] += 1
     memory["last_signal_ts"] = sent_ts
     memory.setdefault("ma_last_candle_ts", {})[f"{res['symbol']}:{res['direction']}"] = res.get("candle_ts", "")
-
-    # /hafiza için sayaç
-    h = memory.setdefault("ma_hafiza", {})
-    h["total_sent"] = int(h.get("total_sent", 0)) + 1
-    if res["direction"] == "SHORT":
-        h["short_sent"] = int(h.get("short_sent", 0)) + 1
-    else:
-        h["long_sent"] = int(h.get("long_sent", 0)) + 1
 
 async def enrich_ma_with_institutional(res: Dict[str, Any]) -> Dict[str, Any]:
     if not res:
@@ -1995,77 +1999,7 @@ def build_ma_signal_message(res: Dict[str, Any]) -> str:
         f"Örnek: {pos_val:.0f} USDT pozisyon = {margin_ex:.2f} USDT marj"
     )
 
-def detect_ma_followup_events(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> List[Dict[str, Any]]:
-    """TP1/TP2/TP3 ve Stop olaylarını sırasıyla yakalar.
-    Daha önce kaydedilmemiş olayları döner. rec içine zaman damgalarını yazar.
-    """
-    direction = str(rec.get("direction", "")).upper()
-    entry = safe_float(rec.get("entry", 0))
-    stop = safe_float(rec.get("stop", 0))
-    tp1 = safe_float(rec.get("tp1", 0))
-    tp2 = safe_float(rec.get("tp2", 0))
-    tp3 = safe_float(rec.get("tp3", 0))
-    if direction not in ("LONG", "SHORT") or entry <= 0 or stop <= 0 or tp1 <= 0:
-        return []
-
-    sent_ts = safe_float(rec.get("sent_ts", 0))
-    start_ms = max(0.0, (sent_ts - 60.0) * 1000.0)
-
-    tp1_done = safe_float(rec.get("tp1_hit_ts", 0)) > 0
-    tp2_done = safe_float(rec.get("tp2_hit_ts", 0)) > 0
-    tp3_done = safe_float(rec.get("tp3_hit_ts", 0)) > 0
-
-    events: List[Dict[str, Any]] = []
-
-    for row in klines_1m:
-        row_ts_ms = safe_float(row[0])
-        if row_ts_ms < start_ms:
-            continue
-        ts_sec = row_ts_ms / 1000.0
-        high = safe_float(row[2])
-        low = safe_float(row[3])
-        if high <= 0 or low <= 0:
-            continue
-
-        hit_stop = (low <= stop) if direction == "LONG" else (high >= stop)
-
-        new_tps: List[Tuple[str, float]] = []
-        if direction == "LONG":
-            if not tp1_done and high >= tp1:
-                new_tps.append(("TP1", tp1)); tp1_done = True
-            if not tp2_done and high >= tp2:
-                new_tps.append(("TP2", tp2)); tp2_done = True
-            if not tp3_done and high >= tp3:
-                new_tps.append(("TP3", tp3)); tp3_done = True
-        else:
-            if not tp1_done and low <= tp1:
-                new_tps.append(("TP1", tp1)); tp1_done = True
-            if not tp2_done and low <= tp2:
-                new_tps.append(("TP2", tp2)); tp2_done = True
-            if not tp3_done and low <= tp3:
-                new_tps.append(("TP3", tp3)); tp3_done = True
-
-        for lvl, price in new_tps:
-            rec[f"{lvl.lower()}_hit_ts"] = ts_sec
-            events.append({"type": lvl, "price": price, "ts": ts_sec})
-
-        if hit_stop:
-            if tp1_done or tp2_done or tp3_done:
-                rec["stop_after_tp_ts"] = ts_sec
-                events.append({"type": "STOP_AFTER_TP", "price": stop, "ts": ts_sec})
-            else:
-                rec["stop_ts"] = ts_sec
-                events.append({"type": "STOP", "price": stop, "ts": ts_sec})
-            break
-
-        if tp3_done:
-            break
-
-    return events
-
-
 def detect_ma_followup_result(rec: Dict[str, Any], klines_1m: List[List[Any]]) -> Optional[Dict[str, Any]]:
-    """Geriye uyumluluk: ilk olayı döndür (eski fonksiyonun davranışını korur)."""
     direction = str(rec.get("direction", "")).upper()
     sent_ts = safe_float(rec.get("sent_ts", 0))
     entry = safe_float(rec.get("entry", 0))
@@ -2183,82 +2117,21 @@ async def check_ma_followups() -> None:
         k1m = await get_klines(symbol, "1m", 300)
         if not k1m:
             continue
-
-        events = detect_ma_followup_events(rec, k1m)
-        if not events:
+        hit = detect_ma_followup_result(rec, k1m)
+        if not hit:
             continue
-
-        h = memory.setdefault("ma_hafiza", {})
-        direction_key = str(rec.get("direction", "")).lower()
-        any_msg = False
-
-        for ev in events:
-            ev_type = str(ev.get("type", ""))
-
-            if ev_type == "TP1":
-                # Eskisi gibi tam mesaj
-                msg = build_ma_followup_message(rec, {
-                    "result": "TP1", "level": "TP1",
-                    "price": ev["price"], "touch_ts": ev["ts"],
-                })
-                await safe_send_telegram(msg)
-                any_msg = True
-                h["total_tp1"] = int(h.get("total_tp1", 0)) + 1
-                h[f"{direction_key}_tp1"] = int(h.get(f"{direction_key}_tp1", 0)) + 1
-                # Eski sayaçları da çalıştır
-                memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
-                memory["stats"]["ma_tp"] = int(memory["stats"].get("ma_tp", 0)) + 1
-                rec["result"] = "TP1"
-                rec["result_price"] = ev["price"]
-                rec["touch_ts"] = ev["ts"]
-
-            elif ev_type == "TP2":
-                # Sessiz — sadece hafıza
-                h["total_tp2"] = int(h.get("total_tp2", 0)) + 1
-                h[f"{direction_key}_tp2"] = int(h.get(f"{direction_key}_tp2", 0)) + 1
-
-            elif ev_type == "TP3":
-                # Sessiz — sadece hafıza, takip biter
-                h["total_tp3"] = int(h.get("total_tp3", 0)) + 1
-                h[f"{direction_key}_tp3"] = int(h.get(f"{direction_key}_tp3", 0)) + 1
-                rec["done"] = True
-
-            elif ev_type == "STOP":
-                # Hiç TP yokken stop — tam mesaj
-                msg = build_ma_followup_message(rec, {
-                    "result": "STOP", "level": "STOP",
-                    "price": ev["price"], "touch_ts": ev["ts"],
-                })
-                await safe_send_telegram(msg)
-                any_msg = True
-                h["total_stop"] = int(h.get("total_stop", 0)) + 1
-                h[f"{direction_key}_stop"] = int(h.get(f"{direction_key}_stop", 0)) + 1
-                memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
+        ok = await safe_send_telegram(build_ma_followup_message(rec, hit))
+        if ok:
+            rec["done"] = True
+            rec["result"] = hit.get("result")
+            rec["result_price"] = hit.get("price")
+            rec["touch_ts"] = hit.get("touch_ts")
+            memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
+            if str(hit.get("result")) == "STOP":
                 memory["stats"]["ma_stop"] = int(memory["stats"].get("ma_stop", 0)) + 1
-                rec["result"] = "STOP"
-                rec["result_price"] = ev["price"]
-                rec["touch_ts"] = ev["ts"]
-                rec["done"] = True
-
-            elif ev_type == "STOP_AFTER_TP":
-                # Kısa mesaj — TP sonrası stop
-                tp_list = []
-                if safe_float(rec.get("tp1_hit_ts", 0)) > 0:
-                    tp_list.append("TP1")
-                if safe_float(rec.get("tp2_hit_ts", 0)) > 0:
-                    tp_list.append("TP2")
-                tp_str = "+".join(tp_list) if tp_list else "TP"
-                short_msg = (
-                    f"⚠️ {symbol} {rec.get('direction', '')}: {tp_str} sonrası STOP\n"
-                    f"Stop fiyat: {fmt_num(ev['price'])}"
-                )
-                await safe_send_telegram(short_msg)
-                any_msg = True
-                h["total_stop_after_tp"] = int(h.get("total_stop_after_tp", 0)) + 1
-                h[f"{direction_key}_stop_after_tp"] = int(h.get(f"{direction_key}_stop_after_tp", 0)) + 1
-                rec["done"] = True
-
-        await save_memory_async()
+            elif str(hit.get("result")).startswith("TP"):
+                memory["stats"]["ma_tp"] = int(memory["stats"].get("ma_tp", 0)) + 1
+            await save_memory_async()
 
 def signal_key(symbol: str, stage: str) -> str:
     return f"{symbol}:{stage}"
@@ -2967,62 +2840,6 @@ async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"MA analiz: {memory.get('stats', {}).get('ma_analyzed', 0)}"
     )
 
-
-async def cmd_hafiza(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    h = memory.get("ma_hafiza", {})
-
-    total_sent = int(h.get("total_sent", 0))
-    total_tp1 = int(h.get("total_tp1", 0))
-    total_tp2 = int(h.get("total_tp2", 0))
-    total_tp3 = int(h.get("total_tp3", 0))
-    total_stop = int(h.get("total_stop", 0))
-    total_stop_after_tp = int(h.get("total_stop_after_tp", 0))
-
-    long_sent = int(h.get("long_sent", 0))
-    long_tp1 = int(h.get("long_tp1", 0))
-    long_tp2 = int(h.get("long_tp2", 0))
-    long_tp3 = int(h.get("long_tp3", 0))
-    long_stop = int(h.get("long_stop", 0))
-    long_stop_after_tp = int(h.get("long_stop_after_tp", 0))
-
-    short_sent = int(h.get("short_sent", 0))
-    short_tp1 = int(h.get("short_tp1", 0))
-    short_tp2 = int(h.get("short_tp2", 0))
-    short_tp3 = int(h.get("short_tp3", 0))
-    short_stop = int(h.get("short_stop", 0))
-    short_stop_after_tp = int(h.get("short_stop_after_tp", 0))
-
-    # Tamamlanmış işlemler: TP1 olmuş veya direkt stop yemiş
-    completed = total_tp1 + total_stop
-    win_rate = (total_tp1 / completed * 100.0) if completed > 0 else 0.0
-    bekleyen = total_sent - completed
-
-    msg = (
-        f"📊 MA HAFIZA\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Toplam Sinyal: {total_sent}\n"
-        f"Bekleyen (henüz sonuç yok): {bekleyen}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"✅ TP1 olan: {total_tp1}\n"
-        f"   ↳ TP2'ye ulaşan: {total_tp2}\n"
-        f"   ↳ TP3'e ulaşan: {total_tp3}\n"
-        f"   ↳ TP sonrası stop: {total_stop_after_tp}\n"
-        f"❌ Direkt stop: {total_stop}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Win rate (TP1 yakalama): %{win_rate:.1f}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 LONG: {long_sent} sinyal\n"
-        f"   TP1: {long_tp1} | TP2: {long_tp2} | TP3: {long_tp3}\n"
-        f"   Stop: {long_stop} | TP sonrası stop: {long_stop_after_tp}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔴 SHORT: {short_sent} sinyal\n"
-        f"   TP1: {short_tp1} | TP2: {short_tp2} | TP3: {short_tp3}\n"
-        f"   Stop: {short_stop} | TP sonrası stop: {short_stop_after_tp}"
-    )
-
-    await update.message.reply_text(msg)
-
-
 async def cmd_whale(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not WHALE_EYE_ENABLED and not FUNDING_EYE_ENABLED:
         await update.message.reply_text("🐋 Whale Eye ve Funding Eye motorları kapalı")
@@ -3202,7 +3019,6 @@ def build_app():
     application.add_handler(CommandHandler("hot", cmd_hot))
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
-    application.add_handler(CommandHandler("hafiza", cmd_hafiza))
     application.add_handler(CommandHandler("whale", cmd_whale))
     application.add_handler(CommandHandler("funding", cmd_funding))
     return application
