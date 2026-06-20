@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcisi V8.1 YON STOP (LONG/SHORT ayri stop-TP)"
+VERSION_NAME = "Balina Avcisi V9 ANLIK+YONSTOP+226COIN (OKX)"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -67,11 +67,20 @@ SYMBOL_FAIL_FORGET_SEC = int(float(os.getenv("SYMBOL_FAIL_FORGET_SEC", "43200"))
 SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1200000"))
+# MA motoru için günlük hacim bandı (alt-üst). 0 = o sınır kapalı.
+MA_MIN_24H_VOLUME = float(os.getenv("MA_MIN_24H_VOLUME", "10000000"))    # 10M alt sınır
+MA_MAX_24H_VOLUME = float(os.getenv("MA_MAX_24H_VOLUME", "100000000"))   # 100M üst sınır
 
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
 MA_KLINE_INTERVAL = os.getenv("MA_KLINE_INTERVAL", "1H").strip()
+MA_FAST_PERIOD = int(float(os.getenv("MA_FAST_PERIOD", "7")))     # hızlı MA (grafikte MA7)
+MA_SLOW_PERIOD = int(float(os.getenv("MA_SLOW_PERIOD", "25")))    # yavaş MA (grafikte MA25)
+# Anlık kesişim modu: mum kapanışı beklemeden kesişim anında sinyal.
+# S/R + mum-yakınlık filtrelerini atlar, yön değişene kadar tekrar atmaz.
+MA_INSTANT_CROSS = os.getenv("MA_INSTANT_CROSS", "false").lower() == "true"
+MA_INSTANT_LOOKBACK = int(float(os.getenv("MA_INSTANT_LOOKBACK", "2")))
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
@@ -158,20 +167,52 @@ ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "true")
 RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 DEFAULT_COINS = [
-    "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
-    "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
-    "ENA-USDT-SWAP", "PENDLE-USDT-SWAP", "TAO-USDT-SWAP", "WLD-USDT-SWAP", "RENDER-USDT-SWAP",
-    "RAY-USDT-SWAP", "STX-USDT-SWAP", "MANTA-USDT-SWAP", "GALA-USDT-SWAP",
-    "SAND-USDT-SWAP", "AR-USDT-SWAP", "HBAR-USDT-SWAP", "KAS-USDT-SWAP", "CRV-USDT-SWAP",
-    "DYDX-USDT-SWAP", "GMT-USDT-SWAP", "ZIL-USDT-SWAP", "ZRX-USDT-SWAP", "API3-USDT-SWAP",
-    "BLUR-USDT-SWAP", "ACH-USDT-SWAP", "PEOPLE-USDT-SWAP", "LDO-USDT-SWAP", "ARKM-USDT-SWAP",
-    "MEME-USDT-SWAP", "NFP-USDT-SWAP", "STRK-USDT-SWAP", "PORTAL-USDT-SWAP", "ALT-USDT-SWAP",
-    "AI-USDT-SWAP", "MAVIA-USDT-SWAP", "AEVO-USDT-SWAP", "OM-USDT-SWAP", "NOT-USDT-SWAP",
-    "TURBO-USDT-SWAP", "BRETT-USDT-SWAP", "MEW-USDT-SWAP", "POLYX-USDT-SWAP", "CHZ-USDT-SWAP",
-    "ROSE-USDT-SWAP", "ID-USDT-SWAP", "SXP-USDT-SWAP", "IOST-USDT-SWAP", "ONE-USDT-SWAP",
-    "CTSI-USDT-SWAP", "HOT-USDT-SWAP", "CELR-USDT-SWAP", "BEL-USDT-SWAP", "FLM-USDT-SWAP",
-    "BAKE-USDT-SWAP", "DUSK-USDT-SWAP", "HOOK-USDT-SWAP", "PHB-USDT-SWAP", "MAGIC-USDT-SWAP",
-    "RSR-USDT-SWAP", "FLOW-USDT-SWAP", "CFX-USDT-SWAP", "MASK-USDT-SWAP", "SKL-USDT-SWAP",
+    "WLD-USDT-SWAP", "SUI-USDT-SWAP", "SEI-USDT-SWAP", "ONDO-USDT-SWAP", "ARB-USDT-SWAP",
+    "OP-USDT-SWAP", "APT-USDT-SWAP", "STX-USDT-SWAP", "IMX-USDT-SWAP", "FIL-USDT-SWAP",
+    "NEAR-USDT-SWAP", "INJ-USDT-SWAP", "JUP-USDT-SWAP", "PENDLE-USDT-SWAP", "DYDX-USDT-SWAP",
+    "ICP-USDT-SWAP", "ROSE-USDT-SWAP", "TIA-USDT-SWAP", "PYTH-USDT-SWAP", "ETHFI-USDT-SWAP",
+    "ENS-USDT-SWAP", "BLUR-USDT-SWAP", "ZRO-USDT-SWAP", "EIGEN-USDT-SWAP", "EOS-USDT-SWAP",
+    "ETC-USDT-SWAP", "XLM-USDT-SWAP", "ALGO-USDT-SWAP", "EGLD-USDT-SWAP", "THETA-USDT-SWAP",
+    "FLOW-USDT-SWAP", "FTM-USDT-SWAP", "GRT-USDT-SWAP", "KSM-USDT-SWAP", "ONE-USDT-SWAP",
+    "CFX-USDT-SWAP", "CELO-USDT-SWAP", "MINA-USDT-SWAP", "IOTA-USDT-SWAP", "QTUM-USDT-SWAP",
+    "BAT-USDT-SWAP", "DASH-USDT-SWAP", "ZIL-USDT-SWAP", "HOT-USDT-SWAP", "OCEAN-USDT-SWAP",
+    "ANKR-USDT-SWAP", "SKL-USDT-SWAP", "AUDIO-USDT-SWAP", "YFI-USDT-SWAP", "MASK-USDT-SWAP",
+    "COTI-USDT-SWAP", "BAL-USDT-SWAP", "API3-USDT-SWAP", "SSV-USDT-SWAP", "ACH-USDT-SWAP",
+    "XNO-USDT-SWAP", "HBAR-USDT-SWAP", "RVN-USDT-SWAP", "GLM-USDT-SWAP", "SPELL-USDT-SWAP",
+    "TRB-USDT-SWAP", "UMA-USDT-SWAP", "ILV-USDT-SWAP", "GMT-USDT-SWAP", "GAL-USDT-SWAP",
+    "PEOPLE-USDT-SWAP", "LRC-USDT-SWAP", "CELR-USDT-SWAP", "JST-USDT-SWAP", "ICX-USDT-SWAP",
+    "FLUX-USDT-SWAP", "TWT-USDT-SWAP", "DENT-USDT-SWAP", "WOO-USDT-SWAP", "ASTR-USDT-SWAP",
+    "ORDI-USDT-SWAP", "NOT-USDT-SWAP", "XAI-USDT-SWAP", "ALT-USDT-SWAP", "PORTAL-USDT-SWAP",
+    "ACE-USDT-SWAP", "MAV-USDT-SWAP", "RDNT-USDT-SWAP", "MAGIC-USDT-SWAP", "ARKM-USDT-SWAP",
+    "CTSI-USDT-SWAP", "HIFI-USDT-SWAP", "NKN-USDT-SWAP", "RSR-USDT-SWAP", "SXP-USDT-SWAP",
+    "FIO-USDT-SWAP", "KNC-USDT-SWAP", "BICO-USDT-SWAP", "RLC-USDT-SWAP", "SFP-USDT-SWAP",
+    "DUSK-USDT-SWAP", "HOOK-USDT-SWAP", "ID-USDT-SWAP", "LEVER-USDT-SWAP", "PHA-USDT-SWAP",
+    "PROM-USDT-SWAP", "ALPHA-USDT-SWAP", "STG-USDT-SWAP", "C98-USDT-SWAP", "XVS-USDT-SWAP",
+    "ZRX-USDT-SWAP", "TLM-USDT-SWAP", "MDT-USDT-SWAP", "IDEX-USDT-SWAP", "REQ-USDT-SWAP",
+    "POLYX-USDT-SWAP", "CKB-USDT-SWAP", "ARPA-USDT-SWAP", "BNT-USDT-SWAP", "DIA-USDT-SWAP",
+    "FIS-USDT-SWAP", "OGN-USDT-SWAP", "ALICE-USDT-SWAP", "ATA-USDT-SWAP", "BADGER-USDT-SWAP",
+    "BETA-USDT-SWAP", "BOND-USDT-SWAP", "DAR-USDT-SWAP", "DODO-USDT-SWAP", "FIDA-USDT-SWAP",
+    "FORTH-USDT-SWAP", "FRONT-USDT-SWAP", "HARD-USDT-SWAP", "JOE-USDT-SWAP", "KEY-USDT-SWAP",
+    "KP3R-USDT-SWAP", "LINA-USDT-SWAP", "LOKA-USDT-SWAP", "LQTY-USDT-SWAP", "MC-USDT-SWAP",
+    "MOVR-USDT-SWAP", "MYRIA-USDT-SWAP", "NFP-USDT-SWAP", "NULS-USDT-SWAP", "OM-USDT-SWAP",
+    "PERP-USDT-SWAP", "PHB-USDT-SWAP", "PLA-USDT-SWAP", "POLS-USDT-SWAP", "POND-USDT-SWAP",
+    "POWR-USDT-SWAP", "QUICK-USDT-SWAP", "RAD-USDT-SWAP", "RARE-USDT-SWAP", "REN-USDT-SWAP",
+    "RIF-USDT-SWAP", "RSS3-USDT-SWAP", "SCRT-USDT-SWAP", "SLP-USDT-SWAP", "STEEM-USDT-SWAP",
+    "STMX-USDT-SWAP", "SUN-USDT-SWAP", "SUPER-USDT-SWAP", "SYS-USDT-SWAP", "TKO-USDT-SWAP",
+    "TOMI-USDT-SWAP", "TRU-USDT-SWAP", "USTC-USDT-SWAP", "VIDT-USDT-SWAP", "VOXEL-USDT-SWAP",
+    "VRA-USDT-SWAP", "WAN-USDT-SWAP", "WAXP-USDT-SWAP", "WIN-USDT-SWAP", "XEM-USDT-SWAP",
+    "XVG-USDT-SWAP", "YGG-USDT-SWAP", "ZBCN-USDT-SWAP", "ZKF-USDT-SWAP", "ZEN-USDT-SWAP",
+    "ENJ-USDT-SWAP", "NMR-USDT-SWAP", "APE-USDT-SWAP", "CRV-USDT-SWAP", "SNX-USDT-SWAP",
+    "COMP-USDT-SWAP", "UNI-USDT-SWAP", "SUSHI-USDT-SWAP", "MKR-USDT-SWAP", "LDO-USDT-SWAP",
+    "RUNE-USDT-SWAP", "KAVA-USDT-SWAP", "CHZ-USDT-SWAP", "AXS-USDT-SWAP", "MANA-USDT-SWAP",
+    "SAND-USDT-SWAP", "GALA-USDT-SWAP", "ZEC-USDT-SWAP", "CHR-USDT-SWAP", "EDU-USDT-SWAP",
+    "LISTA-USDT-SWAP", "REZ-USDT-SWAP", "AEVO-USDT-SWAP", "BB-USDT-SWAP", "CATI-USDT-SWAP",
+    "BANANA-USDT-SWAP", "SAGA-USDT-SWAP", "METIS-USDT-SWAP", "VELO-USDT-SWAP", "BIGTIME-USDT-SWAP",
+    "ARK-USDT-SWAP", "SCR-USDT-SWAP", "SANTOS-USDT-SWAP", "PORT3-USDT-SWAP", "LIT-USDT-SWAP",
+    "SNT-USDT-SWAP", "ELF-USDT-SWAP", "MTL-USDT-SWAP", "AGLD-USDT-SWAP", "COS-USDT-SWAP",
+    "SLERF-USDT-SWAP", "OMNI-USDT-SWAP", "PIXEL-USDT-SWAP", "BIO-USDT-SWAP", "AI-USDT-SWAP",
+    "IRYS-USDT-SWAP", "KAIA-USDT-SWAP", "GAS-USDT-SWAP", "BEL-USDT-SWAP", "DEGO-USDT-SWAP",
+    "AKRO-USDT-SWAP",
 ]
 COINS = [x.strip().upper() for x in (RAW_COINS_ENV or ",".join(DEFAULT_COINS)).split(",") if x.strip()]
 
@@ -1241,6 +1282,13 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     if quote_vol < MIN_24H_QUOTE_VOLUME:
         stats["volume_reject"] += 1
         return None
+    # MA motoru hacim bandı: 10M-100M arası (alt-üst sınır)
+    if MA_MIN_24H_VOLUME > 0 and quote_vol < MA_MIN_24H_VOLUME:
+        stats["volume_reject"] += 1
+        return None
+    if MA_MAX_24H_VOLUME > 0 and quote_vol > MA_MAX_24H_VOLUME:
+        stats["volume_reject"] += 1
+        return None
 
     pump_10m = pct_change(min(c1[-10:]), last_price)
     pump_20m = pct_change(min(c1[-20:]), last_price)
@@ -1585,6 +1633,79 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
     if len(k1h) < 3 or len(ma7) < 3 or len(ma25) < 3:
         return None
 
+    # ============================================================
+    # ANLIK KESİŞİM MODU (MA_INSTANT_CROSS=true)
+    # Canlı mum [-1], kapanış beklenmez, S/R + yakınlık atlanır.
+    # Son MA_INSTANT_LOOKBACK bar içinde kesişim olduysa yakalar.
+    # Yön değişene kadar aynı yönde tekrar atmaz.
+    # ============================================================
+    if MA_INSTANT_CROSS:
+        live_candle = k1h[-1]
+        candle_ts = str(live_candle[0])
+        candle_high = safe_float(live_candle[2])
+        candle_low = safe_float(live_candle[3])
+        last_price = safe_float(live_candle[4])
+        if last_price <= 0:
+            return None
+
+        cur_ma7 = ma7[-1]
+        cur_ma25 = ma25[-1]
+
+        # Şu anki dizilim doğru yönde mi?
+        if direction == "SHORT":
+            if not (cur_ma7 <= cur_ma25):
+                return None
+        elif direction == "LONG":
+            if not (cur_ma7 >= cur_ma25):
+                return None
+        else:
+            return None
+
+        # Son N bar içinde gerçekten kesişim oldu mu (karşı taraftan geçiş)?
+        cross_found = False
+        look = max(2, MA_INSTANT_LOOKBACK)
+        for i in range(1, look + 1):
+            idx = -1 - i
+            if -idx > len(ma7):
+                break
+            if direction == "SHORT" and ma7[idx] > ma25[idx]:
+                cross_found = True
+                break
+            if direction == "LONG" and ma7[idx] < ma25[idx]:
+                cross_found = True
+                break
+        if not cross_found:
+            return None
+
+        # Yön değişimi koruması
+        if memory.get("ma_instant_last_dir", {}).get(symbol, "") == direction:
+            return None
+
+        entry = last_price
+        targets = calc_ma_targets(entry, direction)
+        liq_safe, liq_gap = check_stop_vs_liquidation(entry, targets["stop"], direction)
+        if not liq_safe and LEVERAGE > 1:
+            return None
+
+        sr = calc_support_resistance(k1h, entry)
+        return {
+            "symbol": symbol, "direction": direction, "entry": entry,
+            "stop": targets["stop"], "tp1": targets["tp1"], "tp2": targets["tp2"], "tp3": targets["tp3"],
+            "stop_pct": targets["stop_pct"], "tp1_pct": targets["tp1_pct"],
+            "tp2_pct": targets["tp2_pct"], "tp3_pct": targets["tp3_pct"],
+            "ma7": cur_ma7, "ma25": cur_ma25, "prev_ma7": ma7[-2], "prev_ma25": ma25[-2],
+            "candle_high": candle_high, "candle_low": candle_low, "candle_ts": candle_ts,
+            "timeframe": MA_KLINE_INTERVAL,
+            "entry_note": f"{direction} anlık kesişim ({MA_KLINE_INTERVAL}, son {look} bar) — mum kapanışı beklenmedi",
+            "support": sr.get("support", 0), "resistance": sr.get("resistance", 0),
+            "support_diff_pct": sr.get("support_diff_pct", 0),
+            "resistance_diff_pct": sr.get("resistance_diff_pct", 0),
+            "instant": True,
+        }
+    # ============================================================
+    # NORMAL MOD (kapanmış mum + S/R + yakınlık) — değişmedi
+    # ============================================================
+
     prev_ma7 = ma7[-3]
     prev_ma25 = ma25[-3]
     cur_ma7 = ma7[-2]
@@ -1707,8 +1828,9 @@ async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], 
         return None
 
     c = closes(k1h)
-    ma7 = ema(c, 7)
-    ma25 = ema(c, 25)
+    # Grafikteki MA çizgileri SMA'dır; periyot ENV'den ayarlanır (varsayılan 7/25)
+    ma7 = sma(c, MA_FAST_PERIOD)
+    ma25 = sma(c, MA_SLOW_PERIOD)
     if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
         return None
     return symbol, k1h, ma7, ma25
@@ -1746,6 +1868,9 @@ def ma_already_sent(res: Dict[str, Any]) -> bool:
 def mark_ma_sent(res: Dict[str, Any]) -> None:
     key = ma_signal_key(res)
     sent_ts = time.time()
+    # Anlık modda: bu coinin son yönünü kaydet (yön değişene kadar tekrar atmaz)
+    if res.get("instant"):
+        memory.setdefault("ma_instant_last_dir", {})[res["symbol"]] = res["direction"]
     memory.setdefault("ma_signals", {})[key] = {
         "ts": sent_ts,
         "symbol": res["symbol"],
