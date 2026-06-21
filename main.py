@@ -99,6 +99,12 @@ MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
 SHORT_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MAX_RESISTANCE_DIFF_PCT", "0.30"))
 SHORT_MIN_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MIN_SUPPORT_DIFF_PCT", "1.20"))
 LONG_MAX_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MAX_SUPPORT_DIFF_PCT", "0.30"))
+# Yeni 2 filtre:
+# 1) Destek-direnç aralığı en az bu kadar olmalı (dar/sıkışık aralık eleme). 0=kapalı
+MA_MIN_SR_RANGE_PCT = float(os.getenv("MA_MIN_SR_RANGE_PCT", "0"))
+# 2) Doğru taraf şartı: SHORT'ta dirence mesafe < desteğe mesafe (direnç daha yakın),
+#    LONG'ta desteğe mesafe < dirence mesafe (destek daha yakın). false=kapalı
+MA_REQUIRE_CORRECT_SIDE = os.getenv("MA_REQUIRE_CORRECT_SIDE", "false").lower() == "true"
 LONG_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MIN_RESISTANCE_DIFF_PCT", "1.20"))
 MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
 MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
@@ -1688,6 +1694,27 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
             return None
 
         sr = calc_support_resistance(k1h, entry)
+
+        # YENİ FİLTRE 1: Destek-direnç aralığı (anlık modda da geçerli)
+        if MA_MIN_SR_RANGE_PCT > 0:
+            sup = safe_float(sr.get("support", 0))
+            res = safe_float(sr.get("resistance", 0))
+            if sup > 0 and res > 0:
+                if (res - sup) / sup * 100 < MA_MIN_SR_RANGE_PCT:
+                    stats["sr_range_reject"] = stats.get("sr_range_reject", 0) + 1
+                    return None
+
+        # YENİ FİLTRE 2: Doğru taraf şartı (anlık modda da geçerli)
+        if MA_REQUIRE_CORRECT_SIDE:
+            sup_diff = safe_float(sr.get("support_diff_pct", 0))
+            res_diff = safe_float(sr.get("resistance_diff_pct", 0))
+            if direction == "SHORT" and res_diff >= sup_diff:
+                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
+                return None
+            if direction == "LONG" and sup_diff >= res_diff:
+                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
+                return None
+
         return {
             "symbol": symbol, "direction": direction, "entry": entry,
             "stop": targets["stop"], "tp1": targets["tp1"], "tp2": targets["tp2"], "tp3": targets["tp3"],
@@ -1763,6 +1790,31 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         return None
 
     sr = calc_support_resistance(k1h, entry)
+
+    # YENİ FİLTRE 1: Destek-direnç aralığı en az MA_MIN_SR_RANGE_PCT olmalı
+    if MA_MIN_SR_RANGE_PCT > 0:
+        sup = safe_float(sr.get("support", 0))
+        res = safe_float(sr.get("resistance", 0))
+        if sup > 0 and res > 0:
+            sr_range_pct = (res - sup) / sup * 100
+            if sr_range_pct < MA_MIN_SR_RANGE_PCT:
+                stats["sr_range_reject"] = stats.get("sr_range_reject", 0) + 1
+                return None
+
+    # YENİ FİLTRE 2: Doğru taraf şartı
+    if MA_REQUIRE_CORRECT_SIDE:
+        sup_diff = safe_float(sr.get("support_diff_pct", 0))
+        res_diff = safe_float(sr.get("resistance_diff_pct", 0))
+        if direction == "SHORT":
+            # SHORT'ta direnç daha yakın olmalı (dirence mesafe < desteğe mesafe)
+            if res_diff >= sup_diff:
+                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
+                return None
+        elif direction == "LONG":
+            # LONG'ta destek daha yakın olmalı (desteğe mesafe < dirence mesafe)
+            if sup_diff >= res_diff:
+                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
+                return None
 
     if direction == "SHORT":
         if safe_float(sr.get("resistance_diff_pct", 0)) > SHORT_MAX_RESISTANCE_DIFF_PCT:
