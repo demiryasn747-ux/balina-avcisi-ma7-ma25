@@ -96,7 +96,7 @@ DEFAULT_MARGIN_USDT = float(os.getenv("DEFAULT_MARGIN_USDT", "100"))
 WHALE_EYE_ENABLED = os.getenv("WHALE_EYE_ENABLED", "true").lower() == "true"
 FUNDING_EYE_ENABLED = os.getenv("FUNDING_EYE_ENABLED", "true").lower() == "true"
 
-WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "20")))
+WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "45")))
 WHALE_OI_CACHE_SEC = int(float(os.getenv("WHALE_OI_CACHE_SEC", "30")))
 WHALE_OI_HISTORY_MAX = int(float(os.getenv("WHALE_OI_HISTORY_MAX", "180")))
 WHALE_OI_BEARISH_DROP_PCT = float(os.getenv("WHALE_OI_BEARISH_DROP_PCT", "-1.5"))
@@ -136,6 +136,26 @@ RISK_HALT_HOURS = float(os.getenv("RISK_HALT_HOURS", "24"))          # eşik aş
 RISK_MAX_CONSEC_STOPS = int(float(os.getenv("RISK_MAX_CONSEC_STOPS", "3")))
 RISK_BLACKLIST_HOURS = float(os.getenv("RISK_BLACKLIST_HOURS", "48"))
 RISK_MAX_OPEN_PER_GROUP = int(float(os.getenv("RISK_MAX_OPEN_PER_GROUP", "1")))  # korelasyon kilidi
+
+# === BTC REJİM BIAS + GUARD (bugünkü short kanamasının ilacı) ==============
+# Hibrit motor skor-bazlı DEĞİL (ikili geçit), o yüzden "+puan" yerine
+# rejime göre GEÇİT/BLOK uygulanır. Mantık simetriktir: BTC yukarı→short blok,
+# BTC aşağı→long sıkı. Böylece statik long-bias (1500 trade'in çürüttüğü hata) eklenmez.
+BTC_BIAS_ENABLED = os.getenv("BTC_BIAS_ENABLED", "true").lower() == "true"
+BTC_BIAS_SYMBOL = os.getenv("BTC_BIAS_SYMBOL", "BTC-USDT-SWAP").strip()
+BTC_BIAS_STRONG_GAP_PCT = float(os.getenv("BTC_BIAS_STRONG_GAP_PCT", "1.5"))  # 4H EMA'dan bu kadar uzak=güçlü
+BTC_BIAS_CACHE_SEC = float(os.getenv("BTC_BIAS_CACHE_SEC", "90"))
+# SHORT guard
+SHORT_BLOCK_WHEN_BTC_UP = os.getenv("SHORT_BLOCK_WHEN_BTC_UP", "true").lower() == "true"
+SHORT_EXTREME_OVERRIDE = os.getenv("SHORT_EXTREME_OVERRIDE", "true").lower() == "true"   # whale div+funding ikisi varsa BTC yukarıda bile geç
+SHORT_REQUIRE_INSTITUTIONAL = os.getenv("SHORT_REQUIRE_INSTITUTIONAL", "true").lower() == "true"  # short için en az 1 kurumsal teyit
+# LONG guard (BTC düşüşte sıkılaştır)
+LONG_BLOCK_WHEN_BTC_DOWN = os.getenv("LONG_BLOCK_WHEN_BTC_DOWN", "true").lower() == "true"
+LONG_EXTREME_OVERRIDE = os.getenv("LONG_EXTREME_OVERRIDE", "true").lower() == "true"
+# Volatilite guard
+VOL_GUARD_ENABLED = os.getenv("VOL_GUARD_ENABLED", "true").lower() == "true"
+BTC_ATR_HIGH_PCT = float(os.getenv("BTC_ATR_HIGH_PCT", "2.5"))        # BTC 1H ATR% bu üstü = yüksek vol
+VOL_GUARD_RISK_MULT = float(os.getenv("VOL_GUARD_RISK_MULT", "0.5"))  # yüksek volatilitede risk çarpanı
 
 def calc_leveraged_stop_pct(base_pct: float) -> float:
     return max(MIN_STOP_PCT, min(MAX_STOP_PCT, base_pct))
@@ -1793,6 +1813,86 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
     }
 
 
+_BTC_BIAS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+async def get_btc_trend_bias() -> Dict[str, Any]:
+    """BTC 4H trend + güç + 1H ATR%'i hesaplar (cache'li). Tüm sinyaller için tek kaynak."""
+    now = time.time()
+    cached = _BTC_BIAS_CACHE.get("data")
+    if cached is not None and (now - _BTC_BIAS_CACHE.get("ts", 0)) < BTC_BIAS_CACHE_SEC:
+        return cached
+    bias = {"trend": "FLAT", "strong": False, "gap_pct": 0.0, "atr_pct": 0.0, "ok": False}
+    try:
+        k4h = await get_klines(BTC_BIAS_SYMBOL, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
+        if len(k4h) >= 20:
+            trend, _strong = trend_4h(k4h, HYBRID_TREND_EMA)
+            closed = _s_closed(k4h)
+            c = _s_closes(closed)
+            eff = HYBRID_TREND_EMA if len(c) >= HYBRID_TREND_EMA else max(20, len(c) // 2)
+            line = s_ema(c, eff)[-1]
+            price = c[-1]
+            gap_pct = ((price - line) / line * 100.0) if line > 0 else 0.0
+            strong = abs(gap_pct) >= BTC_BIAS_STRONG_GAP_PCT
+            k1h = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, 60)
+            atr_pct = 0.0
+            if len(k1h) >= 16:
+                cc = _s_closed(k1h)
+                p = _s_closes(cc)[-1]
+                atr_pct = (s_atr(cc, 14) / p * 100.0) if p > 0 else 0.0
+            bias = {"trend": trend, "strong": strong, "gap_pct": round(gap_pct, 2),
+                    "atr_pct": round(atr_pct, 2), "ok": True}
+    except Exception as e:
+        logger.warning("BTC bias hesaplama hata: %s", e)
+    _BTC_BIAS_CACHE["data"] = bias
+    _BTC_BIAS_CACHE["ts"] = now
+    return bias
+
+
+def dynamic_risk_pct(btc_bias: Dict[str, Any]) -> float:
+    """Volatilite guard: BTC 1H ATR% yüksekse risk%'i düşür."""
+    base = HYBRID_RISK_PCT
+    if VOL_GUARD_ENABLED and btc_bias.get("atr_pct", 0) >= BTC_ATR_HIGH_PCT:
+        return round(base * VOL_GUARD_RISK_MULT, 4)
+    return base
+
+
+def btc_regime_gate(res: Dict[str, Any], btc_bias: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    BTC rejimine göre sinyali geçir/blokla (saf, test edilebilir).
+    - SHORT: en az 1 kurumsal teyit (whale div veya funding) zorunlu; BTC yukarıdaysa
+      blok (sadece whale+funding ikisi birden varsa ekstrem geçiş).
+    - LONG: BTC aşağıdaysa blok (whale veya funding varsa ekstrem geçiş).
+    Hibrit skorsuz olduğu için "+puan/-ceza" yerine simetrik geçit uygulanır.
+    """
+    if not BTC_BIAS_ENABLED or not btc_bias.get("ok"):
+        return True, "BTC bias kapalı/yok"
+    direction = res.get("direction", "")
+    trend = btc_bias.get("trend", "FLAT")
+    strong = btc_bias.get("strong", False)
+    whale = safe_float(res.get("institutional_oi_bonus", 0)) > 0      # bearish/bullish divergence
+    funding = safe_float(res.get("institutional_funding_bonus", 0)) > 0
+    s = "güçlü " if strong else ""
+
+    if direction == "SHORT":
+        if SHORT_REQUIRE_INSTITUTIONAL and not (whale or funding):
+            return False, "SHORT bloklandı: kurumsal teyit yok (whale div / funding)"
+        if trend == "UP" and SHORT_BLOCK_WHEN_BTC_UP:
+            if SHORT_EXTREME_OVERRIDE and whale and funding:
+                return True, f"BTC 4H {s}YUKARI ama ekstrem SHORT teyidi (whale+funding) → geçildi"
+            return False, f"SHORT bloklandı: BTC 4H {s}YUKARI (gap %{btc_bias.get('gap_pct',0):+.2f})"
+        return True, f"SHORT ok: BTC {trend}"
+
+    if direction == "LONG":
+        if trend == "DOWN" and LONG_BLOCK_WHEN_BTC_DOWN:
+            if LONG_EXTREME_OVERRIDE and (whale or funding):
+                return True, f"BTC 4H {s}AŞAĞI ama LONG teyidi var → geçildi"
+            return False, f"LONG bloklandı: BTC 4H {s}AŞAĞI (gap %{btc_bias.get('gap_pct',0):+.2f})"
+        return True, f"LONG ok: BTC {trend}"
+
+    return True, "yön bilinmiyor"
+
+
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
     for i in range(len(values)):
@@ -2184,12 +2284,16 @@ async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     k5 = await get_klines(symbol, "5m", 60)
     if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
         return None
-    return build_hybrid_signal(
+    btc_bias = await get_btc_trend_bias()
+    res = build_hybrid_signal(
         symbol, k1h, k4h, k15, k5,
-        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
         leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
         require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
     )
+    if res:
+        res["btc_bias"] = btc_bias
+    return res
 
 
 def build_hybrid_message(res: Dict[str, Any]) -> str:
@@ -2211,6 +2315,8 @@ def build_hybrid_message(res: Dict[str, Any]) -> str:
         f"Coin: {res['symbol']}\n"
         f"Mantık: 1H MA tetik + 4H {HYBRID_TREND_EMA} EMA trend + 15m/5m momentum\n"
         f"Onay: {res.get('mtf_note','-')}\n"
+        f"BTC rejim: {(res.get('btc_bias') or {}).get('trend','-')} "
+        f"(gap %{safe_float((res.get('btc_bias') or {}).get('gap_pct',0)):+.2f}, ATR %{safe_float((res.get('btc_bias') or {}).get('atr_pct',0)):.2f}) | {res.get('regime_note','-')}\n"
         f"{inst}"
         f"---\n"
         f"Entry: {fmt_num(res['entry'])}\n"
@@ -2244,6 +2350,13 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
         res = await enrich_ma_with_institutional(res)
     except Exception as e:
         logger.warning("HİBRİT institutional enrichment hata %s %s: %s", symbol, direction, e)
+    # BTC rejim geçidi (enrichment'tan SONRA — whale div + funding burada hazır)
+    btc_bias = res.get("btc_bias") or await get_btc_trend_bias()
+    allow_regime, regime_reason = btc_regime_gate(res, btc_bias)
+    if not allow_regime:
+        logger.info("HİBRİT rejim bloğu %s %s: %s", symbol, direction, regime_reason)
+        return
+    res["regime_note"] = regime_reason
     try:
         msg = build_hybrid_message(res)
     except Exception as e:
@@ -2257,6 +2370,371 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
                     symbol, direction, fmt_num(safe_float(res.get("entry", 0))), res.get("candle_ts", "-"))
     else:
         logger.warning("HİBRİT TELEGRAM GÖNDERİLEMEDİ %s %s", symbol, direction)
+
+
+# ============================================================================ #
+#  ENTEGRE BACKTESTER (/backtest) — gerçek build_hybrid_signal + TP/Stop replay
+#  Sınırlar (dürüst): OKX tek istek max 300 mum → 1H'da ~12 gün. 4H trend 1H'tan
+#  resample edilir (gerçek); 15m/5m momentum 1H ile yaklaşıklanır (geçmiş limiti).
+#  BTC rejim: sadece YÖN bloğu uygulanır (whale/funding teyidi geçmişe konamaz).
+# ============================================================================ #
+BT_SLIPPAGE_PCT = float(os.getenv("BT_SLIPPAGE_PCT", "0.0018"))
+BT_FEE_PCT = float(os.getenv("BT_FEE_PCT", "0.00045"))
+BT_INITIAL_BALANCE = float(os.getenv("BT_INITIAL_BALANCE", "1000"))
+BT_FUTURE_BARS = int(float(os.getenv("BT_FUTURE_BARS", "10")))
+BT_FUNDING_PCT_8H = float(os.getenv("BT_FUNDING_PCT_8H", "0.0001"))  # ortalama funding maliyeti/8h (modellenmiş)
+BT_CSV_EXPORT = os.getenv("BT_CSV_EXPORT", "true").lower() == "true"
+BT_OOS_SPLIT = float(os.getenv("BT_OOS_SPLIT", "0.7"))               # in-sample oranı (kalan out-of-sample)
+_BACKTEST_RUNNING = False
+
+
+def _bt_resample(klines: List[List[Any]], factor: int) -> List[List[Any]]:
+    """1H mumları daha yüksek TF'e topla (örn. 4H için factor=4). Gerçek OHLCV."""
+    out: List[List[Any]] = []
+    for i in range(0, len(klines) - factor + 1, factor):
+        chunk = klines[i:i + factor]
+        if len(chunk) < factor:
+            break
+        o = safe_float(chunk[0][1])
+        h = max(safe_float(r[2]) for r in chunk)
+        l = min(safe_float(r[3]) for r in chunk)
+        c = safe_float(chunk[-1][4])
+        v = sum(safe_float(r[5]) for r in chunk)
+        out.append([chunk[0][0], o, h, l, c, v])
+    return out
+
+
+async def _bt_btc_trend_series(bars_1h: int) -> List[Any]:
+    """BTC 1H geçmişini çekip 4H'e resample eder, mum başına (ts, trend) listesi döner."""
+    try:
+        k = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, min(bars_1h, 300))
+        k4 = _bt_resample(k, 4)
+        c = _s_closes(k4)
+        if len(c) < 20:
+            return []
+        eff = HYBRID_TREND_EMA if len(c) >= HYBRID_TREND_EMA else max(20, len(c) // 2)
+        e = s_ema(c, eff)
+        series = []
+        for j in range(len(c)):
+            t = "UP" if c[j] > e[j] else ("DOWN" if c[j] < e[j] else "FLAT")
+            series.append((int(safe_float(k4[j][0])), t))
+        return series
+    except Exception as ex:
+        logger.warning("bt BTC series hata: %s", ex)
+        return []
+
+
+def _bt_btc_trend_at(ts: int, series: List[Any]) -> str:
+    """Verilen zamandaki en güncel BTC 4H trendi (ts <= hedef)."""
+    trend = "FLAT"
+    for s_ts, s_tr in series:
+        if s_ts <= ts:
+            trend = s_tr
+        else:
+            break
+    return trend
+
+
+def bt_simulate_tp_stop(entry, stop, tp1, tp2, tp3, future_klines, direction) -> Dict[str, Any]:
+    """İlk dokunulan seviyeyi + kaç mum sonra olduğunu döner. Aynı mumda stop+tp → STOP (konservatif)."""
+    for idx, row in enumerate(future_klines, 1):
+        high = safe_float(row[2])
+        low = safe_float(row[3])
+        if direction == "LONG":
+            if low <= stop:
+                return {"result": "STOP", "exit_price": stop, "bars": idx}
+            if high >= tp3:
+                return {"result": "TP3", "exit_price": tp3, "bars": idx}
+            if high >= tp2:
+                return {"result": "TP2", "exit_price": tp2, "bars": idx}
+            if high >= tp1:
+                return {"result": "TP1", "exit_price": tp1, "bars": idx}
+        else:
+            if high >= stop:
+                return {"result": "STOP", "exit_price": stop, "bars": idx}
+            if low <= tp3:
+                return {"result": "TP3", "exit_price": tp3, "bars": idx}
+            if low <= tp2:
+                return {"result": "TP2", "exit_price": tp2, "bars": idx}
+            if low <= tp1:
+                return {"result": "TP1", "exit_price": tp1, "bars": idx}
+    return {"result": "OPEN", "exit_price": safe_float(future_klines[-1][4]) if future_klines else entry,
+            "bars": len(future_klines)}
+
+
+def bt_calc_pnl(entry, exit_price, direction, risk_usdt) -> float:
+    """Risk-birimli P&L (slippage + 2x komisyon dahil). 1R = risk_usdt."""
+    if entry <= 0:
+        return 0.0
+    if direction == "LONG":
+        gross = (exit_price - entry) / entry * risk_usdt
+    else:
+        gross = (entry - exit_price) / entry * risk_usdt
+    slippage = abs(exit_price - entry) / entry * risk_usdt * BT_SLIPPAGE_PCT
+    fee = risk_usdt * BT_FEE_PCT * 2
+    return round(gross - slippage - fee, 4)
+
+
+def _bt_dyn_slippage(quote_vol_24h: float) -> float:
+    """Coin likiditesine göre dinamik slippage (fraction). Düşük hacim = yüksek slippage."""
+    if quote_vol_24h >= 50_000_000:
+        return 0.0005
+    if quote_vol_24h >= 10_000_000:
+        return 0.0010
+    if quote_vol_24h >= 2_000_000:
+        return 0.0020
+    return 0.0040
+
+
+def _bt_mean(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _bt_std(xs: List[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    m = _bt_mean(xs)
+    return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+
+
+def _bt_sharpe(rs: List[float]) -> float:
+    """Trade başına Sharpe (R getirileri). Yıllıklaştırılmamış."""
+    s = _bt_std(rs)
+    return round(_bt_mean(rs) / s, 3) if s > 0 else 0.0
+
+
+def _bt_sortino(rs: List[float]) -> float:
+    """Trade başına Sortino. Downside deviation = sqrt(mean(min(0, r)^2)) (hedef 0)."""
+    if not rs:
+        return 0.0
+    dd = (sum(min(0.0, r) ** 2 for r in rs) / len(rs)) ** 0.5
+    return round(_bt_mean(rs) / dd, 3) if dd > 0 else 0.0
+
+
+def _bt_longest_loss_streak(results: List[float]) -> int:
+    cur = best = 0
+    for r in results:
+        if r < 0:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+def _bt_metrics(rs: List[float]) -> Dict[str, Any]:
+    """R-multiple listesinden temel performans metrikleri."""
+    n = len(rs)
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r < 0]
+    gp = sum(wins)
+    gl = abs(sum(losses))
+    return {
+        "n": n,
+        "wins": len(wins),
+        "winrate": round(len(wins) / n * 100, 1) if n else 0.0,
+        "expectancy_r": round(_bt_mean(rs), 3),
+        "avg_win_r": round(_bt_mean(wins), 3) if wins else 0.0,
+        "avg_loss_r": round(_bt_mean(losses), 3) if losses else 0.0,
+        "profit_factor": round(gp / gl, 2) if gl > 0 else (float("inf") if gp > 0 else 0.0),
+        "sharpe": _bt_sharpe(rs),
+        "sortino": _bt_sortino(rs),
+        "max_loss_streak": _bt_longest_loss_streak(rs),
+        "total_r": round(sum(rs), 2),
+    }
+
+
+def _bt_equity_dd(rs: List[float], risk_pct: float, initial: float) -> Dict[str, float]:
+    """R getirilerini compound bakiyeye çevir → max DD, getiri%, Calmar."""
+    bal = initial
+    peak = initial
+    max_dd = 0.0
+    for r in rs:
+        bal *= (1 + r * risk_pct / 100.0)
+        peak = max(peak, bal)
+        dd = (peak - bal) / peak * 100.0 if peak > 0 else 0.0
+        max_dd = max(max_dd, dd)
+    ret_pct = (bal - initial) / initial * 100.0
+    calmar = round(ret_pct / max_dd, 2) if max_dd > 0 else (float("inf") if ret_pct > 0 else 0.0)
+    return {"final": round(bal, 2), "ret_pct": round(ret_pct, 2),
+            "max_dd": round(max_dd, 2), "calmar": calmar}
+
+
+def _bt_regime_breakdown(trades: List[Dict[str, Any]]) -> str:
+    """BTC trendine göre kovalara ayır → her rejimde winrate + expectancy."""
+    lines = []
+    for reg in ("UP", "DOWN", "FLAT"):
+        rs = [t["r"] for t in trades if t.get("btc_trend") == reg]
+        if not rs:
+            continue
+        m = _bt_metrics(rs)
+        lines.append(f"  BTC {reg}: {m['n']} trade | %{m['winrate']} | beklenti {m['expectancy_r']:+.2f}R | PF {m['profit_factor']}")
+    return "\n".join(lines) if lines else "  (rejim verisi yok)"
+
+
+def _bt_trades_to_csv(trades: List[Dict[str, Any]]) -> str:
+    rows = ["ts,symbol,direction,result,entry,exit,stop,bars,r,btc_trend"]
+    for t in trades:
+        rows.append(
+            f"{t['ts']},{t['symbol']},{t['direction']},{t['result']},"
+            f"{t['entry']:.8g},{t['exit']:.8g},{t['stop']:.8g},{t['bars']},{t['r']:.4f},{t.get('btc_trend','')}"
+        )
+    return "\n".join(rows)
+
+
+async def _bt_send_csv(csv_str: str, filename: str) -> bool:
+    """CSV'yi Telegram'a belge olarak gönder (best-effort)."""
+    try:
+        from io import BytesIO
+        bio = BytesIO(csv_str.encode("utf-8"))
+        bio.name = filename
+        await app.bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=bio, filename=filename)
+        return True
+    except Exception as e:
+        logger.warning("backtest CSV gönderilemedi: %s", e)
+        return False
+
+
+async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 12) -> str:
+    if not symbols:
+        symbols = list(COINS)[:8] if COINS else [
+            "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
+            "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "FET-USDT-SWAP"]
+    bars_1h = min(days * 24 + 80, 300)
+    btc_series = await _bt_btc_trend_series(bars_1h) if BTC_BIAS_ENABLED else []
+
+    trades: List[Dict[str, Any]] = []
+    signals = 0
+    btc_blocked = 0
+    actual_days = 0.0
+    tested = 0
+    fee_frac = BT_FEE_PCT * 2
+
+    for symbol in symbols[:12]:
+        try:
+            k1h = await get_klines(symbol, MA_KLINE_INTERVAL, bars_1h)
+            if len(k1h) < 60:
+                continue
+            tested += 1
+            actual_days = max(actual_days, len(k1h) / 24.0)
+            # 24s quote hacmi (son 24 mum) → dinamik slippage
+            last24 = k1h[-24:] if len(k1h) >= 24 else k1h
+            quote_vol_24h = sum(safe_float(r[5]) * safe_float(r[4]) for r in last24)
+            slip_frac = _bt_dyn_slippage(quote_vol_24h)
+
+            for i in range(38, len(k1h) - (BT_FUTURE_BARS + 2)):
+                slice1h = k1h[max(0, i - 60):i + 3]
+                k4h = _bt_resample(slice1h, 4)
+                try:
+                    res = build_hybrid_signal(
+                        symbol, slice1h, k4h, slice1h, slice1h,
+                        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+                        leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+                        require_both_ltf=HYBRID_REQUIRE_BOTH_LTF,
+                        allow_weak_trend=HYBRID_ALLOW_WEAK_TREND)
+                except Exception:
+                    continue
+                if not res:
+                    continue
+                signals += 1
+                direction = res["direction"]
+                entry_ts = int(safe_float(k1h[i + 1][0]))
+                btc_tr = _bt_btc_trend_at(entry_ts, btc_series) if btc_series else "NA"
+                if btc_series and ((direction == "SHORT" and btc_tr == "UP") or
+                                   (direction == "LONG" and btc_tr == "DOWN")):
+                    btc_blocked += 1
+                    continue
+                future = k1h[i + 2:i + 2 + BT_FUTURE_BARS]
+                if len(future) < 2:
+                    continue
+                trade = bt_simulate_tp_stop(res["entry"], res["stop"], res["tp1"],
+                                            res["tp2"], res["tp3"], future, direction)
+                if trade["result"] == "OPEN":
+                    continue
+                entry = res["entry"]
+                exitp = trade["exit_price"]
+                risk_unit = abs(entry - res["stop"])
+                if risk_unit <= 0 or entry <= 0:
+                    continue
+                gross_move = (exitp - entry) if direction == "LONG" else (entry - exitp)
+                r_gross = gross_move / risk_unit
+                fund_frac = (trade["bars"] // 8) * BT_FUNDING_PCT_8H
+                cost_r = ((slip_frac + fee_frac + fund_frac) * entry) / risk_unit
+                net_r = round(r_gross - cost_r, 4)
+                trades.append({
+                    "ts": entry_ts, "symbol": symbol, "direction": direction,
+                    "result": trade["result"], "entry": entry, "exit": exitp,
+                    "stop": res["stop"], "bars": trade["bars"], "r": net_r, "btc_trend": btc_tr,
+                })
+        except Exception as e:
+            logger.warning("backtest %s hata: %s", symbol, e)
+
+    trades.sort(key=lambda t: t["ts"])
+    all_r = [t["r"] for t in trades]
+    long_r = [t["r"] for t in trades if t["direction"] == "LONG"]
+    short_r = [t["r"] for t in trades if t["direction"] == "SHORT"]
+    exits = {k: sum(1 for t in trades if t["result"] == k) for k in ("TP1", "TP2", "TP3", "STOP")}
+
+    if not all_r:
+        return (f"🧪 HİBRİT BACKTEST — sinyal/trade yok.\n"
+                f"Coin: {tested} | Pencere: ~{actual_days:.1f} gün | Üretilen sinyal: {signals} | BTC bloğu: {btc_blocked}\n"
+                f"(Kesişim koşulu sağlanmadı veya likidasyon/rejim hepsini eledi.)")
+
+    M = _bt_metrics(all_r)
+    LM = _bt_metrics(long_r)
+    SM = _bt_metrics(short_r)
+    eq = _bt_equity_dd(all_r, HYBRID_RISK_PCT, BT_INITIAL_BALANCE)
+
+    # Out-of-sample tutarlılık (kronolojik 70/30)
+    cut = max(1, int(len(all_r) * BT_OOS_SPLIT))
+    IS = _bt_metrics(all_r[:cut])
+    OOS = _bt_metrics(all_r[cut:]) if len(all_r) - cut >= 1 else {"n": 0, "winrate": 0.0, "expectancy_r": 0.0, "profit_factor": 0.0}
+    overfit_flag = ""
+    if OOS["n"] >= 5 and (OOS["expectancy_r"] < 0 <= IS["expectancy_r"]):
+        overfit_flag = "⚠️ OOS beklentisi negatife döndü → olası overfit / rejime aşırı bağımlılık.\n"
+
+    # CSV export (Telegram belge)
+    if BT_CSV_EXPORT and trades:
+        await _bt_send_csv(_bt_trades_to_csv(trades), f"backtest_{int(time.time())}.csv")
+
+    pf = "∞" if M["profit_factor"] == float("inf") else f"{M['profit_factor']}"
+    return (
+        f"🧪 HİBRİT BACKTEST v2\n"
+        f"Coin: {tested} | Pencere: ~{actual_days:.1f}g (istenen {days}) | Kaldıraç: {HYBRID_LEVERAGE:.0f}x | Risk %{HYBRID_RISK_PCT}\n"
+        f"━━ GENEL ━━\n"
+        f"{M['n']} trade | %{M['winrate']} | beklenti {M['expectancy_r']:+.2f}R | PF {pf}\n"
+        f"Sharpe {M['sharpe']} | Sortino {M['sortino']} | Calmar {eq['calmar']}\n"
+        f"Ort. kazanç {M['avg_win_r']:+.2f}R | ort. kayıp {M['avg_loss_r']:+.2f}R | en uzun kayıp serisi {M['max_loss_streak']}\n"
+        f"Getiri %{eq['ret_pct']:+.2f} | Max DD %{eq['max_dd']} | Final {eq['final']} USDT\n"
+        f"━━ YÖN ━━\n"
+        f"LONG : {LM['n']} | %{LM['winrate']} | {LM['expectancy_r']:+.2f}R | PF {('∞' if LM['profit_factor']==float('inf') else LM['profit_factor'])}\n"
+        f"SHORT: {SM['n']} | %{SM['winrate']} | {SM['expectancy_r']:+.2f}R | PF {('∞' if SM['profit_factor']==float('inf') else SM['profit_factor'])}\n"
+        f"Çıkış: TP1={exits['TP1']} TP2={exits['TP2']} TP3={exits['TP3']} STOP={exits['STOP']}\n"
+        f"━━ REJİM (BTC trendine göre) ━━\n"
+        f"{_bt_regime_breakdown(trades)}\n"
+        f"━━ OUT-OF-SAMPLE (kronolojik %{int(BT_OOS_SPLIT*100)}/%{int((1-BT_OOS_SPLIT)*100)}) ━━\n"
+        f"IS : {IS['n']} | %{IS['winrate']} | {IS['expectancy_r']:+.2f}R\n"
+        f"OOS: {OOS['n']} | %{OOS.get('winrate',0)} | {OOS.get('expectancy_r',0):+.2f}R\n"
+        f"{overfit_flag}"
+        f"Üretilen sinyal: {signals} | BTC yön bloğu: {btc_blocked}\n"
+        f"━━ MODEL ━━\n"
+        f"Dinamik slippage (hacme göre %0.05–0.40) + fee %{BT_FEE_PCT*100:.3f}×2 + funding ~%{BT_FUNDING_PCT_8H*100:.3f}/8h dahil.\n"
+        f"⚠️ 4H trend 1H'tan resample; 15m/5m momentum 1H'la yaklaşık; BTC rejimde yalnız yön bloğu. "
+        f"Pencere 300 mum limitiyle ~12 gün. R'ler sabit risk birimine göre; bakiye compound."
+    )
+
+
+async def _run_backtest_and_report(days: int, symbols: Optional[List[str]]) -> None:
+    global _BACKTEST_RUNNING
+    _BACKTEST_RUNNING = True
+    try:
+        report = await run_hybrid_backtest(symbols, days)
+        await safe_send_telegram(report)
+    except Exception as e:
+        logger.exception("backtest çalıştırma hata: %s", e)
+        await safe_send_telegram(f"❌ Backtest hata: {str(e)[:200]}")
+    finally:
+        _BACKTEST_RUNNING = False
 
 
 def ma_performance_summary() -> Dict[str, Any]:
@@ -3177,6 +3655,34 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(f"{symbol} için şu an 1 saatlik MA7/MA25 temas-kesişim yok.")
 
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _BACKTEST_RUNNING
+    if _BACKTEST_RUNNING:
+        await update.message.reply_text("⏳ Zaten bir backtest çalışıyor. Bitmesini bekle.")
+        return
+    days = 12
+    symbols: Optional[List[str]] = None
+    args = context.args or []
+    if args:
+        try:
+            days = max(2, min(12, int(float(args[0]))))
+        except (ValueError, TypeError):
+            pass
+    if len(args) >= 2:
+        a = args[1].strip()
+        if ("," in a) or (not a.isdigit()):
+            symbols = [normalize_symbol(s) for s in a.split(",") if s.strip()]
+        else:
+            topn = max(1, min(12, int(a)))
+            symbols = list(COINS)[:topn] if COINS else None
+    hedef = symbols if symbols else (f"havuzdan ilk {len(list(COINS)[:8])}" if COINS else "varsayılan set")
+    await update.message.reply_text(
+        f"🧪 Backtest başladı (~{days} gün, arka planda). Hedef: {hedef}.\n"
+        f"Bot taramaya devam ediyor; sonuç bitince gelecek."
+    )
+    asyncio.create_task(_run_backtest_and_report(days, symbols))
+
+
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = RISK_GUARD.state
     now = time.time()
@@ -3184,8 +3690,13 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bl = st.get("blacklist_until", {})
     bl_active = [f"{b} ({max(0.0,(safe_float(t)-now)/3600):.1f}sa)" for b, t in bl.items() if safe_float(t) > now]
     cs = {k: v for k, v in st.get("consec_stops", {}).items() if int(v) > 0}
+    bb = _BTC_BIAS_CACHE.get("data") or {}
+    btc_line = (f"BTC rejim: {bb.get('trend','-')}{' (güçlü)' if bb.get('strong') else ''} "
+                f"| gap %{safe_float(bb.get('gap_pct',0)):+.2f} | 1H ATR %{safe_float(bb.get('atr_pct',0)):.2f}\n"
+                if bb else "BTC rejim: henüz hesaplanmadı\n")
     await update.message.reply_text(
         f"🛡 RİSK YÖNETİCİSİ\n"
+        f"{btc_line}"
         f"Gün: {st.get('day_key','-')}\n"
         f"Günlük P&L (paper): %{safe_float(st.get('daily_pnl_pct',0)):.2f} / eşik -%{RISK_DAILY_DD_PCT:.1f}\n"
         f"Durdurma: {'AKTİF ('+format(halt_left,'.1f')+'sa)' if halt_left>0 else 'yok'}\n"
@@ -3414,6 +3925,7 @@ def build_app():
     application.add_handler(CommandHandler("ma", cmd_ma))
     application.add_handler(CommandHandler("hibrit", cmd_hibrit))
     application.add_handler(CommandHandler("risk", cmd_risk))
+    application.add_handler(CommandHandler("backtest", cmd_backtest))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
     application.add_handler(CommandHandler("whale", cmd_whale))
     application.add_handler(CommandHandler("funding", cmd_funding))
