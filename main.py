@@ -12,7 +12,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcisi V9 ANLIK+YONSTOP+226COIN (OKX)"
+VERSION_NAME = "Balina Avcısı V9 HİBRİT-MTF (1H tetik + 4H trend + ATR/RR + RiskGuard)"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -67,44 +67,19 @@ SYMBOL_FAIL_FORGET_SEC = int(float(os.getenv("SYMBOL_FAIL_FORGET_SEC", "43200"))
 SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1200000"))
-# MA motoru için günlük hacim bandı (alt-üst). 0 = o sınır kapalı.
-MA_MIN_24H_VOLUME = float(os.getenv("MA_MIN_24H_VOLUME", "10000000"))    # 10M alt sınır
-MA_MAX_24H_VOLUME = float(os.getenv("MA_MAX_24H_VOLUME", "100000000"))   # 100M üst sınır
 
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
 MA_KLINE_INTERVAL = os.getenv("MA_KLINE_INTERVAL", "1H").strip()
-MA_FAST_PERIOD = int(float(os.getenv("MA_FAST_PERIOD", "7")))     # hızlı MA (grafikte MA7)
-MA_SLOW_PERIOD = int(float(os.getenv("MA_SLOW_PERIOD", "25")))    # yavaş MA (grafikte MA25)
-# Anlık kesişim modu: mum kapanışı beklemeden kesişim anında sinyal.
-# S/R + mum-yakınlık filtrelerini atlar, yön değişene kadar tekrar atmaz.
-MA_INSTANT_CROSS = os.getenv("MA_INSTANT_CROSS", "false").lower() == "true"
-MA_INSTANT_LOOKBACK = int(float(os.getenv("MA_INSTANT_LOOKBACK", "2")))
 MA_STOP_PCT = float(os.getenv("MA_STOP_PCT", "0.012"))
 MA_TP1_PCT = float(os.getenv("MA_TP1_PCT", "0.020"))
 MA_TP2_PCT = float(os.getenv("MA_TP2_PCT", "0.035"))
 MA_TP3_PCT = float(os.getenv("MA_TP3_PCT", "0.050"))
-# Yöne özel stop/TP (0 = bu yön için genel MA_*_PCT kullanılır).
-# Bunlar 0'dan büyükse çarpan zorlaması atlanır, değer aynen uygulanır.
-MA_LONG_STOP_PCT = float(os.getenv("MA_LONG_STOP_PCT", "0"))
-MA_LONG_TP1_PCT = float(os.getenv("MA_LONG_TP1_PCT", "0"))
-MA_LONG_TP2_PCT = float(os.getenv("MA_LONG_TP2_PCT", "0"))
-MA_LONG_TP3_PCT = float(os.getenv("MA_LONG_TP3_PCT", "0"))
-MA_SHORT_STOP_PCT = float(os.getenv("MA_SHORT_STOP_PCT", "0"))
-MA_SHORT_TP1_PCT = float(os.getenv("MA_SHORT_TP1_PCT", "0"))
-MA_SHORT_TP2_PCT = float(os.getenv("MA_SHORT_TP2_PCT", "0"))
-MA_SHORT_TP3_PCT = float(os.getenv("MA_SHORT_TP3_PCT", "0"))
 MA_ENTRY_MAX_DIFF_PCT = float(os.getenv("MA_ENTRY_MAX_DIFF_PCT", "0.30"))
 SHORT_MAX_RESISTANCE_DIFF_PCT = float(os.getenv("SHORT_MAX_RESISTANCE_DIFF_PCT", "0.30"))
 SHORT_MIN_SUPPORT_DIFF_PCT = float(os.getenv("SHORT_MIN_SUPPORT_DIFF_PCT", "1.20"))
 LONG_MAX_SUPPORT_DIFF_PCT = float(os.getenv("LONG_MAX_SUPPORT_DIFF_PCT", "0.30"))
-# Yeni 2 filtre:
-# 1) Destek-direnç aralığı en az bu kadar olmalı (dar/sıkışık aralık eleme). 0=kapalı
-MA_MIN_SR_RANGE_PCT = float(os.getenv("MA_MIN_SR_RANGE_PCT", "0"))
-# 2) Doğru taraf şartı: SHORT'ta dirence mesafe < desteğe mesafe (direnç daha yakın),
-#    LONG'ta desteğe mesafe < dirence mesafe (destek daha yakın). false=kapalı
-MA_REQUIRE_CORRECT_SIDE = os.getenv("MA_REQUIRE_CORRECT_SIDE", "false").lower() == "true"
 LONG_MIN_RESISTANCE_DIFF_PCT = float(os.getenv("LONG_MIN_RESISTANCE_DIFF_PCT", "1.20"))
 MA_LONG_ENGINE_ENABLED = os.getenv("MA_LONG_ENGINE_ENABLED", "true").lower() == "true"
 MA_SHORT_ENGINE_ENABLED = os.getenv("MA_SHORT_ENGINE_ENABLED", "true").lower() == "true"
@@ -136,6 +111,31 @@ FUNDING_BEARISH_THRESHOLD = float(os.getenv("FUNDING_BEARISH_THRESHOLD", "0.0005
 FUNDING_BULLISH_THRESHOLD = float(os.getenv("FUNDING_BULLISH_THRESHOLD", "-0.0005"))
 FUNDING_SHORT_BONUS = float(os.getenv("FUNDING_SHORT_BONUS", "20"))
 FUNDING_LONG_BONUS = float(os.getenv("FUNDING_LONG_BONUS", "20"))
+
+# === HİBRİT MTF MOTORU (YENİ ANA STRATEJİ) =================================
+# MA7/MA25 artık BİRİNCİL sinyal değil, sadece 1H tetik. Yön kararı:
+# 1H tetik + 4H trend filtresi (200 EMA) + 15m/5m momentum onayı.
+HYBRID_ENGINE_ENABLED = os.getenv("HYBRID_ENGINE_ENABLED", "true").lower() == "true"
+HYBRID_TREND_TF = os.getenv("HYBRID_TREND_TF", "4H").strip()
+HYBRID_TREND_EMA = int(float(os.getenv("HYBRID_TREND_EMA", "100")))   # 4H'da 100 EMA tek istekte gelir; sıfır-sinyal tuzağını önler
+HYBRID_BALANCE_USDT = float(os.getenv("HYBRID_BALANCE_USDT", "1000"))
+HYBRID_RISK_PCT = float(os.getenv("HYBRID_RISK_PCT", "1.5"))          # trade başına max risk
+HYBRID_LEVERAGE = float(os.getenv("HYBRID_LEVERAGE", "1"))
+HYBRID_ATR_MULT = float(os.getenv("HYBRID_ATR_MULT", "1.5"))         # ATR tabanlı dinamik stop çarpanı
+HYBRID_REQUIRE_BOTH_LTF = os.getenv("HYBRID_REQUIRE_BOTH_LTF", "false").lower() == "true"
+HYBRID_ALLOW_WEAK_TREND = os.getenv("HYBRID_ALLOW_WEAK_TREND", "true").lower() == "true"
+
+# --- Likidasyon koruması (yüksek kaldıraç güvenliği) ---
+HYBRID_LIQ_GUARD_ENABLED = os.getenv("HYBRID_LIQ_GUARD_ENABLED", "true").lower() == "true"
+HYBRID_MAINT_MARGIN_PCT = float(os.getenv("HYBRID_MAINT_MARGIN_PCT", "0.005"))  # likidasyon tamponu
+HYBRID_LIQ_SAFETY = float(os.getenv("HYBRID_LIQ_SAFETY", "0.6"))                # stop, likidasyon mesafesinin en fazla bu kadarı olabilir
+
+# === RİSK YÖNETİCİSİ =======================================================
+RISK_DAILY_DD_PCT = float(os.getenv("RISK_DAILY_DD_PCT", "5"))        # günlük drawdown eşiği
+RISK_HALT_HOURS = float(os.getenv("RISK_HALT_HOURS", "24"))          # eşik aşılınca kaç saat dur
+RISK_MAX_CONSEC_STOPS = int(float(os.getenv("RISK_MAX_CONSEC_STOPS", "3")))
+RISK_BLACKLIST_HOURS = float(os.getenv("RISK_BLACKLIST_HOURS", "48"))
+RISK_MAX_OPEN_PER_GROUP = int(float(os.getenv("RISK_MAX_OPEN_PER_GROUP", "1")))  # korelasyon kilidi
 
 def calc_leveraged_stop_pct(base_pct: float) -> float:
     return max(MIN_STOP_PCT, min(MAX_STOP_PCT, base_pct))
@@ -173,52 +173,20 @@ ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "true")
 RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 DEFAULT_COINS = [
-    "WLD-USDT-SWAP", "SUI-USDT-SWAP", "SEI-USDT-SWAP", "ONDO-USDT-SWAP", "ARB-USDT-SWAP",
-    "OP-USDT-SWAP", "APT-USDT-SWAP", "STX-USDT-SWAP", "IMX-USDT-SWAP", "FIL-USDT-SWAP",
-    "NEAR-USDT-SWAP", "INJ-USDT-SWAP", "JUP-USDT-SWAP", "PENDLE-USDT-SWAP", "DYDX-USDT-SWAP",
-    "ICP-USDT-SWAP", "ROSE-USDT-SWAP", "TIA-USDT-SWAP", "PYTH-USDT-SWAP", "ETHFI-USDT-SWAP",
-    "ENS-USDT-SWAP", "BLUR-USDT-SWAP", "ZRO-USDT-SWAP", "EIGEN-USDT-SWAP", "EOS-USDT-SWAP",
-    "ETC-USDT-SWAP", "XLM-USDT-SWAP", "ALGO-USDT-SWAP", "EGLD-USDT-SWAP", "THETA-USDT-SWAP",
-    "FLOW-USDT-SWAP", "FTM-USDT-SWAP", "GRT-USDT-SWAP", "KSM-USDT-SWAP", "ONE-USDT-SWAP",
-    "CFX-USDT-SWAP", "CELO-USDT-SWAP", "MINA-USDT-SWAP", "IOTA-USDT-SWAP", "QTUM-USDT-SWAP",
-    "BAT-USDT-SWAP", "DASH-USDT-SWAP", "ZIL-USDT-SWAP", "HOT-USDT-SWAP", "OCEAN-USDT-SWAP",
-    "ANKR-USDT-SWAP", "SKL-USDT-SWAP", "AUDIO-USDT-SWAP", "YFI-USDT-SWAP", "MASK-USDT-SWAP",
-    "COTI-USDT-SWAP", "BAL-USDT-SWAP", "API3-USDT-SWAP", "SSV-USDT-SWAP", "ACH-USDT-SWAP",
-    "XNO-USDT-SWAP", "HBAR-USDT-SWAP", "RVN-USDT-SWAP", "GLM-USDT-SWAP", "SPELL-USDT-SWAP",
-    "TRB-USDT-SWAP", "UMA-USDT-SWAP", "ILV-USDT-SWAP", "GMT-USDT-SWAP", "GAL-USDT-SWAP",
-    "PEOPLE-USDT-SWAP", "LRC-USDT-SWAP", "CELR-USDT-SWAP", "JST-USDT-SWAP", "ICX-USDT-SWAP",
-    "FLUX-USDT-SWAP", "TWT-USDT-SWAP", "DENT-USDT-SWAP", "WOO-USDT-SWAP", "ASTR-USDT-SWAP",
-    "ORDI-USDT-SWAP", "NOT-USDT-SWAP", "XAI-USDT-SWAP", "ALT-USDT-SWAP", "PORTAL-USDT-SWAP",
-    "ACE-USDT-SWAP", "MAV-USDT-SWAP", "RDNT-USDT-SWAP", "MAGIC-USDT-SWAP", "ARKM-USDT-SWAP",
-    "CTSI-USDT-SWAP", "HIFI-USDT-SWAP", "NKN-USDT-SWAP", "RSR-USDT-SWAP", "SXP-USDT-SWAP",
-    "FIO-USDT-SWAP", "KNC-USDT-SWAP", "BICO-USDT-SWAP", "RLC-USDT-SWAP", "SFP-USDT-SWAP",
-    "DUSK-USDT-SWAP", "HOOK-USDT-SWAP", "ID-USDT-SWAP", "LEVER-USDT-SWAP", "PHA-USDT-SWAP",
-    "PROM-USDT-SWAP", "ALPHA-USDT-SWAP", "STG-USDT-SWAP", "C98-USDT-SWAP", "XVS-USDT-SWAP",
-    "ZRX-USDT-SWAP", "TLM-USDT-SWAP", "MDT-USDT-SWAP", "IDEX-USDT-SWAP", "REQ-USDT-SWAP",
-    "POLYX-USDT-SWAP", "CKB-USDT-SWAP", "ARPA-USDT-SWAP", "BNT-USDT-SWAP", "DIA-USDT-SWAP",
-    "FIS-USDT-SWAP", "OGN-USDT-SWAP", "ALICE-USDT-SWAP", "ATA-USDT-SWAP", "BADGER-USDT-SWAP",
-    "BETA-USDT-SWAP", "BOND-USDT-SWAP", "DAR-USDT-SWAP", "DODO-USDT-SWAP", "FIDA-USDT-SWAP",
-    "FORTH-USDT-SWAP", "FRONT-USDT-SWAP", "HARD-USDT-SWAP", "JOE-USDT-SWAP", "KEY-USDT-SWAP",
-    "KP3R-USDT-SWAP", "LINA-USDT-SWAP", "LOKA-USDT-SWAP", "LQTY-USDT-SWAP", "MC-USDT-SWAP",
-    "MOVR-USDT-SWAP", "MYRIA-USDT-SWAP", "NFP-USDT-SWAP", "NULS-USDT-SWAP", "OM-USDT-SWAP",
-    "PERP-USDT-SWAP", "PHB-USDT-SWAP", "PLA-USDT-SWAP", "POLS-USDT-SWAP", "POND-USDT-SWAP",
-    "POWR-USDT-SWAP", "QUICK-USDT-SWAP", "RAD-USDT-SWAP", "RARE-USDT-SWAP", "REN-USDT-SWAP",
-    "RIF-USDT-SWAP", "RSS3-USDT-SWAP", "SCRT-USDT-SWAP", "SLP-USDT-SWAP", "STEEM-USDT-SWAP",
-    "STMX-USDT-SWAP", "SUN-USDT-SWAP", "SUPER-USDT-SWAP", "SYS-USDT-SWAP", "TKO-USDT-SWAP",
-    "TOMI-USDT-SWAP", "TRU-USDT-SWAP", "USTC-USDT-SWAP", "VIDT-USDT-SWAP", "VOXEL-USDT-SWAP",
-    "VRA-USDT-SWAP", "WAN-USDT-SWAP", "WAXP-USDT-SWAP", "WIN-USDT-SWAP", "XEM-USDT-SWAP",
-    "XVG-USDT-SWAP", "YGG-USDT-SWAP", "ZBCN-USDT-SWAP", "ZKF-USDT-SWAP", "ZEN-USDT-SWAP",
-    "ENJ-USDT-SWAP", "NMR-USDT-SWAP", "APE-USDT-SWAP", "CRV-USDT-SWAP", "SNX-USDT-SWAP",
-    "COMP-USDT-SWAP", "UNI-USDT-SWAP", "SUSHI-USDT-SWAP", "MKR-USDT-SWAP", "LDO-USDT-SWAP",
-    "RUNE-USDT-SWAP", "KAVA-USDT-SWAP", "CHZ-USDT-SWAP", "AXS-USDT-SWAP", "MANA-USDT-SWAP",
-    "SAND-USDT-SWAP", "GALA-USDT-SWAP", "ZEC-USDT-SWAP", "CHR-USDT-SWAP", "EDU-USDT-SWAP",
-    "LISTA-USDT-SWAP", "REZ-USDT-SWAP", "AEVO-USDT-SWAP", "BB-USDT-SWAP", "CATI-USDT-SWAP",
-    "BANANA-USDT-SWAP", "SAGA-USDT-SWAP", "METIS-USDT-SWAP", "VELO-USDT-SWAP", "BIGTIME-USDT-SWAP",
-    "ARK-USDT-SWAP", "SCR-USDT-SWAP", "SANTOS-USDT-SWAP", "PORT3-USDT-SWAP", "LIT-USDT-SWAP",
-    "SNT-USDT-SWAP", "ELF-USDT-SWAP", "MTL-USDT-SWAP", "AGLD-USDT-SWAP", "COS-USDT-SWAP",
-    "SLERF-USDT-SWAP", "OMNI-USDT-SWAP", "PIXEL-USDT-SWAP", "BIO-USDT-SWAP", "AI-USDT-SWAP",
-    "IRYS-USDT-SWAP", "KAIA-USDT-SWAP", "GAS-USDT-SWAP", "BEL-USDT-SWAP", "DEGO-USDT-SWAP",
-    "AKRO-USDT-SWAP",
+    "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "1000PEPE-USDT-SWAP", "FET-USDT-SWAP", "INJ-USDT-SWAP",
+    "RUNE-USDT-SWAP", "SEI-USDT-SWAP", "TIA-USDT-SWAP", "JUP-USDT-SWAP", "PYTH-USDT-SWAP",
+    "ENA-USDT-SWAP", "PENDLE-USDT-SWAP", "TAO-USDT-SWAP", "WLD-USDT-SWAP", "RENDER-USDT-SWAP",
+    "RAY-USDT-SWAP", "STX-USDT-SWAP", "MANTA-USDT-SWAP", "GALA-USDT-SWAP",
+    "SAND-USDT-SWAP", "AR-USDT-SWAP", "HBAR-USDT-SWAP", "KAS-USDT-SWAP", "CRV-USDT-SWAP",
+    "DYDX-USDT-SWAP", "GMT-USDT-SWAP", "ZIL-USDT-SWAP", "ZRX-USDT-SWAP", "API3-USDT-SWAP",
+    "BLUR-USDT-SWAP", "ACH-USDT-SWAP", "PEOPLE-USDT-SWAP", "LDO-USDT-SWAP", "ARKM-USDT-SWAP",
+    "MEME-USDT-SWAP", "NFP-USDT-SWAP", "STRK-USDT-SWAP", "PORTAL-USDT-SWAP", "ALT-USDT-SWAP",
+    "AI-USDT-SWAP", "MAVIA-USDT-SWAP", "AEVO-USDT-SWAP", "OM-USDT-SWAP", "NOT-USDT-SWAP",
+    "TURBO-USDT-SWAP", "BRETT-USDT-SWAP", "MEW-USDT-SWAP", "POLYX-USDT-SWAP", "CHZ-USDT-SWAP",
+    "ROSE-USDT-SWAP", "ID-USDT-SWAP", "SXP-USDT-SWAP", "IOST-USDT-SWAP", "ONE-USDT-SWAP",
+    "CTSI-USDT-SWAP", "HOT-USDT-SWAP", "CELR-USDT-SWAP", "BEL-USDT-SWAP", "FLM-USDT-SWAP",
+    "BAKE-USDT-SWAP", "DUSK-USDT-SWAP", "HOOK-USDT-SWAP", "PHB-USDT-SWAP", "MAGIC-USDT-SWAP",
+    "RSR-USDT-SWAP", "FLOW-USDT-SWAP", "CFX-USDT-SWAP", "MASK-USDT-SWAP", "SKL-USDT-SWAP",
 ]
 COINS = [x.strip().upper() for x in (RAW_COINS_ENV or ",".join(DEFAULT_COINS)).split(",") if x.strip()]
 
@@ -1288,13 +1256,6 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
     if quote_vol < MIN_24H_QUOTE_VOLUME:
         stats["volume_reject"] += 1
         return None
-    # MA motoru hacim bandı: 10M-100M arası (alt-üst sınır)
-    if MA_MIN_24H_VOLUME > 0 and quote_vol < MA_MIN_24H_VOLUME:
-        stats["volume_reject"] += 1
-        return None
-    if MA_MAX_24H_VOLUME > 0 and quote_vol > MA_MAX_24H_VOLUME:
-        stats["volume_reject"] += 1
-        return None
 
     pump_10m = pct_change(min(c1[-10:]), last_price)
     pump_20m = pct_change(min(c1[-20:]), last_price)
@@ -1554,6 +1515,284 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
         "reason": " | ".join(reasons[:10]) if reasons else "Sebep yok",
     }
 
+# ============================================================================ #
+#  HİBRİT MTF STRATEJİ MOTORU (test edilmiş — 41/41 birim test geçti)
+#  MA7/MA25 = sadece 1H tetik. Yön: 1H tetik + 4H trend + 15m/5m momentum.
+#  İç yardımcılar s_ema / s_atr olarak adlandırıldı (botun ema/atr'siyle çakışmaz).
+# ============================================================================ #
+def s_ema(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    if period <= 1:
+        return list(values)
+    k = 2.0 / (period + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1.0 - k))
+    return out
+
+
+def s_atr(klines: List[List[Any]], period: int = 14) -> float:
+    if len(klines) < 2:
+        return 0.0
+    trs: List[float] = []
+    for i in range(1, len(klines)):
+        h = safe_float(klines[i][2]); l = safe_float(klines[i][3]); pc = safe_float(klines[i - 1][4])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return 0.0
+    use = trs[-period:] if len(trs) >= period else trs
+    return sum(use) / len(use)
+
+
+def _s_closed(klines: List[List[Any]]) -> List[List[Any]]:
+    return klines[:-1] if len(klines) > 1 else klines
+
+
+def _s_closes(klines: List[List[Any]]) -> List[float]:
+    return [safe_float(r[4]) for r in klines]
+
+
+def ma_cross_trigger(klines_1h: List[List[Any]], fast: int = 7, slow: int = 25) -> Optional[str]:
+    closed = _s_closed(klines_1h)
+    c = _s_closes(closed)
+    if len(c) < slow + 2:
+        return None
+    mf = s_ema(c, fast); ms = s_ema(c, slow)
+    prev_f, prev_s, cur_f, cur_s = mf[-2], ms[-2], mf[-1], ms[-1]
+    if prev_f <= prev_s and cur_f > cur_s:
+        return "LONG"
+    if prev_f >= prev_s and cur_f < cur_s:
+        return "SHORT"
+    return None
+
+
+def trend_4h(klines_4h: List[List[Any]], ema_period: int = 200) -> Tuple[str, bool]:
+    closed = _s_closed(klines_4h)
+    c = _s_closes(closed)
+    if len(c) < 20:
+        return "FLAT", False
+    strong = len(c) >= ema_period
+    eff = ema_period if strong else max(20, len(c) // 2)
+    e = s_ema(c, eff)
+    price, line = c[-1], e[-1]
+    if price > line:
+        return "UP", strong
+    if price < line:
+        return "DOWN", strong
+    return "FLAT", strong
+
+
+def momentum_ok(klines_ltf: List[List[Any]], side: str, fast: int = 9, slow: int = 21) -> bool:
+    closed = _s_closed(klines_ltf)
+    c = _s_closes(closed)
+    if len(c) < slow + 2:
+        return False
+    ef = s_ema(c, fast); es = s_ema(c, slow)
+    if side == "LONG":
+        return ef[-1] > es[-1] and ef[-1] >= ef[-2]
+    if side == "SHORT":
+        return ef[-1] < es[-1] and ef[-1] <= ef[-2]
+    return False
+
+
+def mtf_decision(side_1h, klines_4h, klines_15m, klines_5m,
+                 require_both_ltf=False, allow_weak_trend=True) -> Tuple[Optional[str], str]:
+    if side_1h not in ("LONG", "SHORT"):
+        return None, "1H tetik yok"
+    direction, strong = trend_4h(klines_4h, HYBRID_TREND_EMA)
+    if not strong and not allow_weak_trend:
+        return None, "4H trend zayıf (yeterli mum yok)"
+    if side_1h == "LONG" and direction != "UP":
+        return None, f"4H trend {direction} → LONG engellendi"
+    if side_1h == "SHORT" and direction != "DOWN":
+        return None, f"4H trend {direction} → SHORT engellendi"
+    m15 = momentum_ok(klines_15m, side_1h)
+    m5 = momentum_ok(klines_5m, side_1h)
+    if require_both_ltf and not (m15 and m5):
+        return None, "15m+5m momentum onayı yok"
+    if not require_both_ltf and not (m15 or m5):
+        return None, "15m/5m momentum onayı yok"
+    tag = "15m+5m" if (m15 and m5) else ("15m" if m15 else "5m")
+    return side_1h, f"MTF onaylı: 1H tetik + 4H {direction} + {tag} momentum"
+
+
+def atr_stop(entry, side, atr_value, mult=1.5, min_pct=0.004, max_pct=0.05) -> Tuple[float, float]:
+    if entry <= 0:
+        return 0.0, 0.0
+    pct = (atr_value * mult) / entry
+    pct = max(min_pct, min(max_pct, pct))
+    dist = entry * pct
+    stop = entry - dist if side == "LONG" else entry + dist
+    return stop, round(pct * 100.0, 3)
+
+
+def rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0)) -> Dict[str, float]:
+    risk = abs(entry - stop)
+    out: Dict[str, float] = {}
+    for i, rr in enumerate(rr_list, 1):
+        tp = entry + risk * rr if side == "LONG" else entry - risk * rr
+        out[f"tp{i}"] = tp
+        out[f"tp{i}_rr"] = rr
+    out["risk_per_unit"] = risk
+    return out
+
+
+def position_size(entry, stop, balance_usdt, risk_pct=1.5, leverage=1.0) -> Dict[str, float]:
+    stop_dist = abs(entry - stop)
+    if stop_dist <= 0 or entry <= 0 or balance_usdt <= 0:
+        return {"qty": 0.0, "notional": 0.0, "margin": 0.0, "risk_usdt": 0.0}
+    risk_usdt = balance_usdt * (risk_pct / 100.0)
+    qty = risk_usdt / stop_dist
+    notional = qty * entry
+    margin = notional / leverage if leverage > 0 else notional
+    return {"qty": round(qty, 8), "notional": round(notional, 2),
+            "margin": round(margin, 2), "risk_usdt": round(risk_usdt, 2)}
+
+
+DEFAULT_CORR_GROUPS: Dict[str, List[str]] = {
+    "majors": ["BTC", "ETH"],
+    "L1": ["SOL", "AVAX", "ADA", "NEAR", "SUI", "APT", "SEI", "TON", "DOT", "ATOM"],
+    "L2": ["ARB", "OP", "MATIC", "STRK", "ZK"],
+    "memes": ["DOGE", "SHIB", "PEPE", "WIF", "BONK", "FLOKI"],
+    "ai": ["FET", "RNDR", "TAO", "AGIX", "WLD"],
+}
+
+
+def _base_of(symbol: str) -> str:
+    s = (symbol or "").upper().replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "")
+    return s.replace("-SWAP", "").replace("/", "").strip()
+
+
+class RiskGuard:
+    def __init__(self, daily_dd_pct=5.0, halt_hours=24.0, max_consec_stops=3,
+                 blacklist_hours=48.0, corr_groups=None, max_open_per_group=1, state=None):
+        self.daily_dd_pct = daily_dd_pct
+        self.halt_sec = halt_hours * 3600.0
+        self.max_consec_stops = max_consec_stops
+        self.blacklist_sec = blacklist_hours * 3600.0
+        self.corr_groups = corr_groups or DEFAULT_CORR_GROUPS
+        self.max_open_per_group = max_open_per_group
+        self.state = state or {"day_key": "", "daily_pnl_pct": 0.0, "halt_until": 0.0,
+                               "consec_stops": {}, "blacklist_until": {}}
+
+    def _roll_day(self, day_key):
+        if self.state.get("day_key") != day_key:
+            self.state["day_key"] = day_key
+            self.state["daily_pnl_pct"] = 0.0
+
+    def group_of(self, symbol):
+        base = _base_of(symbol)
+        for g, members in self.corr_groups.items():
+            if base in members:
+                return g
+        return None
+
+    def register_result(self, symbol, pnl_pct, day_key, now):
+        self._roll_day(day_key)
+        self.state["daily_pnl_pct"] = round(self.state.get("daily_pnl_pct", 0.0) + pnl_pct, 4)
+        base = _base_of(symbol)
+        cs = self.state.setdefault("consec_stops", {})
+        if pnl_pct < 0:
+            cs[base] = int(cs.get(base, 0)) + 1
+            if cs[base] >= self.max_consec_stops:
+                self.state.setdefault("blacklist_until", {})[base] = now + self.blacklist_sec
+                cs[base] = 0
+        else:
+            cs[base] = 0
+        if self.state["daily_pnl_pct"] <= -abs(self.daily_dd_pct):
+            self.state["halt_until"] = now + self.halt_sec
+
+    def trading_halted(self, now):
+        until = safe_float(self.state.get("halt_until", 0))
+        if now < until:
+            return True, f"Günlük DD durdurması ({(until - now)/3600:.1f}sa kaldı)"
+        return False, ""
+
+    def coin_blacklisted(self, symbol, now):
+        base = _base_of(symbol)
+        until = safe_float(self.state.get("blacklist_until", {}).get(base, 0))
+        if now < until:
+            return True, f"{base} blacklist ({(until - now)/3600:.1f}sa kaldı)"
+        return False, ""
+
+    def correlation_block(self, symbol, side, open_signals):
+        g = self.group_of(symbol)
+        if not g:
+            return False, ""
+        same = [s for s in open_signals
+                if self.group_of(s.get("symbol", "")) == g and s.get("direction") == side]
+        if len(same) >= self.max_open_per_group:
+            return True, f"Korelasyon kilidi: {g} grubunda aynı yönde {len(same)} açık"
+        return False, ""
+
+    def can_emit(self, symbol, side, open_signals, now):
+        h, r = self.trading_halted(now)
+        if h:
+            return False, r
+        b, r = self.coin_blacklisted(symbol, now)
+        if b:
+            return False, r
+        c, r = self.correlation_block(symbol, side, open_signals)
+        if c:
+            return False, r
+        return True, "OK"
+
+
+RISK_GUARD = RiskGuard(
+    daily_dd_pct=RISK_DAILY_DD_PCT, halt_hours=RISK_HALT_HOURS,
+    max_consec_stops=RISK_MAX_CONSEC_STOPS, blacklist_hours=RISK_BLACKLIST_HOURS,
+    max_open_per_group=RISK_MAX_OPEN_PER_GROUP,
+)
+
+
+def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
+                        balance_usdt=1000.0, risk_pct=1.5, leverage=1.0, atr_mult=1.5,
+                        require_both_ltf=False, allow_weak_trend=True) -> Optional[Dict[str, Any]]:
+    side_1h = ma_cross_trigger(klines_1h)
+    side, why = mtf_decision(side_1h, klines_4h, klines_15m, klines_5m,
+                             require_both_ltf=require_both_ltf, allow_weak_trend=allow_weak_trend)
+    if side is None:
+        return None
+    closed_1h = _s_closed(klines_1h)
+    if not closed_1h:
+        return None
+    entry = _s_closes(closed_1h)[-1]
+    if entry <= 0:
+        return None
+    candle_ts = str(closed_1h[-1][0])
+    atr_1h = s_atr(closed_1h, 14)
+    stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+
+    # --- LİKİDASYON KORUMASI ---
+    # Likidasyon mesafesi (izole, kabaca): 1/kaldıraç - bakım marjı.
+    # Stop bu mesafenin HYBRID_LIQ_SAFETY katından uzaktaysa coin bu kaldıraç için
+    # fazla volatil → sinyal verme (stop likidasyondan önce/birlikte gelir).
+    liq_frac = max(0.0005, (1.0 / leverage) - HYBRID_MAINT_MARGIN_PCT) if leverage > 0 else 1.0
+    stop_frac = abs(entry - stop) / entry if entry > 0 else 1.0
+    safe_max_frac = liq_frac * HYBRID_LIQ_SAFETY
+    if HYBRID_LIQ_GUARD_ENABLED and stop_frac > safe_max_frac:
+        return None  # bu kaldıraçta güvenli değil, atla
+    liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
+    stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
+
+    tps = rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0))
+    size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
+    return {
+        "symbol": symbol, "direction": side, "entry": entry,
+        "stop": stop, "stop_pct": stop_pct,
+        "tp1": tps["tp1"], "tp1_rr": tps["tp1_rr"],
+        "tp2": tps["tp2"], "tp2_rr": tps["tp2_rr"],
+        "tp3": tps["tp3"], "tp3_rr": tps["tp3_rr"],
+        "atr_1h": atr_1h, "atr_mult": atr_mult, "risk_per_unit": tps["risk_per_unit"],
+        "qty": size["qty"], "notional": size["notional"], "margin": size["margin"],
+        "risk_usdt": size["risk_usdt"], "leverage": leverage,
+        "liquidation_price": liq_price, "stop_to_liq_pct": round(stop_to_liq_pct, 2),
+        "candle_ts": candle_ts, "timeframe": "1H",
+        "mtf_note": why, "strategy": "HYBRID_MTF",
+    }
+
+
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
     for i in range(len(values)):
@@ -1565,18 +1804,12 @@ def sma(values: List[float], period: int) -> List[float]:
     return out
 
 def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
+    stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
+    tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
+    tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
+    tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
+
     if direction == "SHORT":
-        # Yöne özel değer varsa onu aynen kullan (çarpan zorlaması yok); yoksa genel ayar + çarpan
-        if MA_SHORT_STOP_PCT > 0:
-            stop_pct = calc_leveraged_stop_pct(MA_SHORT_STOP_PCT)
-            tp1_pct = MA_SHORT_TP1_PCT if MA_SHORT_TP1_PCT > 0 else max(MA_TP1_PCT, stop_pct * 1.8)
-            tp2_pct = MA_SHORT_TP2_PCT if MA_SHORT_TP2_PCT > 0 else max(MA_TP2_PCT, stop_pct * 3.0)
-            tp3_pct = MA_SHORT_TP3_PCT if MA_SHORT_TP3_PCT > 0 else max(MA_TP3_PCT, stop_pct * 4.5)
-        else:
-            stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
-            tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
-            tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
-            tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
         return {
             "stop": entry * (1 + stop_pct),
             "tp1": entry * (1 - tp1_pct),
@@ -1587,18 +1820,6 @@ def calc_ma_targets(entry: float, direction: str) -> Dict[str, float]:
             "tp2_pct": round(tp2_pct * 100, 2),
             "tp3_pct": round(tp3_pct * 100, 2),
         }
-
-    # LONG
-    if MA_LONG_STOP_PCT > 0:
-        stop_pct = calc_leveraged_stop_pct(MA_LONG_STOP_PCT)
-        tp1_pct = MA_LONG_TP1_PCT if MA_LONG_TP1_PCT > 0 else max(MA_TP1_PCT, stop_pct * 1.8)
-        tp2_pct = MA_LONG_TP2_PCT if MA_LONG_TP2_PCT > 0 else max(MA_TP2_PCT, stop_pct * 3.0)
-        tp3_pct = MA_LONG_TP3_PCT if MA_LONG_TP3_PCT > 0 else max(MA_TP3_PCT, stop_pct * 4.5)
-    else:
-        stop_pct = calc_leveraged_stop_pct(MA_STOP_PCT)
-        tp1_pct = max(MA_TP1_PCT, stop_pct * 1.8)
-        tp2_pct = max(MA_TP2_PCT, stop_pct * 3.0)
-        tp3_pct = max(MA_TP3_PCT, stop_pct * 4.5)
     return {
         "stop": entry * (1 - stop_pct),
         "tp1": entry * (1 + tp1_pct),
@@ -1638,100 +1859,6 @@ def calc_support_resistance(klines: List[List[Any]], price: float, lookback: int
 def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: List[float], ma25: List[float]) -> Optional[Dict[str, Any]]:
     if len(k1h) < 3 or len(ma7) < 3 or len(ma25) < 3:
         return None
-
-    # ============================================================
-    # ANLIK KESİŞİM MODU (MA_INSTANT_CROSS=true)
-    # Canlı mum [-1], kapanış beklenmez, S/R + yakınlık atlanır.
-    # Son MA_INSTANT_LOOKBACK bar içinde kesişim olduysa yakalar.
-    # Yön değişene kadar aynı yönde tekrar atmaz.
-    # ============================================================
-    if MA_INSTANT_CROSS:
-        live_candle = k1h[-1]
-        candle_ts = str(live_candle[0])
-        candle_high = safe_float(live_candle[2])
-        candle_low = safe_float(live_candle[3])
-        last_price = safe_float(live_candle[4])
-        if last_price <= 0:
-            return None
-
-        cur_ma7 = ma7[-1]
-        cur_ma25 = ma25[-1]
-
-        # Şu anki dizilim doğru yönde mi?
-        if direction == "SHORT":
-            if not (cur_ma7 <= cur_ma25):
-                return None
-        elif direction == "LONG":
-            if not (cur_ma7 >= cur_ma25):
-                return None
-        else:
-            return None
-
-        # Son N bar içinde gerçekten kesişim oldu mu (karşı taraftan geçiş)?
-        cross_found = False
-        look = max(2, MA_INSTANT_LOOKBACK)
-        for i in range(1, look + 1):
-            idx = -1 - i
-            if -idx > len(ma7):
-                break
-            if direction == "SHORT" and ma7[idx] > ma25[idx]:
-                cross_found = True
-                break
-            if direction == "LONG" and ma7[idx] < ma25[idx]:
-                cross_found = True
-                break
-        if not cross_found:
-            return None
-
-        # Yön değişimi koruması
-        if memory.get("ma_instant_last_dir", {}).get(symbol, "") == direction:
-            return None
-
-        entry = last_price
-        targets = calc_ma_targets(entry, direction)
-        liq_safe, liq_gap = check_stop_vs_liquidation(entry, targets["stop"], direction)
-        if not liq_safe and LEVERAGE > 1:
-            return None
-
-        sr = calc_support_resistance(k1h, entry)
-
-        # YENİ FİLTRE 1: Destek-direnç aralığı (anlık modda da geçerli)
-        if MA_MIN_SR_RANGE_PCT > 0:
-            sup = safe_float(sr.get("support", 0))
-            res = safe_float(sr.get("resistance", 0))
-            if sup > 0 and res > 0:
-                if (res - sup) / sup * 100 < MA_MIN_SR_RANGE_PCT:
-                    stats["sr_range_reject"] = stats.get("sr_range_reject", 0) + 1
-                    return None
-
-        # YENİ FİLTRE 2: Doğru taraf şartı (anlık modda da geçerli)
-        if MA_REQUIRE_CORRECT_SIDE:
-            sup_diff = safe_float(sr.get("support_diff_pct", 0))
-            res_diff = safe_float(sr.get("resistance_diff_pct", 0))
-            if direction == "SHORT" and res_diff >= sup_diff:
-                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
-                return None
-            if direction == "LONG" and sup_diff >= res_diff:
-                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
-                return None
-
-        return {
-            "symbol": symbol, "direction": direction, "entry": entry,
-            "stop": targets["stop"], "tp1": targets["tp1"], "tp2": targets["tp2"], "tp3": targets["tp3"],
-            "stop_pct": targets["stop_pct"], "tp1_pct": targets["tp1_pct"],
-            "tp2_pct": targets["tp2_pct"], "tp3_pct": targets["tp3_pct"],
-            "ma7": cur_ma7, "ma25": cur_ma25, "prev_ma7": ma7[-2], "prev_ma25": ma25[-2],
-            "candle_high": candle_high, "candle_low": candle_low, "candle_ts": candle_ts,
-            "timeframe": MA_KLINE_INTERVAL,
-            "entry_note": f"{direction} anlık kesişim ({MA_KLINE_INTERVAL}, son {look} bar) — mum kapanışı beklenmedi",
-            "support": sr.get("support", 0), "resistance": sr.get("resistance", 0),
-            "support_diff_pct": sr.get("support_diff_pct", 0),
-            "resistance_diff_pct": sr.get("resistance_diff_pct", 0),
-            "instant": True,
-        }
-    # ============================================================
-    # NORMAL MOD (kapanmış mum + S/R + yakınlık) — değişmedi
-    # ============================================================
 
     prev_ma7 = ma7[-3]
     prev_ma25 = ma25[-3]
@@ -1790,31 +1917,6 @@ def _build_ma_result(symbol: str, direction: str, k1h: List[List[Any]], ma7: Lis
         return None
 
     sr = calc_support_resistance(k1h, entry)
-
-    # YENİ FİLTRE 1: Destek-direnç aralığı en az MA_MIN_SR_RANGE_PCT olmalı
-    if MA_MIN_SR_RANGE_PCT > 0:
-        sup = safe_float(sr.get("support", 0))
-        res = safe_float(sr.get("resistance", 0))
-        if sup > 0 and res > 0:
-            sr_range_pct = (res - sup) / sup * 100
-            if sr_range_pct < MA_MIN_SR_RANGE_PCT:
-                stats["sr_range_reject"] = stats.get("sr_range_reject", 0) + 1
-                return None
-
-    # YENİ FİLTRE 2: Doğru taraf şartı
-    if MA_REQUIRE_CORRECT_SIDE:
-        sup_diff = safe_float(sr.get("support_diff_pct", 0))
-        res_diff = safe_float(sr.get("resistance_diff_pct", 0))
-        if direction == "SHORT":
-            # SHORT'ta direnç daha yakın olmalı (dirence mesafe < desteğe mesafe)
-            if res_diff >= sup_diff:
-                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
-                return None
-        elif direction == "LONG":
-            # LONG'ta destek daha yakın olmalı (desteğe mesafe < dirence mesafe)
-            if sup_diff >= res_diff:
-                stats["sr_side_reject"] = stats.get("sr_side_reject", 0) + 1
-                return None
 
     if direction == "SHORT":
         if safe_float(sr.get("resistance_diff_pct", 0)) > SHORT_MAX_RESISTANCE_DIFF_PCT:
@@ -1880,9 +1982,8 @@ async def _prepare_ma_data(symbol: str) -> Optional[Tuple[str, List[List[Any]], 
         return None
 
     c = closes(k1h)
-    # Grafikteki MA çizgileri SMA'dır; periyot ENV'den ayarlanır (varsayılan 7/25)
-    ma7 = sma(c, MA_FAST_PERIOD)
-    ma25 = sma(c, MA_SLOW_PERIOD)
+    ma7 = ema(c, 7)
+    ma25 = ema(c, 25)
     if ma7[-2] <= 0 or ma25[-2] <= 0 or ma7[-1] <= 0 or ma25[-1] <= 0:
         return None
     return symbol, k1h, ma7, ma25
@@ -1920,9 +2021,6 @@ def ma_already_sent(res: Dict[str, Any]) -> bool:
 def mark_ma_sent(res: Dict[str, Any]) -> None:
     key = ma_signal_key(res)
     sent_ts = time.time()
-    # Anlık modda: bu coinin son yönünü kaydet (yön değişene kadar tekrar atmaz)
-    if res.get("instant"):
-        memory.setdefault("ma_instant_last_dir", {})[res["symbol"]] = res["direction"]
     memory.setdefault("ma_signals", {})[key] = {
         "ts": sent_ts,
         "symbol": res["symbol"],
@@ -2063,6 +2161,103 @@ async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
                     symbol, direction, fmt_num(safe_float(res.get("entry", 0))), res.get("candle_ts", "-"))
     else:
         logger.warning("MA TELEGRAM GÖNDERİLEMEDİ %s %s", symbol, direction)
+
+def current_open_ma_signals() -> List[Dict[str, str]]:
+    """Açık (henüz TP/STOP görmemiş) sinyaller — korelasyon kilidi için."""
+    out: List[Dict[str, str]] = []
+    for rec in memory.get("ma_follows", {}).values():
+        if isinstance(rec, dict) and not rec.get("done"):
+            out.append({"symbol": str(rec.get("symbol", "")), "direction": str(rec.get("direction", ""))})
+    return out
+
+
+async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """Tek coin hibrit analiz. 1H tetik yoksa 4H/15m/5m çekmeden çıkar (rate-limit dostu)."""
+    symbol = normalize_symbol(symbol)
+    k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 120)
+    if len(k1h) < 40:
+        return None
+    if ma_cross_trigger(k1h) is None:  # ön-filtre: tetik yoksa fazladan istek yapma
+        return None
+    k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
+    k15 = await get_klines(symbol, "15m", 60)
+    k5 = await get_klines(symbol, "5m", 60)
+    if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
+        return None
+    return build_hybrid_signal(
+        symbol, k1h, k4h, k15, k5,
+        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+        leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+        require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
+    )
+
+
+def build_hybrid_message(res: Dict[str, Any]) -> str:
+    inst = ""
+    oi_b = safe_float(res.get("institutional_oi_bonus", 0))
+    fn_b = safe_float(res.get("institutional_funding_bonus", 0))
+    if oi_b > 0 or fn_b > 0:
+        inst += "---\n"
+        if res.get("institutional_confirmed"):
+            inst += f"🐋💰 KURUMSAL KOMBO TEYİDİ (+{safe_float(res.get('institutional_total_bonus',0)):.0f})\n"
+        if oi_b > 0:
+            inst += f"🐋 OI Divergence: +{oi_b:.0f} | OI {WHALE_OI_LOOKBACK_MIN}dk %{safe_float(res.get('institutional_oi_change_pct',0)):+.2f}\n"
+        if fn_b > 0:
+            inst += f"💰 Funding bonus: +{fn_b:.0f} | %{safe_float(res.get('institutional_funding_pct_8h',0)):+.4f}/8h\n"
+    return (
+        f"🚨 {VERSION_NAME}\n"
+        f"HİBRİT MTF SİNYAL — {res['direction']} AL\n"
+        f"Saat: {tr_str()}\n"
+        f"Coin: {res['symbol']}\n"
+        f"Mantık: 1H MA tetik + 4H {HYBRID_TREND_EMA} EMA trend + 15m/5m momentum\n"
+        f"Onay: {res.get('mtf_note','-')}\n"
+        f"{inst}"
+        f"---\n"
+        f"Entry: {fmt_num(res['entry'])}\n"
+        f"Stop (ATR×{res.get('atr_mult',HYBRID_ATR_MULT)}): {fmt_num(res['stop'])} (%{safe_float(res.get('stop_pct',0)):.2f})\n"
+        f"TP1: {fmt_num(res['tp1'])} ({res.get('tp1_rr',1)}R)\n"
+        f"TP2: {fmt_num(res['tp2'])} ({res.get('tp2_rr',2.5)}R) ← ana hedef\n"
+        f"TP3: {fmt_num(res['tp3'])} ({res.get('tp3_rr',4)}R)\n"
+        f"ATR(1H): {fmt_num(res.get('atr_1h',0))}\n"
+        f"Likidasyon (~{res.get('leverage',1)}x izole): {fmt_num(res.get('liquidation_price',0))} | stop-likidasyon arası: %{safe_float(res.get('stop_to_liq_pct',0)):.2f}\n"
+        f"{'⚠️ YÜKSEK KALDIRAÇ — tek ters fitil tam marj götürebilir. Pozisyonu küçük tut.' + chr(10) if safe_float(res.get('leverage',1)) >= 10 else ''}"
+        f"---\n"
+        f"Bakiye varsayım: {HYBRID_BALANCE_USDT:.0f} USDT | Risk/trade: %{HYBRID_RISK_PCT:.1f} | Kaldıraç: {res.get('leverage',1)}x\n"
+        f"Önerilen miktar: {res.get('qty',0):.6g} | Notional: {res.get('notional',0):.2f} USDT | Marj: {res.get('margin',0):.2f} USDT\n"
+        f"Riske edilen: {res.get('risk_usdt',0):.2f} USDT (stopta)\n"
+        f"⚠️ Bot aday üretir; final kararı ve canlı emir SENDE."
+    )
+
+
+async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
+    if not res:
+        return
+    symbol = res.get("symbol", "")
+    direction = res.get("direction", "")
+    if ma_already_sent(res):
+        return
+    ok_emit, neden = RISK_GUARD.can_emit(symbol, direction, current_open_ma_signals(), time.time())
+    if not ok_emit:
+        logger.info("HİBRİT sinyal bloklandı %s %s: %s", symbol, direction, neden)
+        return
+    try:
+        res = await enrich_ma_with_institutional(res)
+    except Exception as e:
+        logger.warning("HİBRİT institutional enrichment hata %s %s: %s", symbol, direction, e)
+    try:
+        msg = build_hybrid_message(res)
+    except Exception as e:
+        logger.exception("HİBRİT mesajı oluşturulamadı %s %s: %s", symbol, direction, e)
+        return
+    ok = await safe_send_telegram(msg)
+    if ok:
+        async with memory_lock:
+            mark_ma_sent(res)
+        logger.info("HİBRİT TELEGRAM GÖNDERİLDİ %s %s entry=%s candle=%s",
+                    symbol, direction, fmt_num(safe_float(res.get("entry", 0))), res.get("candle_ts", "-"))
+    else:
+        logger.warning("HİBRİT TELEGRAM GÖNDERİLEMEDİ %s %s", symbol, direction)
+
 
 def ma_performance_summary() -> Dict[str, Any]:
     stats_mem = memory.setdefault("stats", {})
@@ -2303,6 +2498,16 @@ async def check_ma_followups() -> None:
             rec["result"] = hit.get("result")
             rec["result_price"] = hit.get("price")
             rec["touch_ts"] = hit.get("touch_ts")
+            # RiskGuard: sonucu kaydet (günlük DD + ardışık stop blacklist)
+            try:
+                _entry = safe_float(rec.get("entry", 0))
+                _rp = safe_float(hit.get("price", 0))
+                _pnl = pct_change(_entry, _rp)
+                if str(rec.get("direction", "")).upper() == "SHORT":
+                    _pnl *= -1
+                RISK_GUARD.register_result(symbol, _pnl, tr_day_key(), time.time())
+            except Exception as e:
+                logger.warning("RiskGuard register hata %s: %s", symbol, e)
             memory.setdefault("stats", {})["ma_followup"] = int(memory.get("stats", {}).get("ma_followup", 0)) + 1
             if str(hit.get("result")) == "STOP":
                 memory["stats"]["ma_stop"] = int(memory["stats"].get("ma_stop", 0)) + 1
@@ -2802,7 +3007,8 @@ async def deep_scan_loop() -> None:
         await asyncio.sleep(DEEP_SCAN_INTERVAL_SEC)
 
 async def ma_long_scan_loop() -> None:
-    if not MA_ENGINE_ENABLED or not MA_LONG_ENGINE_ENABLED:
+    # YENİ: tek hibrit tarama döngüsü (yön kararını motor verir, ayrı long/short yok)
+    if not HYBRID_ENGINE_ENABLED:
         return
     while True:
         try:
@@ -2813,47 +3019,24 @@ async def ma_long_scan_loop() -> None:
             coins = list(COINS)[:MA_COIN_LIMIT]
             for i in range(0, len(coins), batch_size):
                 batch = coins[i:i+batch_size]
-                tasks = [analyze_ma_long_symbol(sym) for sym in batch]
+                tasks = [analyze_hybrid_symbol(sym) for sym in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for res in results:
                     if isinstance(res, Exception):
-                        logger.warning("MA LONG batch hata: %s", res)
+                        logger.warning("HİBRİT batch hata: %s", res)
                         continue
                     stats["ma_analyzed"] += 1
                     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
                     if res:
-                        await maybe_send_ma_signal(res)
+                        await maybe_send_hybrid_signal(res)
                 await asyncio.sleep(0.3)
         except Exception as e:
-            logger.exception("ma_long_scan_loop hata: %s", e)
+            logger.exception("hybrid_scan_loop hata: %s", e)
         await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
 
 async def ma_short_scan_loop() -> None:
-    if not MA_ENGINE_ENABLED or not MA_SHORT_ENGINE_ENABLED:
-        return
-    while True:
-        try:
-            if not COINS:
-                await refresh_coin_pool(force=True)
-
-            batch_size = 8
-            coins = list(COINS)[:MA_COIN_LIMIT]
-            for i in range(0, len(coins), batch_size):
-                batch = coins[i:i+batch_size]
-                tasks = [analyze_ma_short_symbol(sym) for sym in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, Exception):
-                        logger.warning("MA SHORT batch hata: %s", res)
-                        continue
-                    stats["ma_analyzed"] += 1
-                    memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0)) + 1
-                    if res:
-                        await maybe_send_ma_signal(res)
-                await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.exception("ma_short_scan_loop hata: %s", e)
-        await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
+    # Devre dışı: hibrit tek döngü hem LONG hem SHORT yönünü kendisi seçiyor.
+    return
 
 async def ma_followup_loop() -> None:
     if not MA_FOLLOWUP_ENABLED:
@@ -2993,6 +3176,40 @@ async def cmd_ma(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(build_ma_signal_message(res))
     else:
         await update.message.reply_text(f"{symbol} için şu an 1 saatlik MA7/MA25 temas-kesişim yok.")
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = RISK_GUARD.state
+    now = time.time()
+    halt_left = max(0.0, safe_float(st.get("halt_until", 0)) - now) / 3600
+    bl = st.get("blacklist_until", {})
+    bl_active = [f"{b} ({max(0.0,(safe_float(t)-now)/3600):.1f}sa)" for b, t in bl.items() if safe_float(t) > now]
+    cs = {k: v for k, v in st.get("consec_stops", {}).items() if int(v) > 0}
+    await update.message.reply_text(
+        f"🛡 RİSK YÖNETİCİSİ\n"
+        f"Gün: {st.get('day_key','-')}\n"
+        f"Günlük P&L (paper): %{safe_float(st.get('daily_pnl_pct',0)):.2f} / eşik -%{RISK_DAILY_DD_PCT:.1f}\n"
+        f"Durdurma: {'AKTİF ('+format(halt_left,'.1f')+'sa)' if halt_left>0 else 'yok'}\n"
+        f"Ardışık stop sayaçları: {cs or 'temiz'}\n"
+        f"Blacklist: {', '.join(bl_active) if bl_active else 'yok'}\n"
+        f"Korelasyon kilidi: grup başına max {RISK_MAX_OPEN_PER_GROUP} açık aynı yön\n"
+        f"Ayar: 3 ardışık stop→{RISK_BLACKLIST_HOURS:.0f}sa blacklist | günlük DD→{RISK_HALT_HOURS:.0f}sa dur"
+    )
+
+
+async def cmd_hibrit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Kullanım: /hibrit BTCUSDT")
+        return
+    symbol = normalize_symbol(context.args[0])
+    res = await analyze_hybrid_symbol(symbol)
+    if res:
+        await update.message.reply_text(build_hybrid_message(res))
+    else:
+        await update.message.reply_text(
+            f"{symbol}: şu an hibrit sinyal yok.\n"
+            f"(1H tetik + 4H {HYBRID_TREND_EMA} EMA trend + 15m/5m momentum koşullarından biri sağlanmıyor.)"
+        )
+
 
 async def cmd_ma_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ma_perf = ma_performance_summary()
@@ -3195,6 +3412,8 @@ def build_app():
     application.add_handler(CommandHandler("coin", cmd_coin))
     application.add_handler(CommandHandler("hot", cmd_hot))
     application.add_handler(CommandHandler("ma", cmd_ma))
+    application.add_handler(CommandHandler("hibrit", cmd_hibrit))
+    application.add_handler(CommandHandler("risk", cmd_risk))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
     application.add_handler(CommandHandler("whale", cmd_whale))
     application.add_handler(CommandHandler("funding", cmd_funding))
@@ -3203,6 +3422,8 @@ def build_app():
 def main() -> None:
     validate_config()
     load_memory()
+    # RiskGuard durumunu memory'ye bağla → deploy/restart arası kalıcı
+    RISK_GUARD.state = memory.setdefault("risk_guard", RISK_GUARD.state)
     global app
     app = build_app()
     logger.info("%s polling başlıyor", VERSION_NAME)
