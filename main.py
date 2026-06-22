@@ -96,7 +96,7 @@ DEFAULT_MARGIN_USDT = float(os.getenv("DEFAULT_MARGIN_USDT", "100"))
 WHALE_EYE_ENABLED = os.getenv("WHALE_EYE_ENABLED", "true").lower() == "true"
 FUNDING_EYE_ENABLED = os.getenv("FUNDING_EYE_ENABLED", "true").lower() == "true"
 
-WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "20")))
+WHALE_OI_LOOKBACK_MIN = int(float(os.getenv("WHALE_OI_LOOKBACK_MIN", "45")))
 WHALE_OI_CACHE_SEC = int(float(os.getenv("WHALE_OI_CACHE_SEC", "30")))
 WHALE_OI_HISTORY_MAX = int(float(os.getenv("WHALE_OI_HISTORY_MAX", "180")))
 WHALE_OI_BEARISH_DROP_PCT = float(os.getenv("WHALE_OI_BEARISH_DROP_PCT", "-1.5"))
@@ -136,6 +136,26 @@ RISK_HALT_HOURS = float(os.getenv("RISK_HALT_HOURS", "24"))          # eşik aş
 RISK_MAX_CONSEC_STOPS = int(float(os.getenv("RISK_MAX_CONSEC_STOPS", "3")))
 RISK_BLACKLIST_HOURS = float(os.getenv("RISK_BLACKLIST_HOURS", "48"))
 RISK_MAX_OPEN_PER_GROUP = int(float(os.getenv("RISK_MAX_OPEN_PER_GROUP", "1")))  # korelasyon kilidi
+
+# === BTC REJİM BIAS + GUARD (bugünkü short kanamasının ilacı) ==============
+# Hibrit motor skor-bazlı DEĞİL (ikili geçit), o yüzden "+puan" yerine
+# rejime göre GEÇİT/BLOK uygulanır. Mantık simetriktir: BTC yukarı→short blok,
+# BTC aşağı→long sıkı. Böylece statik long-bias (1500 trade'in çürüttüğü hata) eklenmez.
+BTC_BIAS_ENABLED = os.getenv("BTC_BIAS_ENABLED", "true").lower() == "true"
+BTC_BIAS_SYMBOL = os.getenv("BTC_BIAS_SYMBOL", "BTC-USDT-SWAP").strip()
+BTC_BIAS_STRONG_GAP_PCT = float(os.getenv("BTC_BIAS_STRONG_GAP_PCT", "1.5"))  # 4H EMA'dan bu kadar uzak=güçlü
+BTC_BIAS_CACHE_SEC = float(os.getenv("BTC_BIAS_CACHE_SEC", "90"))
+# SHORT guard
+SHORT_BLOCK_WHEN_BTC_UP = os.getenv("SHORT_BLOCK_WHEN_BTC_UP", "true").lower() == "true"
+SHORT_EXTREME_OVERRIDE = os.getenv("SHORT_EXTREME_OVERRIDE", "true").lower() == "true"   # whale div+funding ikisi varsa BTC yukarıda bile geç
+SHORT_REQUIRE_INSTITUTIONAL = os.getenv("SHORT_REQUIRE_INSTITUTIONAL", "true").lower() == "true"  # short için en az 1 kurumsal teyit
+# LONG guard (BTC düşüşte sıkılaştır)
+LONG_BLOCK_WHEN_BTC_DOWN = os.getenv("LONG_BLOCK_WHEN_BTC_DOWN", "true").lower() == "true"
+LONG_EXTREME_OVERRIDE = os.getenv("LONG_EXTREME_OVERRIDE", "true").lower() == "true"
+# Volatilite guard
+VOL_GUARD_ENABLED = os.getenv("VOL_GUARD_ENABLED", "true").lower() == "true"
+BTC_ATR_HIGH_PCT = float(os.getenv("BTC_ATR_HIGH_PCT", "2.5"))        # BTC 1H ATR% bu üstü = yüksek vol
+VOL_GUARD_RISK_MULT = float(os.getenv("VOL_GUARD_RISK_MULT", "0.5"))  # yüksek volatilitede risk çarpanı
 
 def calc_leveraged_stop_pct(base_pct: float) -> float:
     return max(MIN_STOP_PCT, min(MAX_STOP_PCT, base_pct))
@@ -1793,6 +1813,86 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
     }
 
 
+_BTC_BIAS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+async def get_btc_trend_bias() -> Dict[str, Any]:
+    """BTC 4H trend + güç + 1H ATR%'i hesaplar (cache'li). Tüm sinyaller için tek kaynak."""
+    now = time.time()
+    cached = _BTC_BIAS_CACHE.get("data")
+    if cached is not None and (now - _BTC_BIAS_CACHE.get("ts", 0)) < BTC_BIAS_CACHE_SEC:
+        return cached
+    bias = {"trend": "FLAT", "strong": False, "gap_pct": 0.0, "atr_pct": 0.0, "ok": False}
+    try:
+        k4h = await get_klines(BTC_BIAS_SYMBOL, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
+        if len(k4h) >= 20:
+            trend, _strong = trend_4h(k4h, HYBRID_TREND_EMA)
+            closed = _s_closed(k4h)
+            c = _s_closes(closed)
+            eff = HYBRID_TREND_EMA if len(c) >= HYBRID_TREND_EMA else max(20, len(c) // 2)
+            line = s_ema(c, eff)[-1]
+            price = c[-1]
+            gap_pct = ((price - line) / line * 100.0) if line > 0 else 0.0
+            strong = abs(gap_pct) >= BTC_BIAS_STRONG_GAP_PCT
+            k1h = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, 60)
+            atr_pct = 0.0
+            if len(k1h) >= 16:
+                cc = _s_closed(k1h)
+                p = _s_closes(cc)[-1]
+                atr_pct = (s_atr(cc, 14) / p * 100.0) if p > 0 else 0.0
+            bias = {"trend": trend, "strong": strong, "gap_pct": round(gap_pct, 2),
+                    "atr_pct": round(atr_pct, 2), "ok": True}
+    except Exception as e:
+        logger.warning("BTC bias hesaplama hata: %s", e)
+    _BTC_BIAS_CACHE["data"] = bias
+    _BTC_BIAS_CACHE["ts"] = now
+    return bias
+
+
+def dynamic_risk_pct(btc_bias: Dict[str, Any]) -> float:
+    """Volatilite guard: BTC 1H ATR% yüksekse risk%'i düşür."""
+    base = HYBRID_RISK_PCT
+    if VOL_GUARD_ENABLED and btc_bias.get("atr_pct", 0) >= BTC_ATR_HIGH_PCT:
+        return round(base * VOL_GUARD_RISK_MULT, 4)
+    return base
+
+
+def btc_regime_gate(res: Dict[str, Any], btc_bias: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    BTC rejimine göre sinyali geçir/blokla (saf, test edilebilir).
+    - SHORT: en az 1 kurumsal teyit (whale div veya funding) zorunlu; BTC yukarıdaysa
+      blok (sadece whale+funding ikisi birden varsa ekstrem geçiş).
+    - LONG: BTC aşağıdaysa blok (whale veya funding varsa ekstrem geçiş).
+    Hibrit skorsuz olduğu için "+puan/-ceza" yerine simetrik geçit uygulanır.
+    """
+    if not BTC_BIAS_ENABLED or not btc_bias.get("ok"):
+        return True, "BTC bias kapalı/yok"
+    direction = res.get("direction", "")
+    trend = btc_bias.get("trend", "FLAT")
+    strong = btc_bias.get("strong", False)
+    whale = safe_float(res.get("institutional_oi_bonus", 0)) > 0      # bearish/bullish divergence
+    funding = safe_float(res.get("institutional_funding_bonus", 0)) > 0
+    s = "güçlü " if strong else ""
+
+    if direction == "SHORT":
+        if SHORT_REQUIRE_INSTITUTIONAL and not (whale or funding):
+            return False, "SHORT bloklandı: kurumsal teyit yok (whale div / funding)"
+        if trend == "UP" and SHORT_BLOCK_WHEN_BTC_UP:
+            if SHORT_EXTREME_OVERRIDE and whale and funding:
+                return True, f"BTC 4H {s}YUKARI ama ekstrem SHORT teyidi (whale+funding) → geçildi"
+            return False, f"SHORT bloklandı: BTC 4H {s}YUKARI (gap %{btc_bias.get('gap_pct',0):+.2f})"
+        return True, f"SHORT ok: BTC {trend}"
+
+    if direction == "LONG":
+        if trend == "DOWN" and LONG_BLOCK_WHEN_BTC_DOWN:
+            if LONG_EXTREME_OVERRIDE and (whale or funding):
+                return True, f"BTC 4H {s}AŞAĞI ama LONG teyidi var → geçildi"
+            return False, f"LONG bloklandı: BTC 4H {s}AŞAĞI (gap %{btc_bias.get('gap_pct',0):+.2f})"
+        return True, f"LONG ok: BTC {trend}"
+
+    return True, "yön bilinmiyor"
+
+
 def sma(values: List[float], period: int) -> List[float]:
     out: List[float] = []
     for i in range(len(values)):
@@ -2184,12 +2284,16 @@ async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     k5 = await get_klines(symbol, "5m", 60)
     if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
         return None
-    return build_hybrid_signal(
+    btc_bias = await get_btc_trend_bias()
+    res = build_hybrid_signal(
         symbol, k1h, k4h, k15, k5,
-        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
         leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
         require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
     )
+    if res:
+        res["btc_bias"] = btc_bias
+    return res
 
 
 def build_hybrid_message(res: Dict[str, Any]) -> str:
@@ -2211,6 +2315,8 @@ def build_hybrid_message(res: Dict[str, Any]) -> str:
         f"Coin: {res['symbol']}\n"
         f"Mantık: 1H MA tetik + 4H {HYBRID_TREND_EMA} EMA trend + 15m/5m momentum\n"
         f"Onay: {res.get('mtf_note','-')}\n"
+        f"BTC rejim: {(res.get('btc_bias') or {}).get('trend','-')} "
+        f"(gap %{safe_float((res.get('btc_bias') or {}).get('gap_pct',0)):+.2f}, ATR %{safe_float((res.get('btc_bias') or {}).get('atr_pct',0)):.2f}) | {res.get('regime_note','-')}\n"
         f"{inst}"
         f"---\n"
         f"Entry: {fmt_num(res['entry'])}\n"
@@ -2244,6 +2350,13 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
         res = await enrich_ma_with_institutional(res)
     except Exception as e:
         logger.warning("HİBRİT institutional enrichment hata %s %s: %s", symbol, direction, e)
+    # BTC rejim geçidi (enrichment'tan SONRA — whale div + funding burada hazır)
+    btc_bias = res.get("btc_bias") or await get_btc_trend_bias()
+    allow_regime, regime_reason = btc_regime_gate(res, btc_bias)
+    if not allow_regime:
+        logger.info("HİBRİT rejim bloğu %s %s: %s", symbol, direction, regime_reason)
+        return
+    res["regime_note"] = regime_reason
     try:
         msg = build_hybrid_message(res)
     except Exception as e:
@@ -3184,8 +3297,13 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bl = st.get("blacklist_until", {})
     bl_active = [f"{b} ({max(0.0,(safe_float(t)-now)/3600):.1f}sa)" for b, t in bl.items() if safe_float(t) > now]
     cs = {k: v for k, v in st.get("consec_stops", {}).items() if int(v) > 0}
+    bb = _BTC_BIAS_CACHE.get("data") or {}
+    btc_line = (f"BTC rejim: {bb.get('trend','-')}{' (güçlü)' if bb.get('strong') else ''} "
+                f"| gap %{safe_float(bb.get('gap_pct',0)):+.2f} | 1H ATR %{safe_float(bb.get('atr_pct',0)):.2f}\n"
+                if bb else "BTC rejim: henüz hesaplanmadı\n")
     await update.message.reply_text(
         f"🛡 RİSK YÖNETİCİSİ\n"
+        f"{btc_line}"
         f"Gün: {st.get('day_key','-')}\n"
         f"Günlük P&L (paper): %{safe_float(st.get('daily_pnl_pct',0)):.2f} / eşik -%{RISK_DAILY_DD_PCT:.1f}\n"
         f"Durdurma: {'AKTİF ('+format(halt_left,'.1f')+'sa)' if halt_left>0 else 'yok'}\n"
