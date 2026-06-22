@@ -4,6 +4,7 @@ import time
 import copy
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -31,6 +32,9 @@ HARD_BINANCE_OKX_PRICE_GAP_PCT = float(os.getenv("HARD_BINANCE_OKX_PRICE_GAP_PCT
 
 MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_avcisi_v527_hibrit_onayli_memory.json").strip()
 LOG_FILE = os.getenv("LOG_FILE", "balina_avcisi_v527_hibrit_onayli.log").strip()
+LOG_MAX_MB = float(os.getenv("LOG_MAX_MB", "10"))      # log dosyası bu boyuta ulaşınca döner
+LOG_BACKUPS = int(float(os.getenv("LOG_BACKUPS", "3")))  # kaç eski log dosyası saklansın
+MA_RECORD_TTL_DAYS = float(os.getenv("MA_RECORD_TTL_DAYS", "3"))  # ma_signals/ma_follows kayıt ömrü (leak önleme)
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", "Europe/Istanbul").strip()
 
 AUTO_START_MESSAGE = os.getenv("AUTO_START_MESSAGE", "true").lower() == "true"
@@ -214,11 +218,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(LOG_FILE, maxBytes=int(LOG_MAX_MB * 1024 * 1024),
+                            backupCount=LOG_BACKUPS, encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("balina_avcisi_v527_hibrit_onayli")
+logger = logging.getLogger("balina_avcisi")
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 SESSION = requests.Session()
@@ -366,12 +371,11 @@ def load_memory() -> None:
     else:
         ensure_memory_shape()
 
-def save_memory() -> None:
+def _write_memory_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Hazır snapshot'ı dosyaya yazar (deepcopy YOK — çağıran atomik snapshot verir)."""
     last_err = None
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            ensure_memory_shape()
-            snapshot = copy.deepcopy(memory)
             tmp_path = MEMORY_FILE + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
@@ -381,13 +385,29 @@ def save_memory() -> None:
             last_err = e
             time.sleep(0.05)
         except Exception as e:
-            logger.exception("Memory kaydedilemedi: %s", e)
+            logger.exception("Memory yazılamadı: %s", e)
             return
-    logger.warning("Memory snapshot 3 denemede de başarısız: %s", last_err)
+    logger.warning("Memory yazma 3 denemede başarısız: %s", last_err)
+
+
+def save_memory() -> None:
+    """Senkron yol (shutdown vb.). Snapshot'ı burada alır."""
+    try:
+        ensure_memory_shape()
+        snapshot = copy.deepcopy(memory)
+    except Exception as e:
+        logger.exception("Memory snapshot alınamadı: %s", e)
+        return
+    _write_memory_snapshot(snapshot)
+
 
 async def save_memory_async() -> None:
+    # Snapshot event loop içinde alınır (await yok → diğer coroutine'ler araya giremez,
+    # böylece deepcopy ile worker-thread yazımı arasındaki race ortadan kalkar).
     async with memory_lock:
-        await asyncio.to_thread(save_memory)
+        ensure_memory_shape()
+        snapshot = copy.deepcopy(memory)
+    await asyncio.to_thread(_write_memory_snapshot, snapshot)
 
 def cleanup_symbol_fail_state() -> None:
     now_ts = time.time()
@@ -425,6 +445,20 @@ def cleanup_memory() -> None:
                     daily_short_sent.pop(day_key, None)
             except Exception:
                 daily_short_sent.pop(day_key, None)
+
+    # MA/hibrit kayıtları (leak önleme): dedup ve takip kayıtlarını buda
+    ma_ttl = MA_RECORD_TTL_DAYS * 24 * 3600
+    ma_signals = memory.get("ma_signals", {})
+    for k in list(ma_signals.keys()):
+        if now_ts - safe_float(ma_signals[k].get("ts", 0)) > ma_ttl:
+            ma_signals.pop(k, None)
+    ma_follows = memory.get("ma_follows", {})
+    for k in list(ma_follows.keys()):
+        rec = ma_follows[k]
+        age = now_ts - safe_float(rec.get("sent_ts", 0))
+        # çözülmüş (done) takipleri 6 saat sonra, çözülmemişleri TTL sonunda at
+        if (rec.get("done") and age > 6 * 3600) or age > ma_ttl:
+            ma_follows.pop(k, None)
 
     cleanup_symbol_fail_state()
     cleanup_whale_funding_state()
@@ -2385,7 +2419,96 @@ BT_FUTURE_BARS = int(float(os.getenv("BT_FUTURE_BARS", "10")))
 BT_FUNDING_PCT_8H = float(os.getenv("BT_FUNDING_PCT_8H", "0.0001"))  # ortalama funding maliyeti/8h (modellenmiş)
 BT_CSV_EXPORT = os.getenv("BT_CSV_EXPORT", "true").lower() == "true"
 BT_OOS_SPLIT = float(os.getenv("BT_OOS_SPLIT", "0.7"))               # in-sample oranı (kalan out-of-sample)
+BT_MAX_BARS = int(float(os.getenv("BT_MAX_BARS", "6000")))           # paginasyon üst sınırı (~250 gün 1H)
+BT_MAX_PAGES = int(float(os.getenv("BT_MAX_PAGES", "80")))           # backtest başına max OKX sayfa isteği/coin
+BT_PAGE_SLEEP = float(os.getenv("BT_PAGE_SLEEP", "0.12"))            # sayfa istekleri arası bekleme (rate-limit)
+BT_REAL_FUNDING = os.getenv("BT_REAL_FUNDING", "true").lower() == "true"  # gerçek funding geçmişi (kapalıysa sabit model)
 _BACKTEST_RUNNING = False
+
+
+def _bt_assemble_klines(raw_rows: List[List[Any]], total_needed: int) -> List[List[Any]]:
+    """Ham OKX satırlarını (sıra/dup farketmez) ts'e göre ascending, dedup'lı, son N mum olarak döndür."""
+    seen: Dict[int, List[Any]] = {}
+    for r in raw_rows:
+        try:
+            seen[int(r[0])] = r
+        except (ValueError, TypeError, IndexError):
+            continue
+    ordered = [seen[t] for t in sorted(seen.keys())]
+    mapped = [_okx_to_kline(r) for r in ordered]
+    if total_needed and len(mapped) > total_needed:
+        return mapped[-total_needed:]
+    return mapped
+
+
+async def get_klines_paginated(symbol: str, interval: str, total_needed: int) -> List[List[Any]]:
+    """OKX history-candles ile çok sayıda mum çek (300 limitini aşar). Ascending döner."""
+    symbol = normalize_symbol(symbol)
+    total_needed = max(1, int(total_needed))
+    if total_needed <= 300:
+        return await get_klines(symbol, interval, total_needed)  # cache'li hızlı yol
+    raw: List[List[Any]] = []
+    after: Optional[int] = None
+    pages = 0
+    while len(raw) < total_needed and pages < BT_MAX_PAGES:
+        params: Dict[str, Any] = {"instId": symbol, "bar": interval, "limit": "100"}
+        if after is not None:
+            params["after"] = str(after)
+        try:
+            data = await asyncio.to_thread(_okx_get, "/api/v5/market/history-candles", params)
+        except Exception as e:
+            logger.warning("paginated kline hata %s %s: %s", symbol, interval, e)
+            break
+        if not data:
+            break
+        raw.extend(data)
+        try:
+            after = int(data[-1][0])  # OKX newest-first → son eleman en eski; bir sonraki sayfa daha eski
+        except (ValueError, TypeError, IndexError):
+            break
+        pages += 1
+        if len(data) < 100:
+            break
+        await asyncio.sleep(BT_PAGE_SLEEP)
+    return _bt_assemble_klines(raw, total_needed)
+
+
+async def _bt_funding_history(symbol: str, since_ts: int) -> List[Any]:
+    """OKX funding-rate-history → since_ts'i kapsayana kadar [(fundingTime_sec, rate)] (ascending)."""
+    symbol = normalize_symbol(symbol)
+    out: List[Any] = []
+    after: Optional[int] = None
+    pages = 0
+    while pages < BT_MAX_PAGES:
+        params: Dict[str, Any] = {"instId": symbol, "limit": "100"}
+        if after is not None:
+            params["after"] = str(after)
+        try:
+            data = await asyncio.to_thread(_okx_get, "/api/v5/public/funding-rate-history", params)
+        except Exception as e:
+            logger.warning("funding history hata %s: %s", symbol, e)
+            break
+        if not data:
+            break
+        oldest_ms = None
+        for row in data:
+            ft_ms = int(safe_float(row.get("fundingTime", 0)))
+            out.append((ft_ms // 1000, safe_float(row.get("fundingRate", 0))))
+            oldest_ms = ft_ms if oldest_ms is None else min(oldest_ms, ft_ms)
+        pages += 1
+        if oldest_ms is None or (oldest_ms // 1000) <= since_ts or len(data) < 100:
+            break
+        after = oldest_ms
+        await asyncio.sleep(BT_PAGE_SLEEP)
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _bt_funding_cost(funding_sorted: List[Any], entry_ts: int, exit_ts: int, direction: str) -> float:
+    """(entry, exit] arasında settle olan funding'lerin imzalı toplam maliyeti (notional kesri).
+    LONG pozitif funding'i ÖDER (maliyet +), SHORT ALIR (maliyet -). Negatif = funding geliri."""
+    total = sum(rate for (ft, rate) in funding_sorted if entry_ts < ft <= exit_ts)
+    return total if direction == "LONG" else -total
 
 
 def _bt_resample(klines: List[List[Any]], factor: int) -> List[List[Any]]:
@@ -2407,7 +2530,7 @@ def _bt_resample(klines: List[List[Any]], factor: int) -> List[List[Any]]:
 async def _bt_btc_trend_series(bars_1h: int) -> List[Any]:
     """BTC 1H geçmişini çekip 4H'e resample eder, mum başına (ts, trend) listesi döner."""
     try:
-        k = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, min(bars_1h, 300))
+        k = await get_klines_paginated(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, bars_1h)
         k4 = _bt_resample(k, 4)
         c = _s_closes(k4)
         if len(c) < 20:
@@ -2595,12 +2718,12 @@ async def _bt_send_csv(csv_str: str, filename: str) -> bool:
         return False
 
 
-async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 12) -> str:
+async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 30) -> str:
     if not symbols:
         symbols = list(COINS)[:8] if COINS else [
             "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "FET-USDT-SWAP"]
-    bars_1h = min(days * 24 + 80, 300)
+    bars_1h = min(days * 24 + 80, BT_MAX_BARS)
     btc_series = await _bt_btc_trend_series(bars_1h) if BTC_BIAS_ENABLED else []
 
     trades: List[Dict[str, Any]] = []
@@ -2612,11 +2735,12 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 1
 
     for symbol in symbols[:12]:
         try:
-            k1h = await get_klines(symbol, MA_KLINE_INTERVAL, bars_1h)
+            k1h = await get_klines_paginated(symbol, MA_KLINE_INTERVAL, bars_1h)
             if len(k1h) < 60:
                 continue
             tested += 1
             actual_days = max(actual_days, len(k1h) / 24.0)
+            fhist = await _bt_funding_history(symbol, int(safe_float(k1h[0][0]))) if BT_REAL_FUNDING else []
             # 24s quote hacmi (son 24 mum) → dinamik slippage
             last24 = k1h[-24:] if len(k1h) >= 24 else k1h
             quote_vol_24h = sum(safe_float(r[5]) * safe_float(r[4]) for r in last24)
@@ -2658,8 +2782,12 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 1
                     continue
                 gross_move = (exitp - entry) if direction == "LONG" else (entry - exitp)
                 r_gross = gross_move / risk_unit
-                fund_frac = (trade["bars"] // 8) * BT_FUNDING_PCT_8H
-                cost_r = ((slip_frac + fee_frac + fund_frac) * entry) / risk_unit
+                exit_ts = entry_ts + trade["bars"] * 3600
+                if fhist:
+                    fund_signed = _bt_funding_cost(fhist, entry_ts, exit_ts, direction)  # imzalı (gelir negatif)
+                else:
+                    fund_signed = (trade["bars"] // 8) * BT_FUNDING_PCT_8H  # sabit model (maliyet)
+                cost_r = ((slip_frac + fee_frac) * entry + fund_signed * entry) / risk_unit
                 net_r = round(r_gross - cost_r, 4)
                 trades.append({
                     "ts": entry_ts, "symbol": symbol, "direction": direction,
@@ -2718,9 +2846,10 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 1
         f"{overfit_flag}"
         f"Üretilen sinyal: {signals} | BTC yön bloğu: {btc_blocked}\n"
         f"━━ MODEL ━━\n"
-        f"Dinamik slippage (hacme göre %0.05–0.40) + fee %{BT_FEE_PCT*100:.3f}×2 + funding ~%{BT_FUNDING_PCT_8H*100:.3f}/8h dahil.\n"
+        f"Dinamik slippage (hacme göre %0.05–0.40) + fee %{BT_FEE_PCT*100:.3f}×2 + "
+        f"{'GERÇEK funding geçmişi (imzalı; short geliri dahil)' if BT_REAL_FUNDING else 'sabit funding modeli'} dahil.\n"
         f"⚠️ 4H trend 1H'tan resample; 15m/5m momentum 1H'la yaklaşık; BTC rejimde yalnız yön bloğu. "
-        f"Pencere 300 mum limitiyle ~12 gün. R'ler sabit risk birimine göre; bakiye compound."
+        f"Pencere paginasyonla (max {BT_MAX_BARS} mum ≈ {BT_MAX_BARS//24} gün). R'ler sabit risk birimine göre; bakiye compound."
     )
 
 
@@ -3660,12 +3789,12 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _BACKTEST_RUNNING:
         await update.message.reply_text("⏳ Zaten bir backtest çalışıyor. Bitmesini bekle.")
         return
-    days = 12
+    days = 30
     symbols: Optional[List[str]] = None
     args = context.args or []
     if args:
         try:
-            days = max(2, min(12, int(float(args[0]))))
+            days = max(2, min(365, int(float(args[0]))))
         except (ValueError, TypeError):
             pass
     if len(args) >= 2:
