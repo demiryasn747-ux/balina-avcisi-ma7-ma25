@@ -134,6 +134,22 @@ HYBRID_LIQ_GUARD_ENABLED = os.getenv("HYBRID_LIQ_GUARD_ENABLED", "true").lower()
 HYBRID_MAINT_MARGIN_PCT = float(os.getenv("HYBRID_MAINT_MARGIN_PCT", "0.005"))  # likidasyon tamponu
 HYBRID_LIQ_SAFETY = float(os.getenv("HYBRID_LIQ_SAFETY", "0.6"))                # stop, likidasyon mesafesinin en fazla bu kadarı olabilir
 
+# === SİNYAL MOTORU SEÇİMİ =================================================
+# "ma"    : MA7/MA25 kesişimi + MTF (eski; veriyle kaybettiği kanıtlandı)
+# "sweep" : Likidite sweep / stop avı dönüşü (yeni gerçek edge)
+SIGNAL_ENGINE = os.getenv("SIGNAL_ENGINE", "ma").strip().lower()
+# --- Likidite Sweep motoru ---
+SWEEP_LOOKBACK = int(float(os.getenv("SWEEP_LOOKBACK", "20")))                 # swing seviye penceresi
+SWEEP_STOP_BUFFER_PCT = float(os.getenv("SWEEP_STOP_BUFFER_PCT", "0.15"))      # stop, sweep fitilinin bu kadar ötesinde
+SWEEP_MIN_WICK_PCT = float(os.getenv("SWEEP_MIN_WICK_PCT", "0.20"))            # sweep mumunun min fitil oranı (kalite)
+SWEEP_USE_TREND_FILTER = os.getenv("SWEEP_USE_TREND_FILTER", "false").lower() == "true"  # 4H trend yönüne zorla
+# --- Sabit % hedef modu (her iki motorda; kapalıysa RR bazlı) ---
+HYBRID_FIXED_TARGETS = os.getenv("HYBRID_FIXED_TARGETS", "false").lower() == "true"
+HYBRID_FIXED_STOP_PCT = float(os.getenv("HYBRID_FIXED_STOP_PCT", "1.4"))
+HYBRID_FIXED_TP1_PCT = float(os.getenv("HYBRID_FIXED_TP1_PCT", "4"))
+HYBRID_FIXED_TP2_PCT = float(os.getenv("HYBRID_FIXED_TP2_PCT", "6"))
+HYBRID_FIXED_TP3_PCT = float(os.getenv("HYBRID_FIXED_TP3_PCT", "8"))
+
 # === RİSK YÖNETİCİSİ =======================================================
 RISK_DAILY_DD_PCT = float(os.getenv("RISK_DAILY_DD_PCT", "5"))        # günlük drawdown eşiği
 RISK_HALT_HOURS = float(os.getenv("RISK_HALT_HOURS", "24"))          # eşik aşılınca kaç saat dur
@@ -193,7 +209,7 @@ def check_stop_vs_liquidation(entry: float, stop: float, direction: str) -> Tupl
 
 MA_FOLLOWUP_INTERVAL_SEC = int(float(os.getenv("MA_FOLLOWUP_INTERVAL_SEC", "60")))
 DYNAMIC_TOP_200_COIN_POOL = os.getenv("DYNAMIC_TOP_200_COIN_POOL", "true").lower() == "true"
-ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "true").lower() == "true"
+ORIGINAL_V527_ENGINE_ENABLED = os.getenv("ORIGINAL_V527_ENGINE_ENABLED", "false").lower() == "true"
 RAW_COINS_ENV = os.getenv("COINS", "").strip()
 
 DEFAULT_COINS = [
@@ -1800,6 +1816,105 @@ RISK_GUARD = RiskGuard(
 )
 
 
+def detect_liquidity_sweep(klines_1h: List[List[Any]], lookback: int = 20,
+                           min_wick_pct: float = 0.20) -> Tuple[Optional[str], float]:
+    """
+    Likidite sweep / stop avı dönüşü (kapanmış mumda).
+    LONG: son mum, önceki swing low'un ALTINA sarkıp (stop avı) üstüne KAPANIR + belirgin alt fitil.
+    SHORT: swing high'ın ÜSTÜNE çıkıp altına kapanır + belirgin üst fitil.
+    (yön, süpürülen_seviye) döner.
+    """
+    closed = _s_closed(klines_1h)
+    if len(closed) < lookback + 2:
+        return None, 0.0
+    window = closed[-(lookback + 1):-1]   # tetik mumdan önceki pencere
+    trig = closed[-1]
+    swing_low = min(safe_float(b[3]) for b in window)
+    swing_high = max(safe_float(b[2]) for b in window)
+    o = safe_float(trig[1]); h = safe_float(trig[2]); l = safe_float(trig[3]); c = safe_float(trig[4])
+    rng = h - l
+    if rng <= 0:
+        return None, 0.0
+    # Boğa sweep: swing low süpürüldü ama üstüne kapanış
+    if l < swing_low and c > swing_low:
+        lower_wick = min(o, c) - l
+        if lower_wick / rng >= min_wick_pct:
+            return "LONG", swing_low
+    # Ayı sweep: swing high süpürüldü ama altına kapanış
+    if h > swing_high and c < swing_high:
+        upper_wick = h - max(o, c)
+        if upper_wick / rng >= min_wick_pct:
+            return "SHORT", swing_high
+    return None, 0.0
+
+
+def _targets_for(entry: float, stop: float, side: str) -> Dict[str, float]:
+    """Ortak TP hesabı: sabit % modu açıksa yüzde, değilse RR bazlı (1/2.5/4R)."""
+    if HYBRID_FIXED_TARGETS:
+        def ft(p):
+            return entry * (1 + p / 100.0) if side == "LONG" else entry * (1 - p / 100.0)
+        sp = HYBRID_FIXED_STOP_PCT if HYBRID_FIXED_STOP_PCT > 0 else 1.0
+        return {
+            "tp1": ft(HYBRID_FIXED_TP1_PCT), "tp1_rr": round(HYBRID_FIXED_TP1_PCT / sp, 2),
+            "tp2": ft(HYBRID_FIXED_TP2_PCT), "tp2_rr": round(HYBRID_FIXED_TP2_PCT / sp, 2),
+            "tp3": ft(HYBRID_FIXED_TP3_PCT), "tp3_rr": round(HYBRID_FIXED_TP3_PCT / sp, 2),
+            "risk_per_unit": abs(entry - stop),
+        }
+    return rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0))
+
+
+def build_sweep_signal(symbol, klines_1h, klines_4h,
+                       balance_usdt=1000.0, risk_pct=1.5, leverage=1.0,
+                       lookback=20) -> Optional[Dict[str, Any]]:
+    """Likidite sweep sinyali: yapısal stop (sweep fitilinin ötesi) + RR/sabit TP + liq guard + sizing."""
+    side, level = detect_liquidity_sweep(klines_1h, lookback, SWEEP_MIN_WICK_PCT)
+    if side is None:
+        return None
+    if SWEEP_USE_TREND_FILTER:
+        direction, _strong = trend_4h(klines_4h, HYBRID_TREND_EMA)
+        if side == "LONG" and direction != "UP":
+            return None
+        if side == "SHORT" and direction != "DOWN":
+            return None
+    closed = _s_closed(klines_1h)
+    trig = closed[-1]
+    entry = safe_float(trig[4])
+    if entry <= 0:
+        return None
+    candle_ts = str(trig[0])
+    # Stop: sabit % açıksa yüzde, değilse sweep fitilinin ötesi (yapısal invalidasyon)
+    if HYBRID_FIXED_TARGETS:
+        sp = HYBRID_FIXED_STOP_PCT / 100.0
+        stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
+    else:
+        buf = SWEEP_STOP_BUFFER_PCT / 100.0
+        stop = safe_float(trig[3]) * (1 - buf) if side == "LONG" else safe_float(trig[2]) * (1 + buf)
+    stop_pct = round(abs(entry - stop) / entry * 100.0, 3) if entry > 0 else 0.0
+
+    liq_frac = max(0.0005, (1.0 / leverage) - HYBRID_MAINT_MARGIN_PCT) if leverage > 0 else 1.0
+    stop_frac = abs(entry - stop) / entry if entry > 0 else 1.0
+    if HYBRID_LIQ_GUARD_ENABLED and stop_frac > liq_frac * HYBRID_LIQ_SAFETY:
+        return None
+    liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
+    stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
+
+    tps = _targets_for(entry, stop, side)
+    size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
+    return {
+        "symbol": symbol, "direction": side, "entry": entry,
+        "stop": stop, "stop_pct": stop_pct,
+        "tp1": tps["tp1"], "tp1_rr": tps["tp1_rr"],
+        "tp2": tps["tp2"], "tp2_rr": tps["tp2_rr"],
+        "tp3": tps["tp3"], "tp3_rr": tps["tp3_rr"],
+        "atr_1h": 0.0, "atr_mult": 0.0, "risk_per_unit": tps["risk_per_unit"],
+        "qty": size["qty"], "notional": size["notional"], "margin": size["margin"],
+        "risk_usdt": size["risk_usdt"], "leverage": leverage,
+        "liquidation_price": liq_price, "stop_to_liq_pct": round(stop_to_liq_pct, 2),
+        "candle_ts": candle_ts, "timeframe": "1H", "swept_level": level,
+        "mtf_note": f"Likidite sweep {side} @ {fmt_num(level)}", "strategy": "SWEEP",
+    }
+
+
 def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
                         balance_usdt=1000.0, risk_pct=1.5, leverage=1.0, atr_mult=1.5,
                         require_both_ltf=False, allow_weak_trend=True) -> Optional[Dict[str, Any]]:
@@ -1816,7 +1931,12 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
         return None
     candle_ts = str(closed_1h[-1][0])
     atr_1h = s_atr(closed_1h, 14)
-    stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+    if HYBRID_FIXED_TARGETS:
+        sp = HYBRID_FIXED_STOP_PCT / 100.0
+        stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
+        stop_pct = round(HYBRID_FIXED_STOP_PCT, 3)
+    else:
+        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
 
     # --- LİKİDASYON KORUMASI ---
     # Likidasyon mesafesi (izole, kabaca): 1/kaldıraç - bakım marjı.
@@ -1830,7 +1950,7 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
     liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
     stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
 
-    tps = rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0))
+    tps = _targets_for(entry, stop, side)
     size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
     return {
         "symbol": symbol, "direction": side, "entry": entry,
@@ -2306,25 +2426,34 @@ def current_open_ma_signals() -> List[Dict[str, str]]:
 
 
 async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    """Tek coin hibrit analiz. 1H tetik yoksa 4H/15m/5m çekmeden çıkar (rate-limit dostu)."""
+    """Tek coin analiz. SIGNAL_ENGINE'e göre MA-MTF ya da Likidite Sweep. Ön-filtre rate-limit dostu."""
     symbol = normalize_symbol(symbol)
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 120)
     if len(k1h) < 40:
         return None
-    if ma_cross_trigger(k1h) is None:  # ön-filtre: tetik yoksa fazladan istek yapma
-        return None
-    k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
-    k15 = await get_klines(symbol, "15m", 60)
-    k5 = await get_klines(symbol, "5m", 60)
-    if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
-        return None
     btc_bias = await get_btc_trend_bias()
-    res = build_hybrid_signal(
-        symbol, k1h, k4h, k15, k5,
-        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
-        leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
-        require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
-    )
+    if SIGNAL_ENGINE == "sweep":
+        if detect_liquidity_sweep(k1h, SWEEP_LOOKBACK, SWEEP_MIN_WICK_PCT)[0] is None:
+            return None  # ön-filtre: sweep yoksa fazladan istek yok
+        k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120)) if SWEEP_USE_TREND_FILTER else []
+        res = build_sweep_signal(
+            symbol, k1h, k4h, balance_usdt=HYBRID_BALANCE_USDT,
+            risk_pct=dynamic_risk_pct(btc_bias), leverage=HYBRID_LEVERAGE, lookback=SWEEP_LOOKBACK,
+        )
+    else:
+        if ma_cross_trigger(k1h) is None:  # ön-filtre: tetik yoksa fazladan istek yok
+            return None
+        k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
+        k15 = await get_klines(symbol, "15m", 60)
+        k5 = await get_klines(symbol, "5m", 60)
+        if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
+            return None
+        res = build_hybrid_signal(
+            symbol, k1h, k4h, k15, k5,
+            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
+            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+            require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
+        )
     if res:
         res["btc_bias"] = btc_bias
     return res
@@ -2752,15 +2881,21 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                 slice1h = k1h[max(0, i - 60):i + 3]
                 # look-ahead yok: yalnız entry_ts'ten ÖNCE tam kapanmış 4H mumlar (open+4h <= entry_ts)
                 k4h = [c for c in k4h_full if (int(c[0]) + 14400) <= entry_ts]
-                if len(k4h) < 20:
-                    continue  # 4H ısınması (ilk birkaç gün) — atla
                 try:
-                    res = build_hybrid_signal(
-                        symbol, slice1h, k4h, slice1h, slice1h,
-                        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
-                        leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
-                        require_both_ltf=HYBRID_REQUIRE_BOTH_LTF,
-                        allow_weak_trend=HYBRID_ALLOW_WEAK_TREND)
+                    if SIGNAL_ENGINE == "sweep":
+                        res = build_sweep_signal(
+                            symbol, slice1h, k4h,
+                            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+                            leverage=HYBRID_LEVERAGE, lookback=SWEEP_LOOKBACK)
+                    else:
+                        if len(k4h) < 20:
+                            continue  # MA motoru 4H trend ister; sweep istemez
+                        res = build_hybrid_signal(
+                            symbol, slice1h, k4h, slice1h, slice1h,
+                            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
+                            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+                            require_both_ltf=HYBRID_REQUIRE_BOTH_LTF,
+                            allow_weak_trend=HYBRID_ALLOW_WEAK_TREND)
                 except Exception:
                     continue
                 if not res:
@@ -2831,7 +2966,7 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
 
     pf = "∞" if M["profit_factor"] == float("inf") else f"{M['profit_factor']}"
     return (
-        f"🧪 HİBRİT BACKTEST v2\n"
+        f"🧪 BACKTEST v2 — Motor: {SIGNAL_ENGINE.upper()}{' (sabit %TP)' if HYBRID_FIXED_TARGETS else ''}\n"
         f"Coin: {tested} | Pencere: ~{actual_days:.1f}g (istenen {days}) | Kaldıraç: {HYBRID_LEVERAGE:.0f}x | Risk %{HYBRID_RISK_PCT}\n"
         f"━━ GENEL ━━\n"
         f"{M['n']} trade | %{M['winrate']} | beklenti {M['expectancy_r']:+.2f}R | PF {pf}\n"
