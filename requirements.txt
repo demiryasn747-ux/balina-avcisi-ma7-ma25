@@ -6,5 +6,4 @@ requests>=2.31.0,<3.0.0
 
 # zoneinfo (Python 3.9+ stdlib) minimal Linux imajlarında tz veritabanı bulamayabilir;
 # ZoneInfo("Europe/Istanbul") hatasını önlemek için tzdata şart:
-
 tzdata>=2024.1
