@@ -2745,10 +2745,15 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
             last24 = k1h[-24:] if len(k1h) >= 24 else k1h
             quote_vol_24h = sum(safe_float(r[5]) * safe_float(r[4]) for r in last24)
             slip_frac = _bt_dyn_slippage(quote_vol_24h)
+            k4h_full = _bt_resample(k1h, 4)  # 4H trendi tüm geçmişten (kısa pencere değil)
 
             for i in range(38, len(k1h) - (BT_FUTURE_BARS + 2)):
+                entry_ts = int(safe_float(k1h[i + 1][0]))
                 slice1h = k1h[max(0, i - 60):i + 3]
-                k4h = _bt_resample(slice1h, 4)
+                # look-ahead yok: yalnız entry_ts'ten ÖNCE tam kapanmış 4H mumlar (open+4h <= entry_ts)
+                k4h = [c for c in k4h_full if (int(c[0]) + 14400) <= entry_ts]
+                if len(k4h) < 20:
+                    continue  # 4H ısınması (ilk birkaç gün) — atla
                 try:
                     res = build_hybrid_signal(
                         symbol, slice1h, k4h, slice1h, slice1h,
@@ -2762,7 +2767,6 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                     continue
                 signals += 1
                 direction = res["direction"]
-                entry_ts = int(safe_float(k1h[i + 1][0]))
                 btc_tr = _bt_btc_trend_at(entry_ts, btc_series) if btc_series else "NA"
                 if btc_series and ((direction == "SHORT" and btc_tr == "UP") or
                                    (direction == "LONG" and btc_tr == "DOWN")):
