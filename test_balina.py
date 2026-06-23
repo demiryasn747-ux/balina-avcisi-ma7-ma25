@@ -35,6 +35,10 @@ def _load(names):
         "SHORT_EXTREME_OVERRIDE": True, "LONG_BLOCK_WHEN_BTC_DOWN": True, "LONG_EXTREME_OVERRIDE": True,
         "VOL_GUARD_ENABLED": True, "BTC_ATR_HIGH_PCT": 2.5, "VOL_GUARD_RISK_MULT": 0.5,
         "BT_FEE_PCT": 0.00045, "BT_SLIPPAGE_PCT": 0.0018,
+        "SWEEP_MIN_WICK_PCT": 0.20, "SWEEP_STOP_BUFFER_PCT": 0.15, "SWEEP_USE_TREND_FILTER": False,
+        "HYBRID_FIXED_TARGETS": False, "HYBRID_FIXED_STOP_PCT": 1.4,
+        "HYBRID_FIXED_TP1_PCT": 4.0, "HYBRID_FIXED_TP2_PCT": 6.0, "HYBRID_FIXED_TP3_PCT": 8.0,
+        "fmt_num": (lambda v: "%.4f" % float(v)),
     }
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
@@ -55,6 +59,7 @@ FN = _load([
     "_bt_regime_breakdown", "_bt_trades_to_csv",
     "_bt_resample", "bt_simulate_tp_stop", "bt_calc_pnl", "_bt_btc_trend_at",
     "_okx_to_kline", "_bt_assemble_klines", "_bt_funding_cost",
+    "detect_liquidity_sweep", "_targets_for", "build_sweep_signal",
 ])
 
 PASS = 0
@@ -179,6 +184,28 @@ ck("LONG funding (1000,2500]=0.015", abs(FN["_bt_funding_cost"](_fh, 1000, 2500,
 ck("SHORT funding aynı=-0.015 (gelir)", abs(FN["_bt_funding_cost"](_fh, 1000, 2500, "SHORT") + 0.015) < 1e-9)
 ck("funding entry_ts hariç (ft=1000 sayılmaz)", abs(FN["_bt_funding_cost"](_fh, 1000, 1500, "LONG") - 0.02) < 1e-9)
 ck("funding pencere dışı=0", FN["_bt_funding_cost"](_fh, 5000, 6000, "LONG") == 0)
+
+# ---- likidite sweep motoru + ortak hedef ----
+def _K(o, h, l, c): return [0, o, h, l, c, 1000.0]
+_form = _K(99, 100, 98, 99)  # _s_closed bunu (oluşan mum) atar
+_swL = [_K(100, 101, 95, 100) for _ in range(22)] + [_K(98, 99.5, 90, 99)] + [_form]
+ck("boğa sweep → LONG", FN["detect_liquidity_sweep"](_swL, 20, 0.2)[0] == "LONG")
+ck("süpürülen seviye ~95", abs(FN["detect_liquidity_sweep"](_swL, 20, 0.2)[1] - 95) < 1e-6)
+_swH = [_K(100, 105, 99, 100) for _ in range(22)] + [_K(102, 110, 101, 101)] + [_K(101, 102, 100, 101)]
+ck("ayı sweep → SHORT", FN["detect_liquidity_sweep"](_swH, 20, 0.2)[0] == "SHORT")
+_no = [_K(100, 101, 95, 100) for _ in range(22)] + [_K(100, 101, 96, 100)] + [_form]
+ck("sweep yok → None", FN["detect_liquidity_sweep"](_no, 20, 0.2)[0] is None)
+_ss = FN["build_sweep_signal"]("X", _swL, [], balance_usdt=1000, risk_pct=1.5, leverage=5, lookback=20)
+ck("sweep sinyali LONG", bool(_ss) and _ss["direction"] == "LONG")
+ck("sweep stop < 90 (sweep low altı)", bool(_ss) and _ss["stop"] < 90)
+ck("strategy=SWEEP", bool(_ss) and _ss["strategy"] == "SWEEP")
+ck("sweep liq fiyatı dolu", bool(_ss) and _ss["liquidation_price"] > 0)
+ck("RR modu tp2=2.5R=107.5", abs(FN["_targets_for"](100, 97, "LONG")["tp2"] - 107.5) < 1e-9)
+FN["HYBRID_FIXED_TARGETS"] = True
+_fx = FN["_targets_for"](100, 98.6, "LONG")
+ck("sabit modu tp1=+4%=104", abs(_fx["tp1"] - 104) < 1e-9)
+ck("sabit modu tp1_rr=4/1.4≈2.86", abs(_fx["tp1_rr"] - 2.86) < 0.01)
+FN["HYBRID_FIXED_TARGETS"] = False
 
 print(f"\n=== {PASS} geçti, {FAIL} kaldı ===")
 sys.exit(1 if FAIL else 0)
