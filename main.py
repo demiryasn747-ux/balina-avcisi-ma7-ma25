@@ -70,7 +70,7 @@ SYMBOL_FAIL_BLOCK_SEC = int(float(os.getenv("SYMBOL_FAIL_BLOCK_SEC", "900")))
 SYMBOL_FAIL_FORGET_SEC = int(float(os.getenv("SYMBOL_FAIL_FORGET_SEC", "43200")))
 SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 
-MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "1200000"))
+MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
 
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
@@ -144,11 +144,14 @@ SWEEP_STOP_BUFFER_PCT = float(os.getenv("SWEEP_STOP_BUFFER_PCT", "0.15"))      #
 SWEEP_MIN_WICK_PCT = float(os.getenv("SWEEP_MIN_WICK_PCT", "0.20"))            # sweep mumunun min fitil oranı (kalite)
 SWEEP_USE_TREND_FILTER = os.getenv("SWEEP_USE_TREND_FILTER", "false").lower() == "true"  # 4H trend yönüne zorla
 # --- Sabit % hedef modu (her iki motorda; kapalıysa RR bazlı) ---
-HYBRID_FIXED_TARGETS = os.getenv("HYBRID_FIXED_TARGETS", "false").lower() == "true"
-HYBRID_FIXED_STOP_PCT = float(os.getenv("HYBRID_FIXED_STOP_PCT", "1.4"))
+HYBRID_FIXED_TARGETS = os.getenv("HYBRID_FIXED_TARGETS", "true").lower() == "true"
+HYBRID_FIXED_STOP_PCT = float(os.getenv("HYBRID_FIXED_STOP_PCT", "2"))
 HYBRID_FIXED_TP1_PCT = float(os.getenv("HYBRID_FIXED_TP1_PCT", "4"))
 HYBRID_FIXED_TP2_PCT = float(os.getenv("HYBRID_FIXED_TP2_PCT", "6"))
 HYBRID_FIXED_TP3_PCT = float(os.getenv("HYBRID_FIXED_TP3_PCT", "8"))
+# --- BTC 1H yön filtresi: BTC 1H yukarıysa SADECE LONG, aşağıysa SADECE SHORT ---
+BTC_1H_FILTER = os.getenv("BTC_1H_FILTER", "true").lower() == "true"
+BTC_1H_EMA = int(float(os.getenv("BTC_1H_EMA", "50")))
 
 # === RİSK YÖNETİCİSİ =======================================================
 RISK_DAILY_DD_PCT = float(os.getenv("RISK_DAILY_DD_PCT", "5"))        # günlük drawdown eşiği
@@ -736,7 +739,10 @@ def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: D
             continue
         if instruments and ns not in instruments:
             continue
-        rows.append((ns, quote_volume_from_ticker(row)))
+        qv = quote_volume_from_ticker(row)
+        if qv < MIN_24H_QUOTE_VOLUME:   # düşük hacimli saçma coinleri ele
+            continue
+        rows.append((ns, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
     return [sym for sym, _ in rows[:MA_COIN_LIMIT]]
 
@@ -1976,7 +1982,7 @@ async def get_btc_trend_bias() -> Dict[str, Any]:
     cached = _BTC_BIAS_CACHE.get("data")
     if cached is not None and (now - _BTC_BIAS_CACHE.get("ts", 0)) < BTC_BIAS_CACHE_SEC:
         return cached
-    bias = {"trend": "FLAT", "strong": False, "gap_pct": 0.0, "atr_pct": 0.0, "ok": False}
+    bias = {"trend": "FLAT", "strong": False, "gap_pct": 0.0, "atr_pct": 0.0, "dir_1h": "FLAT", "ok": False}
     try:
         k4h = await get_klines(BTC_BIAS_SYMBOL, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
         if len(k4h) >= 20:
@@ -1988,14 +1994,19 @@ async def get_btc_trend_bias() -> Dict[str, Any]:
             price = c[-1]
             gap_pct = ((price - line) / line * 100.0) if line > 0 else 0.0
             strong = abs(gap_pct) >= BTC_BIAS_STRONG_GAP_PCT
-            k1h = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, 60)
+            k1h = await get_klines(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, max(BTC_1H_EMA + 10, 60))
             atr_pct = 0.0
+            dir_1h = "FLAT"
             if len(k1h) >= 16:
                 cc = _s_closed(k1h)
-                p = _s_closes(cc)[-1]
+                cl = _s_closes(cc)
+                p = cl[-1]
                 atr_pct = (s_atr(cc, 14) / p * 100.0) if p > 0 else 0.0
+                eff1 = BTC_1H_EMA if len(cl) >= BTC_1H_EMA else max(10, len(cl) // 2)
+                line1 = s_ema(cl, eff1)[-1]
+                dir_1h = "UP" if p > line1 else ("DOWN" if p < line1 else "FLAT")
             bias = {"trend": trend, "strong": strong, "gap_pct": round(gap_pct, 2),
-                    "atr_pct": round(atr_pct, 2), "ok": True}
+                    "atr_pct": round(atr_pct, 2), "dir_1h": dir_1h, "ok": True}
     except Exception as e:
         logger.warning("BTC bias hesaplama hata: %s", e)
     _BTC_BIAS_CACHE["data"] = bias
@@ -2454,6 +2465,10 @@ async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
             require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
         )
+    if res and BTC_1H_FILTER:
+        d1 = btc_bias.get("dir_1h", "FLAT")
+        if (d1 == "UP" and res["direction"] != "LONG") or (d1 == "DOWN" and res["direction"] != "SHORT"):
+            return None  # BTC 1H yönüne ters → ele
     if res:
         res["btc_bias"] = btc_bias
     return res
@@ -2656,6 +2671,20 @@ def _bt_resample(klines: List[List[Any]], factor: int) -> List[List[Any]]:
     return out
 
 
+def _btc_dir_series(klines: List[List[Any]], ema_period: int) -> List[Any]:
+    """Mum başına (ts, 'UP'/'DOWN'/'FLAT') = kapanış vs EMA. Look-ahead yok (EMA[j] sadece 0..j)."""
+    cl = [safe_float(r[4]) for r in klines]
+    if len(cl) < 20:
+        return []
+    eff = ema_period if len(cl) >= ema_period else max(10, len(cl) // 2)
+    e = s_ema(cl, eff)
+    out = []
+    for j in range(len(cl)):
+        d = "UP" if cl[j] > e[j] else ("DOWN" if cl[j] < e[j] else "FLAT")
+        out.append((int(safe_float(klines[j][0])), d))
+    return out
+
+
 async def _bt_btc_trend_series(bars_1h: int) -> List[Any]:
     """BTC 1H geçmişini çekip 4H'e resample eder, mum başına (ts, trend) listesi döner."""
     try:
@@ -2853,7 +2882,9 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
             "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "FET-USDT-SWAP"]
     bars_1h = min(days * 24 + 80, BT_MAX_BARS)
-    btc_series = await _bt_btc_trend_series(bars_1h) if BTC_BIAS_ENABLED else []
+    btc_k1h = await get_klines_paginated(BTC_BIAS_SYMBOL, MA_KLINE_INTERVAL, bars_1h) if (BTC_BIAS_ENABLED or BTC_1H_FILTER) else []
+    btc_series = _btc_dir_series(_bt_resample(btc_k1h, 4), HYBRID_TREND_EMA) if (BTC_BIAS_ENABLED and btc_k1h) else []
+    btc_1h_series = _btc_dir_series(btc_k1h, BTC_1H_EMA) if (BTC_1H_FILTER and btc_k1h) else []
 
     trades: List[Dict[str, Any]] = []
     signals = 0
@@ -2902,6 +2933,11 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                     continue
                 signals += 1
                 direction = res["direction"]
+                if BTC_1H_FILTER and btc_1h_series:
+                    d1 = _bt_btc_trend_at(entry_ts, btc_1h_series)
+                    if (d1 == "UP" and direction != "LONG") or (d1 == "DOWN" and direction != "SHORT"):
+                        btc_blocked += 1
+                        continue
                 btc_tr = _bt_btc_trend_at(entry_ts, btc_series) if btc_series else "NA"
                 if btc_series and ((direction == "SHORT" and btc_tr == "UP") or
                                    (direction == "LONG" and btc_tr == "DOWN")):
