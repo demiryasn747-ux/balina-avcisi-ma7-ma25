@@ -144,6 +144,12 @@ SWEEP_STOP_BUFFER_PCT = float(os.getenv("SWEEP_STOP_BUFFER_PCT", "0.15"))      #
 SWEEP_MIN_WICK_PCT = float(os.getenv("SWEEP_MIN_WICK_PCT", "0.20"))            # sweep mumunun min fitil oranı (kalite)
 SWEEP_USE_TREND_FILTER = os.getenv("SWEEP_USE_TREND_FILTER", "false").lower() == "true"  # 4H trend yönüne zorla
 SWEEP_MA_CONFIRM = os.getenv("SWEEP_MA_CONFIRM", "true").lower() == "true"  # MA7/MA25 yönü sweep yönüyle uyuşmalı (confluence)
+# --- Balina Pozisyon motoru (OI + fiyat + funding) ---
+WHALE_PRICE_BARS = int(float(os.getenv("WHALE_PRICE_BARS", "3")))         # fiyat değişim penceresi (1H bar)
+WHALE_MIN_PRICE_PCT = float(os.getenv("WHALE_MIN_PRICE_PCT", "0.5"))      # min |fiyat değişimi| %
+WHALE_OI_LOOKBACK = int(float(os.getenv("WHALE_OI_LOOKBACK", "12")))      # OI değişim penceresi (5m periyot; 12=1 saat)
+WHALE_MIN_OI_RISE = float(os.getenv("WHALE_MIN_OI_RISE", "1.0"))          # min OI artışı % (yeni pozisyon kanıtı)
+WHALE_FUNDING_EXTREME = float(os.getenv("WHALE_FUNDING_EXTREME", "0.0005"))  # funding bu eşiği (kesir) geçerse o yöne girme
 # --- Sabit % hedef modu (her iki motorda; kapalıysa RR bazlı) ---
 HYBRID_FIXED_TARGETS = os.getenv("HYBRID_FIXED_TARGETS", "true").lower() == "true"
 HYBRID_FIXED_STOP_PCT = float(os.getenv("HYBRID_FIXED_STOP_PCT", "2"))
@@ -1837,6 +1843,104 @@ RISK_GUARD = RiskGuard(
 )
 
 
+async def fetch_okx_oi_change(symbol: str, lookback_periods: int = 12) -> Optional[float]:
+    """Rubik OI geçmişinden son lookback_periods×5dk içindeki OI değişimi (%). Anında çalışır (snapshot beklemez)."""
+    symbol = normalize_symbol(symbol)
+    ccy = symbol.split("-")[0]
+    if not ccy:
+        return None
+    try:
+        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/open-interest-volume",
+                                    {"ccy": ccy, "period": "5m"})
+    except Exception as e:
+        logger.warning("OI geçmişi alınamadı %s: %s", symbol, e)
+        return None
+    if not isinstance(d, list) or len(d) < lookback_periods + 1:
+        return None
+    # rubik newest-first: d[0]=en yeni, d[lookback]=lookback önce; satır [ts, oi, vol]
+    try:
+        oi_now = safe_float(d[0][1])
+        oi_past = safe_float(d[lookback_periods][1])
+    except (IndexError, TypeError):
+        return None
+    if oi_past <= 0:
+        return None
+    return (oi_now - oi_past) / oi_past * 100.0
+
+
+def detect_whale_position(price_change_pct: float, oi_change_pct: float, funding_rate: float,
+                          min_price: float, min_oi: float, fund_extreme: float) -> Optional[str]:
+    """
+    Balina pozisyon tespiti:
+    - OI yükselmiyorsa yeni pozisyon yok → sinyal yok.
+    - Fiyat↑ + OI↑ = balina LONG açıyor (funding aşırı pozitif değilse).
+    - Fiyat↓ + OI↑ = balina SHORT açıyor (funding aşırı negatif değilse).
+    """
+    if oi_change_pct < min_oi:
+        return None
+    if price_change_pct >= min_price:
+        if funding_rate > fund_extreme:   # long kalabalığı zaten prim ödüyor → geç kalmış
+            return None
+        return "LONG"
+    if price_change_pct <= -min_price:
+        if funding_rate < -fund_extreme:  # short kalabalığı aşırı → geç kalmış
+            return None
+        return "SHORT"
+    return None
+
+
+def build_whale_signal(symbol, klines_1h, oi_change_pct, funding_rate,
+                       balance_usdt=1000.0, risk_pct=1.5, leverage=1.0, atr_mult=1.6) -> Optional[Dict[str, Any]]:
+    """Balina pozisyon sinyali: OI+fiyat+funding teyidi + ATR/sabit stop + TP + liq guard + sizing."""
+    closed = _s_closed(klines_1h)
+    cl = _s_closes(closed)
+    if len(cl) < max(WHALE_PRICE_BARS + 1, 16):
+        return None
+    entry = cl[-1]
+    if entry <= 0:
+        return None
+    past = cl[-1 - WHALE_PRICE_BARS]
+    price_change_pct = (entry - past) / past * 100.0 if past > 0 else 0.0
+    side = detect_whale_position(price_change_pct, oi_change_pct, funding_rate,
+                                 WHALE_MIN_PRICE_PCT, WHALE_MIN_OI_RISE, WHALE_FUNDING_EXTREME)
+    if side is None:
+        return None
+    candle_ts = str(closed[-1][0])
+    atr_1h = s_atr(closed, 14)
+    if HYBRID_FIXED_TARGETS:
+        sp = HYBRID_FIXED_STOP_PCT / 100.0
+        stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
+        stop_pct = round(HYBRID_FIXED_STOP_PCT, 3)
+    else:
+        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+
+    liq_frac = max(0.0005, (1.0 / leverage) - HYBRID_MAINT_MARGIN_PCT) if leverage > 0 else 1.0
+    stop_frac = abs(entry - stop) / entry if entry > 0 else 1.0
+    if HYBRID_LIQ_GUARD_ENABLED and stop_frac > liq_frac * HYBRID_LIQ_SAFETY:
+        return None
+    liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
+    stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
+
+    tps = _targets_for(entry, stop, side)
+    size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
+    return {
+        "symbol": symbol, "direction": side, "entry": entry,
+        "stop": stop, "stop_pct": stop_pct,
+        "tp1": tps["tp1"], "tp1_rr": tps["tp1_rr"],
+        "tp2": tps["tp2"], "tp2_rr": tps["tp2_rr"],
+        "tp3": tps["tp3"], "tp3_rr": tps["tp3_rr"],
+        "atr_1h": atr_1h, "atr_mult": atr_mult, "risk_per_unit": tps["risk_per_unit"],
+        "qty": size["qty"], "notional": size["notional"], "margin": size["margin"],
+        "risk_usdt": size["risk_usdt"], "leverage": leverage,
+        "liquidation_price": liq_price, "stop_to_liq_pct": round(stop_to_liq_pct, 2),
+        "candle_ts": candle_ts, "timeframe": "1H",
+        "oi_change_pct": round(oi_change_pct, 2), "price_change_pct": round(price_change_pct, 2),
+        "funding_rate": funding_rate,
+        "mtf_note": f"Balina pozisyon {side}: fiyat {price_change_pct:+.2f}% + OI {oi_change_pct:+.2f}% + funding {funding_rate*100:.4f}%",
+        "strategy": "WHALE",
+    }
+
+
 def detect_liquidity_sweep(klines_1h: List[List[Any]], lookback: int = 20,
                            min_wick_pct: float = 0.20) -> Tuple[Optional[str], float]:
     """
@@ -2469,6 +2573,16 @@ async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             symbol, k1h, k4h, balance_usdt=HYBRID_BALANCE_USDT,
             risk_pct=dynamic_risk_pct(btc_bias), leverage=HYBRID_LEVERAGE, lookback=SWEEP_LOOKBACK,
         )
+    elif SIGNAL_ENGINE == "whale":
+        oi_change = await fetch_okx_oi_change(symbol, WHALE_OI_LOOKBACK)
+        if oi_change is None:
+            return None  # OI verisi yok → sinyal yok
+        funding = await fetch_okx_funding_rate(symbol)
+        res = build_whale_signal(
+            symbol, k1h, oi_change, funding if funding is not None else 0.0,
+            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
+            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+        )
     else:
         if ma_cross_trigger(k1h) is None:  # ön-filtre: tetik yoksa fazladan istek yok
             return None
@@ -2895,6 +3009,11 @@ async def _bt_send_csv(csv_str: str, filename: str) -> bool:
 
 
 async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 30) -> str:
+    if SIGNAL_ENGINE == "whale":
+        return ("🐋 Balina motoru (OI+fiyat+funding) CANLI OI verisi gerektirir.\n"
+                "OKX OI geçmişi sadece ~2 gün (rubik) → 90/250 gün backtest mümkün değil.\n"
+                "Bu motor PAPER (canlı kâğıt-ticaret) ile ölçülür — sıradaki adım paper ledger.\n"
+                "Şimdilik canlı sinyalleri izle; istersen MA/sweep backtest için SIGNAL_ENGINE değiştir.")
     if not symbols:
         symbols = list(COINS)[:8] if COINS else [
             "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
