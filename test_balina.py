@@ -36,6 +36,8 @@ def _load(names):
         "VOL_GUARD_ENABLED": True, "BTC_ATR_HIGH_PCT": 2.5, "VOL_GUARD_RISK_MULT": 0.5,
         "BT_FEE_PCT": 0.00045, "BT_SLIPPAGE_PCT": 0.0018,
         "SWEEP_MIN_WICK_PCT": 0.20, "SWEEP_STOP_BUFFER_PCT": 0.15, "SWEEP_USE_TREND_FILTER": False,
+        "SWEEP_MA_CONFIRM": False,
+        "WHALE_PRICE_BARS": 3, "WHALE_MIN_PRICE_PCT": 0.5, "WHALE_MIN_OI_RISE": 1.0, "WHALE_FUNDING_EXTREME": 0.0005,
         "HYBRID_FIXED_TARGETS": False, "HYBRID_FIXED_STOP_PCT": 1.4,
         "HYBRID_FIXED_TP1_PCT": 4.0, "HYBRID_FIXED_TP2_PCT": 6.0, "HYBRID_FIXED_TP3_PCT": 8.0,
         "fmt_num": (lambda v: "%.4f" % float(v)),
@@ -59,7 +61,8 @@ FN = _load([
     "_bt_regime_breakdown", "_bt_trades_to_csv",
     "_bt_resample", "bt_simulate_tp_stop", "bt_calc_pnl", "_bt_btc_trend_at",
     "_okx_to_kline", "_bt_assemble_klines", "_bt_funding_cost",
-    "detect_liquidity_sweep", "_targets_for", "build_sweep_signal",
+    "detect_liquidity_sweep", "_targets_for", "build_sweep_signal", "_btc_dir_series", "ma_side",
+    "detect_whale_position", "build_whale_signal",
 ])
 
 PASS = 0
@@ -172,6 +175,10 @@ ck("LONG stop pnl negatif", FN["bt_calc_pnl"](100, 98, "LONG", 15) < 0)
 ser = [(100, "DOWN"), (200, "UP"), (300, "UP")]
 ck("btc_at ts=150→DOWN", FN["_bt_btc_trend_at"](150, ser) == "DOWN")
 ck("btc_at ts=50→FLAT", FN["_bt_btc_trend_at"](50, ser) == "FLAT")
+_bris = [[1700 + i, 0, 0, 0, 100 + i, 0] for i in range(60)]
+_bfal = [[1700 + i, 0, 0, 0, 200 - i, 0] for i in range(60)]
+ck("BTC 1H serisi yükselen→UP", FN["_btc_dir_series"](_bris, 50)[-1][1] == "UP")
+ck("BTC 1H serisi düşen→DOWN", FN["_btc_dir_series"](_bfal, 50)[-1][1] == "DOWN")
 
 # ---- paginasyon birleştirme + gerçek funding maliyeti ----
 _raw = [[3, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], [2, 1, 1, 1, 1, 1], [2, 9, 9, 9, 9, 9]]
@@ -200,6 +207,32 @@ ck("sweep sinyali LONG", bool(_ss) and _ss["direction"] == "LONG")
 ck("sweep stop < 90 (sweep low altı)", bool(_ss) and _ss["stop"] < 90)
 ck("strategy=SWEEP", bool(_ss) and _ss["strategy"] == "SWEEP")
 ck("sweep liq fiyatı dolu", bool(_ss) and _ss["liquidation_price"] > 0)
+# MA7/MA25 yön (confluence) + onay filtresi
+_upS = [_K(90 + i * 0.6, 91 + i * 0.6, 89 + i * 0.6, 90 + i * 0.6) for i in range(40)]
+_dnS = [_K(150 - i * 0.6, 151 - i * 0.6, 149 - i * 0.6, 150 - i * 0.6) for i in range(40)]
+ck("ma_side yükselen=LONG", FN["ma_side"](_upS) == "LONG")
+ck("ma_side düşen=SHORT", FN["ma_side"](_dnS) == "SHORT")
+_dnSweep = _dnS + [_K(127, 127.5, 120, 126.5)] + [_form]  # düşüşte boğa sweep
+ck("düşüş+boğa sweep tespiti=LONG", FN["detect_liquidity_sweep"](_dnSweep, 20, 0.2)[0] == "LONG")
+FN["SWEEP_MA_CONFIRM"] = True
+ck("MA onay açık: boğa sweep + MA SHORT → None",
+   FN["build_sweep_signal"]("X", _dnSweep, [], leverage=5, lookback=20) is None)
+FN["SWEEP_MA_CONFIRM"] = False
+
+# ---- balina pozisyon motoru (OI+fiyat+funding) ----
+_D = FN["detect_whale_position"]
+ck("fiyat↑+OI↑+funding normal→LONG", _D(1.5, 3.0, 0.0001, 0.5, 1.0, 0.0005) == "LONG")
+ck("fiyat↓+OI↑→SHORT", _D(-1.5, 3.0, 0.0001, 0.5, 1.0, 0.0005) == "SHORT")
+ck("OI artmıyor→None", _D(1.5, 0.2, 0.0001, 0.5, 1.0, 0.0005) is None)
+ck("funding aşırı pozitif→None (geç)", _D(1.5, 3.0, 0.001, 0.5, 1.0, 0.0005) is None)
+ck("fiyat yatay→None", _D(0.1, 3.0, 0.0001, 0.5, 1.0, 0.0005) is None)
+_wup = [[0, 100 + i * 0.6, (100 + i * 0.6) * 1.004, (100 + i * 0.6) * 0.996, 100 + i * 0.6, 1000.0] for i in range(40)]
+_wsig = FN["build_whale_signal"]("X", _wup, 4.0, 0.0001, balance_usdt=1000, risk_pct=1.5, leverage=5)
+ck("balina sinyali LONG", bool(_wsig) and _wsig["direction"] == "LONG")
+ck("strategy=WHALE", bool(_wsig) and _wsig["strategy"] == "WHALE")
+ck("OI düşük→sinyal yok", FN["build_whale_signal"]("X", _wup, 0.1, 0.0001, leverage=5) is None)
+ck("MA onay kapalı: aynı sweep → sinyal var",
+   bool(FN["build_sweep_signal"]("X", _dnSweep, [], leverage=5, lookback=20)))
 ck("RR modu tp2=2.5R=107.5", abs(FN["_targets_for"](100, 97, "LONG")["tp2"] - 107.5) < 1e-9)
 FN["HYBRID_FIXED_TARGETS"] = True
 _fx = FN["_targets_for"](100, 98.6, "LONG")
