@@ -4227,6 +4227,77 @@ async def post_init(application) -> None:
     asyncio.create_task(save_loop())
     logger.info("Arka plan döngüleri başlatıldı")
 
+async def cmd_whaletest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Balina verisi erişim testi: OKX'in OI/funding/L-S ratio/taker-volume endpointleri Railway'den çalışıyor mu?"""
+    sym = "BTC-USDT-SWAP"
+    ccy = "BTC"
+    results: List[Tuple[str, bool, str]] = []
+
+    # 1) Baz erişim: mum
+    try:
+        k = await get_klines(sym, "1H", 5)
+        results.append(("1H mum (baz erişim)", len(k) >= 3, f"{len(k)} mum" if k else "boş"))
+    except Exception as e:
+        results.append(("1H mum (baz erişim)", False, str(e)[:50]))
+    # 2) Open Interest
+    try:
+        oi = await fetch_okx_open_interest(sym)
+        results.append(("Open Interest", oi is not None, f"OI={fmt_num(oi)}" if oi else "None/boş"))
+    except Exception as e:
+        results.append(("Open Interest", False, str(e)[:50]))
+    # 3) Funding rate (anlık)
+    try:
+        fr = await fetch_okx_funding_rate(sym)
+        results.append(("Funding rate", fr is not None, f"{fr*100:.4f}%/8h" if fr is not None else "None"))
+    except Exception as e:
+        results.append(("Funding rate", False, str(e)[:50]))
+    # 4) Funding geçmişi (backtest için)
+    try:
+        fh = await _bt_funding_history(sym, int(time.time()) - 7 * 86400)
+        results.append(("Funding geçmişi", len(fh) > 0, f"{len(fh)} kayıt" if fh else "boş"))
+    except Exception as e:
+        results.append(("Funding geçmişi", False, str(e)[:50]))
+    # 5) Long/Short hesap oranı (rubik)
+    try:
+        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                                    {"ccy": ccy, "period": "5m"})
+        ok = isinstance(d, list) and len(d) > 0
+        results.append(("Long/Short ratio", ok, f"son={d[0][1]}" if ok else "boş"))
+    except Exception as e:
+        results.append(("Long/Short ratio", False, str(e)[:50]))
+    # 6) Taker volume = CVD ham verisi (rubik)
+    try:
+        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/taker-volume",
+                                    {"ccy": ccy, "instType": "CONTRACTS", "period": "5m"})
+        ok = isinstance(d, list) and len(d) > 0
+        results.append(("Taker volume (CVD)", ok, f"{len(d)} kayıt" if ok else "boş"))
+    except Exception as e:
+        results.append(("Taker volume (CVD)", False, str(e)[:50]))
+    # 7) OI + hacim geçmişi (rubik)
+    try:
+        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/open-interest-volume",
+                                    {"ccy": ccy, "period": "5m"})
+        ok = isinstance(d, list) and len(d) > 0
+        results.append(("OI+hacim geçmişi", ok, f"{len(d)} kayıt" if ok else "boş"))
+    except Exception as e:
+        results.append(("OI+hacim geçmişi", False, str(e)[:50]))
+
+    lines = ["🐋 BALİNA VERİSİ ERİŞİM TESTİ (OKX, Railway'den)\n"]
+    for name, ok, detail in results:
+        lines.append(f"{'✅' if ok else '❌'} {name}: {detail}")
+    ok_count = sum(1 for _, ok, _ in results if ok)
+    lines.append(f"\n━━ SONUÇ: {ok_count}/{len(results)} erişilebilir ━━")
+    if ok_count == len(results):
+        lines.append("Tüm balina verisi geliyor — sinyal motoru yazmaya hazırız.")
+    elif ok_count == 0:
+        lines.append("⛔ HİÇBİRİ gelmiyor → Railway geo-block. Region'ı Singapur yap.")
+    elif any(n == "1H mum (baz erişim)" and ok for n, ok, _ in results) and ok_count <= 2:
+        lines.append("⚠️ Mum geliyor ama balina endpointleri gelmiyor → OKX bu veriyi bu bölgeden kısıtlıyor olabilir. Singapur region dene.")
+    else:
+        lines.append("⚠️ Kısmi erişim. Gelenlerle başlarız; gelmeyenler için region/endpoint çözülür.")
+    await update.message.reply_text("\n".join(lines))
+
+
 def validate_config() -> None:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
@@ -4250,6 +4321,7 @@ def build_app():
     application.add_handler(CommandHandler("backtest", cmd_backtest))
     application.add_handler(CommandHandler("ma_status", cmd_ma_status))
     application.add_handler(CommandHandler("whale", cmd_whale))
+    application.add_handler(CommandHandler("whaletest", cmd_whaletest))
     application.add_handler(CommandHandler("funding", cmd_funding))
     return application
 
