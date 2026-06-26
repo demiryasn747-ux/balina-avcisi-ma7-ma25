@@ -2577,7 +2577,7 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
 BT_SLIPPAGE_PCT = float(os.getenv("BT_SLIPPAGE_PCT", "0.0018"))
 BT_FEE_PCT = float(os.getenv("BT_FEE_PCT", "0.00045"))
 BT_INITIAL_BALANCE = float(os.getenv("BT_INITIAL_BALANCE", "1000"))
-BT_FUTURE_BARS = int(float(os.getenv("BT_FUTURE_BARS", "10")))
+BT_FUTURE_BARS = int(float(os.getenv("BT_FUTURE_BARS", "96")))   # trade simülasyon penceresi (saat) — geniş %TP'ler için ~4 gün
 BT_FUNDING_PCT_8H = float(os.getenv("BT_FUNDING_PCT_8H", "0.0001"))  # ortalama funding maliyeti/8h (modellenmiş)
 BT_CSV_EXPORT = os.getenv("BT_CSV_EXPORT", "true").lower() == "true"
 BT_OOS_SPLIT = float(os.getenv("BT_OOS_SPLIT", "0.7"))               # in-sample oranı (kalan out-of-sample)
