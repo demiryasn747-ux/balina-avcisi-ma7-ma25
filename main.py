@@ -143,6 +143,7 @@ SWEEP_LOOKBACK = int(float(os.getenv("SWEEP_LOOKBACK", "20")))                 #
 SWEEP_STOP_BUFFER_PCT = float(os.getenv("SWEEP_STOP_BUFFER_PCT", "0.15"))      # stop, sweep fitilinin bu kadar ötesinde
 SWEEP_MIN_WICK_PCT = float(os.getenv("SWEEP_MIN_WICK_PCT", "0.20"))            # sweep mumunun min fitil oranı (kalite)
 SWEEP_USE_TREND_FILTER = os.getenv("SWEEP_USE_TREND_FILTER", "false").lower() == "true"  # 4H trend yönüne zorla
+SWEEP_MA_CONFIRM = os.getenv("SWEEP_MA_CONFIRM", "true").lower() == "true"  # MA7/MA25 yönü sweep yönüyle uyuşmalı (confluence)
 # --- Sabit % hedef modu (her iki motorda; kapalıysa RR bazlı) ---
 HYBRID_FIXED_TARGETS = os.getenv("HYBRID_FIXED_TARGETS", "true").lower() == "true"
 HYBRID_FIXED_STOP_PCT = float(os.getenv("HYBRID_FIXED_STOP_PCT", "2"))
@@ -1643,6 +1644,20 @@ def ma_cross_trigger(klines_1h: List[List[Any]], fast: int = 7, slow: int = 25) 
     return None
 
 
+def ma_side(klines_1h: List[List[Any]], fast: int = 7, slow: int = 25) -> Optional[str]:
+    """MA7/MA25 anlık yönü (kesişim DURUMU): MA7>MA25 → LONG, MA7<MA25 → SHORT."""
+    closed = _s_closed(klines_1h)
+    c = _s_closes(closed)
+    if len(c) < slow + 1:
+        return None
+    mf = s_ema(c, fast); ms = s_ema(c, slow)
+    if mf[-1] > ms[-1]:
+        return "LONG"
+    if mf[-1] < ms[-1]:
+        return "SHORT"
+    return None
+
+
 def trend_4h(klines_4h: List[List[Any]], ema_period: int = 200) -> Tuple[str, bool]:
     closed = _s_closed(klines_4h)
     c = _s_closes(closed)
@@ -1876,6 +1891,8 @@ def build_sweep_signal(symbol, klines_1h, klines_4h,
     side, level = detect_liquidity_sweep(klines_1h, lookback, SWEEP_MIN_WICK_PCT)
     if side is None:
         return None
+    if SWEEP_MA_CONFIRM and ma_side(klines_1h) != side:
+        return None  # MA7/MA25 yönü sweep yönünü onaylamıyor → ele
     if SWEEP_USE_TREND_FILTER:
         direction, _strong = trend_4h(klines_4h, HYBRID_TREND_EMA)
         if side == "LONG" and direction != "UP":
@@ -1917,7 +1934,8 @@ def build_sweep_signal(symbol, klines_1h, klines_4h,
         "risk_usdt": size["risk_usdt"], "leverage": leverage,
         "liquidation_price": liq_price, "stop_to_liq_pct": round(stop_to_liq_pct, 2),
         "candle_ts": candle_ts, "timeframe": "1H", "swept_level": level,
-        "mtf_note": f"Likidite sweep {side} @ {fmt_num(level)}", "strategy": "SWEEP",
+        "mtf_note": f"Likidite sweep {side} @ {fmt_num(level)}" + (" + MA7/MA25 onaylı" if SWEEP_MA_CONFIRM else ""),
+        "strategy": "SWEEP",
     }
 
 
