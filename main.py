@@ -15,7 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 VERSION_NAME = "Balina Avcısı V9 HİBRİT-MTF (1H tetik + 4H trend + ATR/RR + RiskGuard)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V2")
+BOT_BUILD = os.getenv("BOT_BUILD", "V4")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -73,6 +73,7 @@ SYMBOL_FAIL_FORGET_SEC = int(float(os.getenv("SYMBOL_FAIL_FORGET_SEC", "43200"))
 SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
+MAX_24H_QUOTE_VOLUME = float(os.getenv("MAX_24H_QUOTE_VOLUME", "100000000"))  # üst sınır (mid-cap bandı); 0 = sınırsız
 
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
@@ -761,6 +762,8 @@ def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: D
             continue
         qv = quote_volume_from_ticker(row)
         if qv < MIN_24H_QUOTE_VOLUME:   # düşük hacimli saçma coinleri ele
+            continue
+        if MAX_24H_QUOTE_VOLUME > 0 and qv > MAX_24H_QUOTE_VOLUME:  # mega-cap'leri ele (mid-cap bandı)
             continue
         rows.append((ns, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
@@ -2801,6 +2804,7 @@ BT_FUNDING_PCT_8H = float(os.getenv("BT_FUNDING_PCT_8H", "0.0001"))  # ortalama 
 BT_CSV_EXPORT = os.getenv("BT_CSV_EXPORT", "true").lower() == "true"
 BT_OOS_SPLIT = float(os.getenv("BT_OOS_SPLIT", "0.7"))               # in-sample oranı (kalan out-of-sample)
 BT_MAX_BARS = int(float(os.getenv("BT_MAX_BARS", "6000")))           # paginasyon üst sınırı (~250 gün 1H)
+BT_MAX_COINS = int(float(os.getenv("BT_MAX_COINS", "25")))           # backtest'te işlenecek max coin (yüksek = daha çok veri ama yavaş)
 BT_MAX_PAGES = int(float(os.getenv("BT_MAX_PAGES", "80")))           # backtest başına max OKX sayfa isteği/coin
 BT_PAGE_SLEEP = float(os.getenv("BT_PAGE_SLEEP", "0.12"))            # sayfa istekleri arası bekleme (rate-limit)
 BT_REAL_FUNDING = os.getenv("BT_REAL_FUNDING", "true").lower() == "true"  # gerçek funding geçmişi (kapalıysa sabit model)
@@ -3120,7 +3124,7 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                 "Bu motor PAPER (canlı kâğıt-ticaret) ile ölçülür — sıradaki adım paper ledger.\n"
                 "Şimdilik canlı sinyalleri izle; istersen MA/sweep backtest için SIGNAL_ENGINE değiştir.")
     if not symbols:
-        symbols = list(COINS)[:8] if COINS else [
+        symbols = list(COINS)[:BT_MAX_COINS] if COINS else [
             "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP",
             "WIF-USDT-SWAP", "PEPE-USDT-SWAP", "FET-USDT-SWAP"]
     bars_1h = min(days * 24 + 80, BT_MAX_BARS)
@@ -3135,7 +3139,7 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
     tested = 0
     fee_frac = BT_FEE_PCT * 2
 
-    for symbol in symbols[:12]:
+    for symbol in symbols[:BT_MAX_COINS]:
         try:
             k1h = await get_klines_paginated(symbol, MA_KLINE_INTERVAL, bars_1h)
             if len(k1h) < 60:
@@ -4334,9 +4338,9 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if ("," in a) or (not a.isdigit()):
             symbols = [normalize_symbol(s) for s in a.split(",") if s.strip()]
         else:
-            topn = max(1, min(12, int(a)))
+            topn = max(1, min(BT_MAX_COINS, int(a)))
             symbols = list(COINS)[:topn] if COINS else None
-    hedef = symbols if symbols else (f"havuzdan ilk {len(list(COINS)[:8])}" if COINS else "varsayılan set")
+    hedef = symbols if symbols else (f"havuzdan ilk {len(list(COINS)[:BT_MAX_COINS])}" if COINS else "varsayılan set")
     await update.message.reply_text(
         f"🧪 Backtest başladı (~{days} gün, arka planda). Hedef: {hedef}.\n"
         f"Bot taramaya devam ediyor; sonuç bitince gelecek."
@@ -4576,7 +4580,7 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
            if HYBRID_FIXED_TARGETS else "") + "\n"
         f"BTC 1H filtresi: {'açık' if BTC_1H_FILTER else 'kapalı'} | BTC 4H rejim: {'açık' if BTC_BIAS_ENABLED else 'kapalı'}\n"
         f"Sweep MA onayı: {'açık' if SWEEP_MA_CONFIRM else 'kapalı'}\n"
-        f"Kaldıraç: {HYBRID_LEVERAGE:.0f}x | Risk %{HYBRID_RISK_PCT:g} | Min hacim {MIN_24H_QUOTE_VOLUME/1e6:.0f}M | Coin {MA_COIN_LIMIT}\n"
+        f"Kaldıraç: {HYBRID_LEVERAGE:.0f}x | Risk %{HYBRID_RISK_PCT:g} | Hacim {MIN_24H_QUOTE_VOLUME/1e6:.0f}M–{(str(int(MAX_24H_QUOTE_VOLUME/1e6))+'M') if MAX_24H_QUOTE_VOLUME>0 else '∞'} | Coin {MA_COIN_LIMIT}\n"
         f"Eski V527 motoru: {'AÇIK' if ORIGINAL_V527_ENGINE_ENABLED else 'kapalı'} | Paper reset: {'açık' if PAPER_RESET_ON_DEPLOY else 'kapalı'}"
     )
     await update.message.reply_text(txt)
