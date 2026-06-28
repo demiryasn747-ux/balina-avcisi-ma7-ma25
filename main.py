@@ -15,7 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 VERSION_NAME = "Balina Avcısı V9 HİBRİT-MTF (1H tetik + 4H trend + ATR/RR + RiskGuard)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V4")
+BOT_BUILD = os.getenv("BOT_BUILD", "V5")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -3155,6 +3155,7 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
 
             for i in range(38, len(k1h) - (BT_FUTURE_BARS + 2)):
                 entry_ts = int(safe_float(k1h[i + 1][0]))
+                entry_sec = entry_ts // 1000  # funding geçmişi saniye → çevir (kline ms)
                 slice1h = k1h[max(0, i - 60):i + 3]
                 # look-ahead yok: yalnız entry_ts'ten ÖNCE tam kapanmış 4H mumlar (open+4h <= entry_ts)
                 k4h = [c for c in k4h_full if (int(c[0]) + 14400) <= entry_ts]
@@ -3166,7 +3167,7 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                             leverage=HYBRID_LEVERAGE, lookback=SWEEP_LOOKBACK)
                     elif SIGNAL_ENGINE == "funding":
                         res = build_funding_signal(
-                            symbol, slice1h, _bt_funding_at(fhist, entry_ts),
+                            symbol, slice1h, _bt_funding_at(fhist, entry_sec),
                             balance_usdt=HYBRID_BALANCE_USDT, risk_pct=HYBRID_RISK_PCT,
                             leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT)
                     else:
@@ -3208,9 +3209,9 @@ async def run_hybrid_backtest(symbols: Optional[List[str]] = None, days: int = 3
                     continue
                 gross_move = (exitp - entry) if direction == "LONG" else (entry - exitp)
                 r_gross = gross_move / risk_unit
-                exit_ts = entry_ts + trade["bars"] * 3600
+                exit_sec = entry_sec + trade["bars"] * 3600
                 if fhist:
-                    fund_signed = _bt_funding_cost(fhist, entry_ts, exit_ts, direction)  # imzalı (gelir negatif)
+                    fund_signed = _bt_funding_cost(fhist, entry_sec, exit_sec, direction)  # imzalı (gelir negatif)
                 else:
                     fund_signed = (trade["bars"] // 8) * BT_FUNDING_PCT_8H  # sabit model (maliyet)
                 cost_r = ((slip_frac + fee_frac) * entry + fund_signed * entry) / risk_unit
