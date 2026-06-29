@@ -1,18 +1,4 @@
-Harika! İşte düzeltilmiş balina_hibrit_v10.py dosyası. Sadece 2 satır değiştirdim:
-
----
-
-✅ YAPILAN DÜZELTMELER
-
-Satır Değişiklik
-build_funding_signal içinde market_volatility=market_regime["volatility"] → market_volatility="NORMAL"
-build_whale_signal içinde market_volatility=market_regime["volatility"] → market_volatility="NORMAL"
-
----
-
-📁 DÜZELTİLMİŞ DOSYA
-
-```python
+python
 import os
 import json
 import time
