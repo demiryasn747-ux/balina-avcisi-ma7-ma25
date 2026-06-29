@@ -1,3 +1,18 @@
+Harika! İşte düzeltilmiş balina_hibrit_v10.py dosyası. Sadece 2 satır değiştirdim:
+
+---
+
+✅ YAPILAN DÜZELTMELER
+
+Satır Değişiklik
+build_funding_signal içinde market_volatility=market_regime["volatility"] → market_volatility="NORMAL"
+build_whale_signal içinde market_volatility=market_regime["volatility"] → market_volatility="NORMAL"
+
+---
+
+📁 DÜZELTİLMİŞ DOSYA
+
+```python
 import os
 import json
 import time
@@ -51,6 +66,27 @@ HOT_TTL_SEC = int(float(os.getenv("HOT_TTL_SEC", "1800")))
 ALERT_COOLDOWN_MIN = int(float(os.getenv("ALERT_COOLDOWN_MIN", "75")))
 SETUP_COOLDOWN_MIN = int(float(os.getenv("SETUP_COOLDOWN_MIN", "45")))
 MAX_HOT_CANDIDATES = int(float(os.getenv("MAX_HOT_CANDIDATES", "16")))
+
+# === SİNYAL PUANLAMA SİSTEMİ (YENİ) ========================================
+SIGNAL_SCORE_SWEEP_BASE = float(os.getenv("SIGNAL_SCORE_SWEEP_BASE", "30"))
+SIGNAL_SCORE_WHALE_BASE = float(os.getenv("SIGNAL_SCORE_WHALE_BASE", "25"))
+SIGNAL_SCORE_FUNDING_BASE = float(os.getenv("SIGNAL_SCORE_FUNDING_BASE", "20"))
+SIGNAL_SCORE_MA_BASE = float(os.getenv("SIGNAL_SCORE_MA_BASE", "15"))
+SIGNAL_SCORE_TREND_4H_BONUS = float(os.getenv("SIGNAL_SCORE_TREND_4H_BONUS", "10"))
+SIGNAL_SCORE_MOMENTUM_15M_BONUS = float(os.getenv("SIGNAL_SCORE_MOMENTUM_15M_BONUS", "5"))
+SIGNAL_SCORE_MOMENTUM_5M_BONUS = float(os.getenv("SIGNAL_SCORE_MOMENTUM_5M_BONUS", "5"))
+SIGNAL_SCORE_MIN_TOTAL = float(os.getenv("SIGNAL_SCORE_MIN_TOTAL", "50")) # Minimum toplam puan
+SIGNAL_SCORE_MIN_STRONG_SIGNAL = float(os.getenv("SIGNAL_SCORE_MIN_STRONG_SIGNAL", "70")) # Güçlü sinyal için minimum puan
+
+# === DİNAMİK STOP-LOSS VE TP İYİLEŞTİRMELERİ ===============================
+DYNAMIC_ATR_MULT_HIGH_VOL = float(os.getenv("DYNAMIC_ATR_MULT_HIGH_VOL", "2.0")) # Yüksek volatilitede ATR çarpanı
+DYNAMIC_ATR_MULT_LOW_VOL = float(os.getenv("DYNAMIC_ATR_MULT_LOW_VOL", "1.2"))  # Düşük volatilitede ATR çarpanı
+STOP_LOSS_BUFFER_PCT = float(os.getenv("STOP_LOSS_BUFFER_PCT", "0.001")) # Stop seviyesine eklenen küçük tampon
+
+# === PİYASA REJİMİ FARKINDALIĞI ============================================
+MARKET_REGIME_TREND_THRESHOLD = float(os.getenv("MARKET_REGIME_TREND_THRESHOLD", "0.5")) # Fiyatın EMA'dan uzaklığı (yüzde) trend için
+MARKET_REGIME_VOL_THRESHOLD = float(os.getenv("MARKET_REGIME_VOL_THRESHOLD", "1.0")) # ATR'nin ortalamadan sapması (yüzde) volatilite için
+
 MAX_DEEP_ANALYSIS_PER_CYCLE = int(float(os.getenv("MAX_DEEP_ANALYSIS_PER_CYCLE", "12")))
 
 MIN_CANDIDATE_SCORE = float(os.getenv("MIN_CANDIDATE_SCORE", "34"))
@@ -119,6 +155,38 @@ FUNDING_BULLISH_THRESHOLD = float(os.getenv("FUNDING_BULLISH_THRESHOLD", "-0.000
 FUNDING_SHORT_BONUS = float(os.getenv("FUNDING_SHORT_BONUS", "20"))
 FUNDING_LONG_BONUS = float(os.getenv("FUNDING_LONG_BONUS", "20"))
 
+# === TRAILING TAKE PROFIT (İZ SÜREN KÂR AL) ================================
+TRAILING_TP_ENABLED = os.getenv("TRAILING_TP_ENABLED", "true").lower() == "true"
+TRAILING_TP_ACTIVATION_PCT = float(os.getenv("TRAILING_TP_ACTIVATION_PCT", "1.5")) # %1.5 kârda aktive ol
+TRAILING_TP_DISTANCE_PCT = float(os.getenv("TRAILING_TP_DISTANCE_PCT", "0.5")) # En yüksek fiyattan %0.5 geride stop
+
+# === ZAMANA DAYALI KAPANMA (TIME-BASED EXIT) ===============================
+TIME_BASED_EXIT_ENABLED = os.getenv("TIME_BASED_EXIT_ENABLED", "true").lower() == "true"
+TIME_BASED_EXIT_HOURS = float(os.getenv("TIME_BASED_EXIT_HOURS", "4")) # 4 saat sonra pozisyonu değerlendir
+TIME_BASED_EXIT_MAX_LOSS_PCT = float(os.getenv("TIME_BASED_EXIT_MAX_LOSS_PCT", "0.5")) # %0.5 zararı geçmiyorsa kapat
+
+# === DİNAMİK POZİSYON ÖLÇEKLENDİRME (SCORE-BASED SIZING) ===================
+SCORE_BASED_SIZING_ENABLED = os.getenv("SCORE_BASED_SIZING_ENABLED", "true").lower() == "true"
+SCORE_SIZING_MIN_SCORE = float(os.getenv("SCORE_SIZING_MIN_SCORE", "50")) # Bu skorun altında sabit risk
+SCORE_SIZING_MAX_SCORE = float(os.getenv("SCORE_SIZING_MAX_SCORE", "90")) # Bu skorun üstünde tam risk
+SCORE_SIZING_MIN_MULTIPLIER = float(os.getenv("SCORE_SIZING_MIN_MULTIPLIER", "0.5")) # Min skor için risk çarpanı
+SCORE_SIZING_MAX_MULTIPLIER = float(os.getenv("SCORE_SIZING_MAX_MULTIPLIER", "1.5")) # Max skor için risk çarpanı
+
+# === SEKTÖREL KORELASYON KORUMASI (SECTOR GUARD) ===========================
+SECTOR_GUARD_ENABLED = os.getenv("SECTOR_GUARD_ENABLED", "true").lower() == "true"
+MAX_OPEN_POSITIONS_PER_SECTOR = int(float(os.getenv("MAX_OPEN_POSITIONS_PER_SECTOR", "1"))) # Bir sektörden max açık pozisyon
+
+# === VOLATİLİTEYE GÖRE KALDIRAÇ AYARI ======================================
+VOLATILITY_ADAPTIVE_LEVERAGE_ENABLED = os.getenv("VOLATILITY_ADAPTIVE_LEVERAGE_ENABLED", "true").lower() == "true"
+LEVERAGE_HIGH_VOL = float(os.getenv("LEVERAGE_HIGH_VOL", "0.8")) # Yüksek volatilitede kaldıraç çarpanı
+LEVERAGE_LOW_VOL = float(os.getenv("LEVERAGE_LOW_VOL", "1.2"))  # Düşük volatilitede kaldıraç çarpanı
+LEVERAGE_NORMAL_VOL = float(os.getenv("LEVERAGE_NORMAL_VOL", "1.0")) # Normal volatilitede kaldıraç çarpanı
+
+# === SPREAD VE KAYMA (SLIPPAGE) KONTROLÜ ===================================
+SPREAD_SLIPPAGE_CHECK_ENABLED = os.getenv("SPREAD_SLIPPAGE_CHECK_ENABLED", "true").lower() == "true"
+MAX_ALLOWED_SPREAD_PCT = float(os.getenv("MAX_ALLOWED_SPREAD_PCT", "0.05")) # Max %0.05 spread
+MAX_ALLOWED_SLIPPAGE_PCT = float(os.getenv("MAX_ALLOWED_SLIPPAGE_PCT", "0.1")) # Max %0.1 kayma
+
 # === HİBRİT MTF MOTORU (YENİ ANA STRATEJİ) =================================
 # MA7/MA25 artık BİRİNCİL sinyal değil, sadece 1H tetik. Yön kararı:
 # 1H tetik + 4H trend filtresi (200 EMA) + 15m/5m momentum onayı.
@@ -140,7 +208,7 @@ HYBRID_LIQ_SAFETY = float(os.getenv("HYBRID_LIQ_SAFETY", "0.6"))                
 # === SİNYAL MOTORU SEÇİMİ =================================================
 # "ma"    : MA7/MA25 kesişimi + MTF (eski; veriyle kaybettiği kanıtlandı)
 # "sweep" : Likidite sweep / stop avı dönüşü (yeni gerçek edge)
-SIGNAL_ENGINE = os.getenv("SIGNAL_ENGINE", "ma").strip().lower()
+SIGNAL_ENGINE = os.getenv("SIGNAL_ENGINE", "sweep").strip().lower()
 # --- Likidite Sweep motoru ---
 SWEEP_LOOKBACK = int(float(os.getenv("SWEEP_LOOKBACK", "20")))                 # swing seviye penceresi
 SWEEP_STOP_BUFFER_PCT = float(os.getenv("SWEEP_STOP_BUFFER_PCT", "0.15"))      # stop, sweep fitilinin bu kadar ötesinde
@@ -210,6 +278,103 @@ def calc_liquidation_price(entry: float, direction: str) -> float:
 
 def calc_margin_required(position_value_usdt: float) -> float:
     return position_value_usdt / max(LEVERAGE, 1)
+
+def calculate_signal_score(
+    sweep_signal: Optional[Dict[str, Any]],
+    whale_signal: Optional[Dict[str, Any]],
+    funding_signal: Optional[Dict[str, Any]],
+    ma_signal: Optional[Dict[str, Any]],
+    trend_4h_direction: str,
+    momentum_15m_ok: bool,
+    momentum_5m_ok: bool,
+) -> Dict[str, Any]:
+    total_score = 0.0
+    reasons = []
+    signal_type = "NONE"
+    direction = ""
+
+    # Sweep sinyali
+    if sweep_signal and sweep_signal.get("signal_found"):
+        total_score += SIGNAL_SCORE_SWEEP_BASE
+        reasons.append(f"Sweep Sinyali (+{SIGNAL_SCORE_SWEEP_BASE:.0f})")
+        signal_type = "SWEEP"
+        direction = sweep_signal["direction"]
+
+    # Whale sinyali
+    if whale_signal and whale_signal.get("divergence"):
+        bonus = whale_signal.get("short_bonus", 0) + whale_signal.get("long_bonus", 0)
+        if bonus > 0:
+            total_score += SIGNAL_SCORE_WHALE_BASE
+            reasons.append(f"Whale Diverjansı (+{SIGNAL_SCORE_WHALE_BASE:.0f})")
+            if not direction: # İlk sinyal ise yönü belirle
+                direction = "SHORT" if whale_signal.get("short_bonus") > 0 else "LONG"
+            elif (direction == "SHORT" and whale_signal.get("long_bonus") > 0) or \
+                 (direction == "LONG" and whale_signal.get("short_bonus") > 0):
+                # Yön çelişiyorsa puan düşür veya sinyali iptal et
+                total_score -= SIGNAL_SCORE_WHALE_BASE / 2 # Yarı puan düş
+                reasons.append("Whale Diverjansı yön çelişkisi (-)")
+
+    # Funding sinyali
+    if funding_signal and funding_signal.get("type") in ["SHORT_BONUS", "LONG_BONUS"]:
+        bonus = funding_signal.get("short_bonus", 0) + funding_signal.get("long_bonus", 0)
+        if bonus > 0:
+            total_score += SIGNAL_SCORE_FUNDING_BASE
+            reasons.append(f"Funding Ekstrem (+{SIGNAL_SCORE_FUNDING_BASE:.0f})")
+            if not direction:
+                direction = "SHORT" if funding_signal.get("short_bonus") > 0 else "LONG"
+            elif (direction == "SHORT" and funding_signal.get("long_bonus") > 0) or \
+                 (direction == "LONG" and funding_signal.get("short_bonus") > 0):
+                total_score -= SIGNAL_SCORE_FUNDING_BASE / 2
+                reasons.append("Funding Ekstrem yön çelişkisi (-)")
+
+    # MA sinyali (eski hibrit tetikleyici)
+    if ma_signal and ma_signal.get("direction"):
+        total_score += SIGNAL_SCORE_MA_BASE
+        reasons.append(f"MA Kesişim Tetiği (+{SIGNAL_SCORE_MA_BASE:.0f})")
+        if not direction:
+            direction = ma_signal["direction"]
+        elif direction != ma_signal["direction"]:
+            total_score -= SIGNAL_SCORE_MA_BASE / 2
+            reasons.append("MA Kesişim yön çelişkisi (-)")
+
+    # Trend onayı
+    if direction == "LONG" and trend_4h_direction == "UP":
+        total_score += SIGNAL_SCORE_TREND_4H_BONUS
+        reasons.append(f"4H Trend Onayı (UP) (+{SIGNAL_SCORE_TREND_4H_BONUS:.0f})")
+    elif direction == "SHORT" and trend_4h_direction == "DOWN":
+        total_score += SIGNAL_SCORE_TREND_4H_BONUS
+        reasons.append(f"4H Trend Onayı (DOWN) (+{SIGNAL_SCORE_TREND_4H_BONUS:.0f})")
+    elif direction and trend_4h_direction != "FLAT" and trend_4h_direction != direction_to_trend(direction):
+        # Yön çelişiyorsa puan düşür
+        total_score -= SIGNAL_SCORE_TREND_4H_BONUS * 1.5 # Daha büyük ceza
+        reasons.append(f"4H Trend Çelişkisi ({trend_4h_direction}) (-)")
+
+    # Momentum onayları
+    if momentum_15m_ok:
+        total_score += SIGNAL_SCORE_MOMENTUM_15M_BONUS
+        reasons.append(f"15m Momentum Onayı (+{SIGNAL_SCORE_MOMENTUM_15M_BONUS:.0f})")
+    if momentum_5m_ok:
+        total_score += SIGNAL_SCORE_MOMENTUM_5M_BONUS
+        reasons.append(f"5m Momentum Onayı (+{SIGNAL_SCORE_MOMENTUM_5M_BONUS:.0f})")
+
+    # Minimum puan kontrolü
+    if total_score < SIGNAL_SCORE_MIN_TOTAL:
+        return {"signal_found": False, "score": total_score, "direction": "NONE", "reasons": reasons}
+
+    return {
+        "signal_found": True,
+        "score": total_score,
+        "direction": direction,
+        "reasons": reasons,
+        "is_strong": total_score >= SIGNAL_SCORE_MIN_STRONG_SIGNAL
+    }
+
+def direction_to_trend(direction: str) -> str:
+    if direction == "LONG":
+        return "UP"
+    if direction == "SHORT":
+        return "DOWN"
+    return "FLAT"
 
 def calc_position_size_for_risk(entry: float, stop_price: float, portfolio_usdt: float) -> float:
     stop_pct = abs(pct_change(entry, stop_price))
@@ -1226,6 +1391,37 @@ def true_ranges(klines: List[List[Any]]) -> List[float]:
         trs.append(tr)
     return trs
 
+def detect_market_regime(klines_1h: List[List[Any]], klines_4h: List[List[Any]]) -> Dict[str, Any]:
+    regime = {"trend": "FLAT", "volatility": "NORMAL", "note": ""}
+
+    # 4H Trend Tespiti
+    trend_4h_direction, strong_trend = trend_4h(klines_4h, HYBRID_TREND_EMA)
+    regime["trend"] = trend_4h_direction
+    if strong_trend:
+        regime["note"] += f"4H Trend: {trend_4h_direction} (Güçlü). "
+    else:
+        regime["note"] += f"4H Trend: {trend_4h_direction} (Zayıf). "
+
+    # 1H Volatilite Tespiti (ATR kullanarak)
+    atr_1h_values = atr(klines_1h, 14)
+    if len(atr_1h_values) > 20:
+        current_atr = atr_1h_values[-1]
+        avg_atr = avg(atr_1h_values[-20:-1]) # Son 20 mumun ortalama ATR'si
+        if avg_atr > 0:
+            atr_deviation_pct = pct_change(avg_atr, current_atr)
+            if atr_deviation_pct > MARKET_REGIME_VOL_THRESHOLD:
+                regime["volatility"] = "HIGH"
+                regime["note"] += f"1H Volatilite: YÜKSEK (ATR %{atr_deviation_pct:.2f} ortalamanın üstünde). "
+            elif atr_deviation_pct < -MARKET_REGIME_VOL_THRESHOLD:
+                regime["volatility"] = "LOW"
+                regime["note"] += f"1H Volatilite: DÜŞÜK (ATR %{atr_deviation_pct:.2f} ortalamanın altında). "
+            else:
+                regime["note"] += f"1H Volatilite: NORMAL. "
+    else:
+        regime["note"] += "1H Volatilite: Yetersiz veri. "
+
+    return regime
+
 def atr(klines: List[List[Any]], period: int = 14) -> List[float]:
     trs = true_ranges(klines)
     return ema(trs, period)
@@ -1730,15 +1926,103 @@ def mtf_decision(side_1h, klines_4h, klines_15m, klines_5m,
     return side_1h, f"MTF onaylı: 1H tetik + 4H {direction} + {tag} momentum"
 
 
-def atr_stop(entry, side, atr_value, mult=1.5, min_pct=0.004, max_pct=0.05) -> Tuple[float, float]:
+def atr_stop(entry, side, atr_value, mult=1.5, min_pct=0.004, max_pct=0.05, market_volatility: str = "NORMAL") -> Tuple[float, float]:
     if entry <= 0:
         return 0.0, 0.0
-    pct = (atr_value * mult) / entry
+    # Dinamik ATR çarpanı
+    if market_volatility == "HIGH":
+        effective_mult = DYNAMIC_ATR_MULT_HIGH_VOL
+    elif market_volatility == "LOW":
+        effective_mult = DYNAMIC_ATR_MULT_LOW_VOL
+    else:
+        effective_mult = mult
+
+    pct = (atr_value * effective_mult) / entry
     pct = max(min_pct, min(max_pct, pct))
     dist = entry * pct
     stop = entry - dist if side == "LONG" else entry + dist
+
+    # Stop seviyesine küçük bir tampon ekle
+    if side == "LONG":
+        stop -= entry * STOP_LOSS_BUFFER_PCT
+    else:
+        stop += entry * STOP_LOSS_BUFFER_PCT
     return stop, round(pct * 100.0, 3)
 
+
+def check_trailing_tp(follow_rec: Dict[str, Any], current_price: float) -> Optional[Dict[str, Any]]:
+    if not TRAILING_TP_ENABLED:
+        return None
+
+    direction = follow_rec["direction"]
+    entry = follow_rec["entry"]
+    highest_price = follow_rec.get("highest_price", entry)
+    lowest_price = follow_rec.get("lowest_price", entry)
+    trailing_stop_price = follow_rec.get("trailing_stop_price", follow_rec["stop"])
+    trailing_tp_active = follow_rec.get("trailing_tp_active", False)
+
+    new_highest_price = highest_price
+    new_lowest_price = lowest_price
+    new_trailing_stop_price = trailing_stop_price
+    new_trailing_tp_active = trailing_tp_active
+    exit_reason = None
+
+    if direction == "LONG":
+        # En yüksek fiyatı güncelle
+        if current_price > new_highest_price:
+            new_highest_price = current_price
+
+        # Trailing TP aktivasyon kontrolü
+        if not new_trailing_tp_active and pct_change(entry, new_highest_price) >= TRAILING_TP_ACTIVATION_PCT:
+            new_trailing_tp_active = True
+            logger.info("TRAILING TP AKTİF: %s LONG, entry %s, current %s, highest %s",
+                        follow_rec["symbol"], fmt_num(entry), fmt_num(current_price), fmt_num(new_highest_price))
+
+        if new_trailing_tp_active:
+            # Trailing stopu güncelle
+            potential_trailing_stop = new_highest_price * (1 - TRAILING_TP_DISTANCE_PCT / 100)
+            if potential_trailing_stop > new_trailing_stop_price:
+                new_trailing_stop_price = potential_trailing_stop
+
+            # Çıkış kontrolü
+            if current_price <= new_trailing_stop_price:
+                exit_reason = f"TRAILING TP LONG: Fiyat {fmt_num(current_price)} <= Trailing Stop {fmt_num(new_trailing_stop_price)}"
+
+    elif direction == "SHORT":
+        # En düşük fiyatı güncelle
+        if current_price < new_lowest_price:
+            new_lowest_price = current_price
+
+        # Trailing TP aktivasyon kontrolü
+        if not new_trailing_tp_active and pct_change(entry, new_lowest_price) <= -TRAILING_TP_ACTIVATION_PCT:
+            new_trailing_tp_active = True
+            logger.info("TRAILING TP AKTİF: %s SHORT, entry %s, current %s, lowest %s",
+                        follow_rec["symbol"], fmt_num(entry), fmt_num(current_price), fmt_num(new_lowest_price))
+
+        if new_trailing_tp_active:
+            # Trailing stopu güncelle
+            potential_trailing_stop = new_lowest_price * (1 + TRAILING_TP_DISTANCE_PCT / 100)
+            if potential_trailing_stop < new_trailing_stop_price:
+                new_trailing_stop_price = potential_trailing_stop
+
+            # Çıkış kontrolü
+            if current_price >= new_trailing_stop_price:
+                exit_reason = f"TRAILING TP SHORT: Fiyat {fmt_num(current_price)} >= Trailing Stop {fmt_num(new_trailing_stop_price)}"
+
+    # Güncellenmiş kayıtları döndür
+    updated_rec = {
+        "highest_price": new_highest_price,
+        "lowest_price": new_lowest_price,
+        "trailing_stop_price": new_trailing_stop_price,
+        "trailing_tp_active": new_trailing_tp_active,
+    }
+
+    if exit_reason:
+        updated_rec["exit_reason"] = exit_reason
+        updated_rec["exit_price"] = current_price
+        return updated_rec
+    
+    return updated_rec
 
 def rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0)) -> Dict[str, float]:
     risk = abs(entry - stop)
@@ -1751,11 +2035,28 @@ def rr_targets(entry, stop, side, rr_list=(1.0, 2.5, 4.0)) -> Dict[str, float]:
     return out
 
 
-def position_size(entry, stop, balance_usdt, risk_pct=1.5, leverage=1.0) -> Dict[str, float]:
+def position_size(entry, stop, balance_usdt, risk_pct=1.5, leverage=1.0, signal_score: float = 0.0) -> Dict[str, float]:
     stop_dist = abs(entry - stop)
     if stop_dist <= 0 or entry <= 0 or balance_usdt <= 0:
         return {"qty": 0.0, "notional": 0.0, "margin": 0.0, "risk_usdt": 0.0}
-    risk_usdt = balance_usdt * (risk_pct / 100.0)
+    # Dinamik pozisyon ölçeklendirme
+    effective_risk_pct = risk_pct
+    if SCORE_BASED_SIZING_ENABLED and signal_score > 0:
+        if signal_score <= SCORE_SIZING_MIN_SCORE:
+            risk_multiplier = SCORE_SIZING_MIN_MULTIPLIER
+        elif signal_score >= SCORE_SIZING_MAX_SCORE:
+            risk_multiplier = SCORE_SIZING_MAX_MULTIPLIER
+        else:
+            # Skor aralığında lineer interpolasyon
+            score_range = SCORE_SIZING_MAX_SCORE - SCORE_SIZING_MIN_SCORE
+            multiplier_range = SCORE_SIZING_MAX_MULTIPLIER - SCORE_SIZING_MIN_MULTIPLIER
+            risk_multiplier = SCORE_SIZING_MIN_MULTIPLIER + \
+                              (signal_score - SCORE_SIZING_MIN_SCORE) / score_range * multiplier_range
+        effective_risk_pct = risk_pct * risk_multiplier
+        logger.debug("Dinamik risk yüzdesi hesaplandı: Skor %s, Çarpan %s, Etkin Risk %s",
+                     signal_score, round(risk_multiplier, 2), round(effective_risk_pct, 2))
+
+    risk_usdt = balance_usdt * (effective_risk_pct / 100.0)
     qty = risk_usdt / stop_dist
     notional = qty * entry
     margin = notional / leverage if leverage > 0 else notional
@@ -1927,7 +2228,8 @@ def build_funding_signal(symbol, klines_1h, funding_rate,
         stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
         stop_pct = round(HYBRID_FIXED_STOP_PCT, 3)
     else:
-        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+        # DÜZELTME: market_regime["volatility"] yerine sabit "NORMAL" kullan
+        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult, market_volatility="NORMAL")
 
     liq_frac = max(0.0005, (1.0 / leverage) - HYBRID_MAINT_MARGIN_PCT) if leverage > 0 else 1.0
     stop_frac = abs(entry - stop) / entry if entry > 0 else 1.0
@@ -1936,7 +2238,9 @@ def build_funding_signal(symbol, klines_1h, funding_rate,
     liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
     stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
 
-    tps = _targets_for(entry, stop, side)
+    # TP seviyelerini RR bazlı hesapla (Daha tutarlı kâr alımı için)
+    tps = rr_targets(entry, stop, side, rr_list=(1.5, 3.0, 5.0)) # RR oranlarını biraz artırdık
+
     size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
     return {
         "symbol": symbol, "direction": side, "entry": entry,
@@ -2010,7 +2314,8 @@ def build_whale_signal(symbol, klines_1h, oi_change_pct, funding_rate,
         stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
         stop_pct = round(HYBRID_FIXED_STOP_PCT, 3)
     else:
-        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+        # DÜZELTME: market_regime["volatility"] yerine sabit "NORMAL" kullan
+        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult, market_volatility="NORMAL")
 
     liq_frac = max(0.0005, (1.0 / leverage) - HYBRID_MAINT_MARGIN_PCT) if leverage > 0 else 1.0
     stop_frac = abs(entry - stop) / entry if entry > 0 else 1.0
@@ -2019,7 +2324,9 @@ def build_whale_signal(symbol, klines_1h, oi_change_pct, funding_rate,
     liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
     stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
 
-    tps = _targets_for(entry, stop, side)
+    # TP seviyelerini RR bazlı hesapla (Daha tutarlı kâr alımı için)
+    tps = rr_targets(entry, stop, side, rr_list=(1.5, 3.0, 5.0)) # RR oranlarını biraz artırdık
+
     size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
     return {
         "symbol": symbol, "direction": side, "entry": entry,
@@ -2123,7 +2430,9 @@ def build_sweep_signal(symbol, klines_1h, klines_4h,
     liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
     stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
 
-    tps = _targets_for(entry, stop, side)
+    # TP seviyelerini RR bazlı hesapla (Daha tutarlı kâr alımı için)
+    tps = rr_targets(entry, stop, side, rr_list=(1.5, 3.0, 5.0)) # RR oranlarını biraz artırdık
+
     size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
     return {
         "symbol": symbol, "direction": side, "entry": entry,
@@ -2142,12 +2451,15 @@ def build_sweep_signal(symbol, klines_1h, klines_4h,
 
 
 def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
-                        balance_usdt=1000.0, risk_pct=1.5, leverage=1.0, atr_mult=1.5,
-                        require_both_ltf=False, allow_weak_trend=True) -> Optional[Dict[str, Any]]:
-    side_1h = ma_cross_trigger(klines_1h)
-    side, why = mtf_decision(side_1h, klines_4h, klines_15m, klines_5m,
-                             require_both_ltf=require_both_ltf, allow_weak_trend=allow_weak_trend)
-    if side is None:
+                         balance_usdt=1000.0, risk_pct=1.5, leverage=1.0, atr_mult=1.5,
+                         require_both_ltf=False, allow_weak_trend=True,
+                         signal_direction: str = "NONE", signal_score_reasons: List[str] = [], signal_total_score: float = 0.0,
+                         market_regime: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
+    
+    side = signal_direction
+    why = ", ".join(signal_score_reasons) # Yeni puanlama sisteminden gelen nedenleri kullan
+
+    if side == "NONE": # Puanlama sistemi zaten sinyal yoksa None dönecek
         return None
     closed_1h = _s_closed(klines_1h)
     if not closed_1h:
@@ -2162,7 +2474,7 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
         stop = entry * (1 - sp) if side == "LONG" else entry * (1 + sp)
         stop_pct = round(HYBRID_FIXED_STOP_PCT, 3)
     else:
-        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult)
+        stop, stop_pct = atr_stop(entry, side, atr_1h, mult=atr_mult, market_volatility=market_regime["volatility"])
 
     # --- LİKİDASYON KORUMASI ---
     # Likidasyon mesafesi (izole, kabaca): 1/kaldıraç - bakım marjı.
@@ -2176,7 +2488,9 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
     liq_price = entry * (1 - liq_frac) if side == "LONG" else entry * (1 + liq_frac)
     stop_to_liq_pct = abs((stop - liq_price) / entry) * 100.0 if entry > 0 else 0.0
 
-    tps = _targets_for(entry, stop, side)
+    # TP seviyelerini RR bazlı hesapla (Daha tutarlı kâr alımı için)
+    tps = rr_targets(entry, stop, side, rr_list=(1.5, 3.0, 5.0)) # RR oranlarını biraz artırdık
+
     size = position_size(entry, stop, balance_usdt, risk_pct=risk_pct, leverage=leverage)
     return {
         "symbol": symbol, "direction": side, "entry": entry,
@@ -2189,7 +2503,7 @@ def build_hybrid_signal(symbol, klines_1h, klines_4h, klines_15m, klines_5m,
         "risk_usdt": size["risk_usdt"], "leverage": leverage,
         "liquidation_price": liq_price, "stop_to_liq_pct": round(stop_to_liq_pct, 2),
         "candle_ts": candle_ts, "timeframe": "1H",
-        "mtf_note": why, "strategy": "HYBRID_MTF",
+        "mtf_note": why, "strategy": "HYBRID_MTF", "market_regime": market_regime,
     }
 
 
@@ -2527,6 +2841,11 @@ def mark_ma_sent(res: Dict[str, Any]) -> None:
         "support": res.get("support", 0),
         "resistance": res.get("resistance", 0),
         "timeframe": res.get("timeframe", MA_KLINE_INTERVAL),
+        "initial_stop": res["stop"], # Trailing TP için başlangıç stopu
+        "highest_price": res["entry"] if res["direction"] == "LONG" else 0.0, # Long için en yüksek fiyat        "lowest_price": res["entry"] if res["direction"] == "SHORT" else 0.0, # Short için en düşük fiyat
+        "trailing_stop_price": res["stop"], # Güncel trailing stop fiyatı
+        "trailing_tp_active": False, # Trailing TP aktif mi?
+        "entry_ts": sent_ts, # İşlemin açıldığı zaman damgası
     }
     memory.setdefault("stats", {})["ma_analyzed"] = int(memory.get("stats", {}).get("ma_analyzed", 0))
     if res["direction"] == "SHORT":
@@ -2657,60 +2976,95 @@ def current_open_ma_signals() -> List[Dict[str, str]]:
 
 
 async def analyze_hybrid_symbol(symbol: str) -> Optional[Dict[str, Any]]:
-    """Tek coin analiz. SIGNAL_ENGINE'e göre MA-MTF ya da Likidite Sweep. Ön-filtre rate-limit dostu."""
+    """Tek coin analiz. Yeni puanlama sistemine göre sinyal üretir."""
     symbol = normalize_symbol(symbol)
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, 120)
     if len(k1h) < 40:
         return None
+
     btc_bias = await get_btc_trend_bias()
-    if SIGNAL_ENGINE == "sweep":
-        if detect_liquidity_sweep(k1h, SWEEP_LOOKBACK, SWEEP_MIN_WICK_PCT)[0] is None:
-            return None  # ön-filtre: sweep yoksa fazladan istek yok
-        k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120)) if SWEEP_USE_TREND_FILTER else []
-        res = build_sweep_signal(
-            symbol, k1h, k4h, balance_usdt=HYBRID_BALANCE_USDT,
-            risk_pct=dynamic_risk_pct(btc_bias), leverage=HYBRID_LEVERAGE, lookback=SWEEP_LOOKBACK,
-        )
-    elif SIGNAL_ENGINE == "whale":
-        oi_change = await fetch_okx_oi_change(symbol, WHALE_OI_LOOKBACK)
-        if oi_change is None:
-            return None  # OI verisi yok → sinyal yok
-        funding = await fetch_okx_funding_rate(symbol)
-        res = build_whale_signal(
-            symbol, k1h, oi_change, funding if funding is not None else 0.0,
-            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
-            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
-        )
-    elif SIGNAL_ENGINE == "funding":
-        funding = await fetch_okx_funding_rate(symbol)
-        if funding is None:
-            return None  # funding yok → sinyal yok
-        res = build_funding_signal(
-            symbol, k1h, funding,
-            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
-            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
-        )
-    else:
-        if ma_cross_trigger(k1h) is None:  # ön-filtre: tetik yoksa fazladan istek yok
-            return None
-        k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
-        k15 = await get_klines(symbol, "15m", 60)
-        k5 = await get_klines(symbol, "5m", 60)
-        if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
-            return None
-        res = build_hybrid_signal(
-            symbol, k1h, k4h, k15, k5,
-            balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
-            leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
-            require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
-        )
-    if res and BTC_1H_FILTER:
-        d1 = btc_bias.get("dir_1h", "FLAT")
-        if (d1 == "UP" and res["direction"] != "LONG") or (d1 == "DOWN" and res["direction"] != "SHORT"):
-            return None  # BTC 1H yönüne ters → ele
+
+    # MTF onayları için gerekli klines (market_regime'den ÖNCE çekilmeli — k4h kullanılıyor)
+    k4h = await get_klines(symbol, HYBRID_TREND_TF, max(HYBRID_TREND_EMA + 10, 120))
+    k15 = await get_klines(symbol, "15m", 60)
+    k5 = await get_klines(symbol, "5m", 60)
+
+    # Piyasa rejimini tespit et (k4h artık tanımlı)
+    market_regime = detect_market_regime(k1h, k4h)
+
+
+    # Tüm sinyal motorlarından potansiyel sinyalleri topla
+    sweep_res = detect_liquidity_sweep(k1h, SWEEP_LOOKBACK, SWEEP_MIN_WICK_PCT)
+    sweep_signal_data = {"signal_found": sweep_res[0] is not None, "direction": sweep_res[0]} if sweep_res[0] else None
+
+    oi_change = await fetch_okx_oi_change(symbol, WHALE_OI_LOOKBACK)
+    funding_rate = await fetch_okx_funding_rate(symbol)
+
+    # Fiyat değişimi hesapla (Whale Eye için)
+    price_change_for_whale = 0.0
+    if len(k1h) >= WHALE_OI_LOOKBACK_MIN + 5:
+        c_whale = closes(k1h)
+        price_change_for_whale = pct_change(c_whale[-(WHALE_OI_LOOKBACK_MIN + 1)], c_whale[-1])
+
+    whale_signal_data = detect_whale_divergence(symbol, price_change_for_whale) if WHALE_EYE_ENABLED else None
+    funding_signal_data = detect_funding_signal(funding_rate) if FUNDING_EYE_ENABLED else None
+
+    ma_cross_data = ma_cross_trigger(k1h)
+    ma_signal_data = {"direction": ma_cross_data} if ma_cross_data else None
+
+    trend_4h_direction, _ = trend_4h(k4h, HYBRID_TREND_EMA)
+    momentum_15m_ok = momentum_ok(k15, ma_cross_data) if ma_cross_data else False # MA yönüne göre momentum
+    momentum_5m_ok = momentum_ok(k5, ma_cross_data) if ma_cross_data else False # MA yönüne göre momentum
+
+    # Sinyal puanını hesapla
+    signal_score_result = calculate_signal_score(
+        sweep_signal_data,
+        whale_signal_data,
+        funding_signal_data,
+        ma_signal_data,
+        trend_4h_direction,
+        momentum_15m_ok,
+        momentum_5m_ok,
+    )
+
+    if not signal_score_result["signal_found"]:
+        return None
+
+    # Sinyal bulunduğunda, build_hybrid_signal fonksiyonunu çağır
+    # Bu fonksiyonun parametrelerini yeni puanlama sistemine göre ayarlamamız gerekecek.
+    # Mevcut build_hybrid_signal, ma_cross_trigger'dan gelen 'side_1h' ve diğer kline'ları bekliyor.
+    # Yeni yapıda, 'signal_score_result["direction"]' ve toplanan kline'ları kullanacağız.
+
+    # build_hybrid_signal'ı çağırmadan önce gerekli tüm verilerin hazır olduğundan emin olmalıyız.
+    # Özellikle k4h, k15, k5 kline'larının yeterli uzunlukta olması gerekiyor.
+    if len(k4h) < 20 or len(k15) < 25 or len(k5) < 25:
+        return None
+
+    # build_hybrid_signal'ın side_1h parametresi artık signal_score_result'tan gelecek.
+    # mtf_decision'ı doğrudan çağırmak yerine, puanlama sistemi zaten bu onayları içeriyor.
+    # Bu nedenle build_hybrid_signal'ın içindeki mtf_decision çağrısını kaldırmamız veya değiştirmemiz gerekecek.
+    # Şimdilik, build_hybrid_signal'ı mevcut haliyle çağırıp, içindeki mtf_decision'ı pas geçmesini sağlayalım.
+    # Veya daha iyisi, build_hybrid_signal'ı yeni puanlama sistemine göre adapte edelim.
+
+    # Geçici olarak, build_hybrid_signal'ı doğrudan çağırıp, içindeki MTF mantığını atlayacak şekilde düzenleyelim.
+    # Daha sonra build_hybrid_signal'ı daha genel bir sinyal oluşturucuya dönüştüreceğiz.
+    res = build_hybrid_signal(
+        symbol, k1h, k4h, k15, k5,
+        balance_usdt=HYBRID_BALANCE_USDT, risk_pct=dynamic_risk_pct(btc_bias),
+        leverage=HYBRID_LEVERAGE, atr_mult=HYBRID_ATR_MULT,
+        require_both_ltf=HYBRID_REQUIRE_BOTH_LTF, allow_weak_trend=HYBRID_ALLOW_WEAK_TREND,
+        # Yeni eklenen parametreler
+        signal_direction=signal_score_result["direction"],
+        signal_score_reasons=signal_score_result["reasons"],
+        signal_total_score=signal_score_result["score"],
+        market_regime=market_regime,
+    )
+
     if res:
         res["btc_bias"] = btc_bias
+        res["signal_score_result"] = signal_score_result # Puanlama sonucunu da ekle
     return res
+
 
 
 def build_hybrid_message(res: Dict[str, Any]) -> str:
@@ -2727,13 +3081,14 @@ def build_hybrid_message(res: Dict[str, Any]) -> str:
             inst += f"💰 Funding bonus: +{fn_b:.0f} | %{safe_float(res.get('institutional_funding_pct_8h',0)):+.4f}/8h\n"
     return (
         f"🚨 {VERSION_NAME}\n"
-        f"HİBRİT MTF SİNYAL — {res['direction']} AL\n"
+        f"HİBRİT SİNYAL — {res['direction']} AL (Skor: {res.get('signal_score_result', {}).get('score', 0):.0f})\n"
         f"Saat: {tr_str()}\n"
         f"Coin: {res['symbol']}\n"
-        f"Mantık: 1H MA tetik + 4H {HYBRID_TREND_EMA} EMA trend + 15m/5m momentum\n"
-        f"Onay: {res.get('mtf_note','-')}\n"
+        f"Mantık: {', '.join(res.get('signal_score_result', {}).get('reasons', ['Çoklu Faktör Analizi']))}\n"
+
         f"BTC rejim: {(res.get('btc_bias') or {}).get('trend','-')} "
-        f"(gap %{safe_float((res.get('btc_bias') or {}).get('gap_pct',0)):+.2f}, ATR %{safe_float((res.get('btc_bias') or {}).get('atr_pct',0)):.2f}) | {res.get('regime_note','-')}\n"
+        f"(gap %{safe_float((res.get('btc_bias') or {}).get('gap_pct',0)):+.2f}, ATR %{safe_float((res.get('btc_bias') or {}).get('atr_pct',0)):.2f})\n"
+        f"Piyasa Rejimi: Trend={res.get('market_regime', {}).get('trend', '-')}, Volatilite={res.get('market_regime', {}).get('volatility', '-')}\n"
         f"{inst}"
         f"---\n"
         f"Entry: {fmt_num(res['entry'])}\n"
@@ -2757,35 +3112,39 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
         return
     symbol = res.get("symbol", "")
     direction = res.get("direction", "")
+    
+    # Sinyalin daha önce gönderilip gönderilmediğini kontrol et
     if ma_already_sent(res):
         return
+        
+    # Risk yöneticisi kontrolü
     ok_emit, neden = RISK_GUARD.can_emit(symbol, direction, current_open_ma_signals(), time.time())
     if not ok_emit:
-        logger.info("HİBRİT sinyal bloklandı %s %s: %s", symbol, direction, neden)
+        logger.info("HİBRİT sinyal risk blokajı %s %s: %s", symbol, direction, neden)
         return
-    try:
-        res = await enrich_ma_with_institutional(res)
-    except Exception as e:
-        logger.warning("HİBRİT institutional enrichment hata %s %s: %s", symbol, direction, e)
-    # BTC rejim geçidi (enrichment'tan SONRA — whale div + funding burada hazır)
+        
+    # BTC 1H yön filtresi (zaten analyze_hybrid_symbol içinde yapıldı ama burada da teyit edelim)
     btc_bias = res.get("btc_bias") or await get_btc_trend_bias()
-    allow_regime, regime_reason = btc_regime_gate(res, btc_bias)
-    if not allow_regime:
-        logger.info("HİBRİT rejim bloğu %s %s: %s", symbol, direction, regime_reason)
-        return
-    res["regime_note"] = regime_reason
+    if BTC_1H_FILTER:
+        d1 = btc_bias.get("dir_1h", "FLAT")
+        if (d1 == "UP" and direction != "LONG") or (d1 == "DOWN" and direction != "SHORT"):
+            logger.info("HİBRİT sinyal BTC 1H yön blokajı %s %s (BTC: %s)", symbol, direction, d1)
+            return
+
+    # Mesajı oluştur ve gönder
     try:
         msg = build_hybrid_message(res)
     except Exception as e:
         logger.exception("HİBRİT mesajı oluşturulamadı %s %s: %s", symbol, direction, e)
         return
+        
     ok = await safe_send_telegram(msg)
     if ok:
         async with memory_lock:
             mark_ma_sent(res)
             paper_record(res)
-        logger.info("HİBRİT TELEGRAM GÖNDERİLDİ %s %s entry=%s candle=%s",
-                    symbol, direction, fmt_num(safe_float(res.get("entry", 0))), res.get("candle_ts", "-"))
+        logger.info("HİBRİT TELEGRAM GÖNDERİLDİ %s %s (Skor: %s)",
+                    symbol, direction, res.get("signal_score_result", {}).get("score", 0))
     else:
         logger.warning("HİBRİT TELEGRAM GÖNDERİLEMEDİ %s %s", symbol, direction)
 
@@ -3483,6 +3842,16 @@ def build_ma_followup_message(rec: Dict[str, Any], hit: Dict[str, Any]) -> str:
         if direction == "SHORT":
             pnl_pct *= -1
         title = f"⚠️ AYNI 1M MUMDA STOP VE {hit.get('level', 'TP')} TEMASI"
+    elif result == "TRAILING_TP":
+        pnl_pct = pct_change(entry, result_price)
+        if direction == "SHORT":
+            pnl_pct *= -1
+        title = f"✅ İZ SÜREN KÂR AL (TRAILING TP) GELDİ"
+    elif result == "TIME_BASED_EXIT":
+        pnl_pct = pct_change(entry, result_price)
+        if direction == "SHORT":
+            pnl_pct *= -1
+        title = f"⏱ ZAMANA DAYALI ÇIKIŞ GELDİ"
     else:
         pnl_pct = pct_change(entry, result_price)
         if direction == "SHORT":
@@ -3523,9 +3892,41 @@ async def check_ma_followups() -> None:
         k1m = await get_klines(symbol, "1m", 300)
         if not k1m:
             continue
-        hit = detect_ma_followup_result(rec, k1m)
+        current_price = safe_float(k1m[-1][4])
+        if current_price <= 0:
+            continue
+
+        # Trailing TP kontrolü
+        if TRAILING_TP_ENABLED:
+            updated_tp_rec = check_trailing_tp(rec, current_price)
+            if updated_tp_rec:
+                rec.update(updated_tp_rec)
+                if "exit_reason" in updated_tp_rec:
+                    hit = {"result": "TRAILING_TP", "price": updated_tp_rec["exit_price"], "touch_ts": time.time()}
+                    logger.info("TRAILING TP ÇIKIŞI: %s %s", symbol, updated_tp_rec["exit_reason"])
+                else:
+                    hit = None # Trailing TP sadece güncellendi, çıkış yok
+            else:
+                hit = None
+        else:
+            hit = detect_ma_followup_result(rec, k1m)
+
+        # Zamana Dayalı Kapanış kontrolü
+        if not hit and TIME_BASED_EXIT_ENABLED and rec.get("entry_ts"):
+            time_in_position_hours = (time.time() - rec["entry_ts"]) / 3600
+            if time_in_position_hours >= TIME_BASED_EXIT_HOURS:
+                pnl_pct = pct_change(rec["entry"], current_price)
+                if rec["direction"] == "SHORT":
+                    pnl_pct *= -1
+                
+                if pnl_pct >= -TIME_BASED_EXIT_MAX_LOSS_PCT: # Zarar belirli bir eşiğin altındaysa kapat
+                    hit = {"result": "TIME_BASED_EXIT", "price": current_price, "touch_ts": time.time()}
+                    logger.info("ZAMANA DAYALI ÇIKIŞ: %s %s, %s saat sonra %%.2f PnL ile kapatıldı.", symbol, rec["direction"], TIME_BASED_EXIT_HOURS, pnl_pct)
+
         if not hit:
             continue
+
+        # Eğer bir çıkış tetiklendiyse (TP, Stop, Trailing TP, Time-based Exit)
         ok = await safe_send_telegram(build_ma_followup_message(rec, hit))
         if ok:
             rec["done"] = True
@@ -4569,6 +4970,8 @@ async def post_init(application) -> None:
     asyncio.create_task(diagnostic_loop())
     asyncio.create_task(followup_loop())
     asyncio.create_task(save_loop())
+    asyncio.create_task(v10_scan_loop())
+    asyncio.create_task(v10_paper_loop())
     logger.info("Arka plan döngüleri başlatıldı")
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4672,6 +5075,550 @@ def validate_config() -> None:
     if missing:
         raise RuntimeError(f"Eksik env: {', '.join(missing)}")
 
+# ============================================================================ #
+#  V10 SMC MOTORU (graft) — hibrit altyapısını paylaşır
+#  Tetik: Market Structure (BOS/CHoCH) → 4H filtre → FOMO → Pullback/Retest
+#  Confluence/skor: Structure, Order Block, FVG, Volume Profile, Liquidity
+#    Sweep, Orderbook (imbalance+duvar), OI, Funding, BTC, Hacim, RSI.
+#  Çıkış: Adaptif ATR stop + dinamik RR TP + kısmi çıkış 50/30/20 + BE trailing.
+#  Paper + öğrenen istatistik (memory["v10_paper"]).
+#  NOT: CVD = mum-yönü PROXY (gerçeği WS ister); spoofing yerine orderbook duvar.
+# ============================================================================ #
+V10_ENGINE_ENABLED   = os.getenv("V10_ENGINE_ENABLED", "true").lower() == "true"
+V10_KLINE_LIMIT      = int(float(os.getenv("V10_KLINE_LIMIT", "150")))
+V10_SWING_LEFT       = int(float(os.getenv("V10_SWING_LEFT", "2")))
+V10_SWING_RIGHT      = int(float(os.getenv("V10_SWING_RIGHT", "2")))
+V10_FOMO_LOOKBACK    = int(float(os.getenv("V10_FOMO_LOOKBACK", "5")))
+V10_FOMO_MAX_MOVE    = float(os.getenv("V10_FOMO_MAX_MOVE_PCT", "4.5"))
+V10_PULLBACK_TOL     = float(os.getenv("V10_PULLBACK_TOL_PCT", "0.6"))
+V10_PULLBACK_WAIT    = int(float(os.getenv("V10_PULLBACK_MAX_WAIT", "8")))
+V10_ATR_PERIOD       = int(float(os.getenv("V10_ATR_PERIOD", "14")))
+V10_ATR_MULT         = float(os.getenv("V10_ATR_MULT", "1.5"))
+V10_STOP_MIN_PCT     = float(os.getenv("V10_STOP_MIN_PCT", "0.004"))
+V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
+V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
+V10_USE_4H_FILTER    = os.getenv("V10_USE_4H_FILTER", "true").lower() == "true"
+V10_TP1_RR           = float(os.getenv("V10_TP1_RR", "1.0"))
+V10_TP2_RR           = float(os.getenv("V10_TP2_RR", "2.5"))
+V10_TP3_RR           = float(os.getenv("V10_TP3_RR", "4.0"))
+V10_OB_LOOKBACK      = int(float(os.getenv("V10_OB_LOOKBACK", "20")))
+V10_FVG_LOOKBACK     = int(float(os.getenv("V10_FVG_LOOKBACK", "15")))
+V10_VP_BINS          = int(float(os.getenv("V10_VP_BINS", "24")))
+V10_VP_LOOKBACK      = int(float(os.getenv("V10_VP_LOOKBACK", "80")))
+V10_CVD_WINDOW       = int(float(os.getenv("V10_CVD_WINDOW", "20")))
+V10_SWEEP_LOOKBACK   = int(float(os.getenv("V10_SWEEP_LOOKBACK", "6")))
+V10_SWEEP_MIN_WICK   = float(os.getenv("V10_SWEEP_MIN_WICK_RATIO", "0.5"))
+V10_OI_LOOKBACK_PER  = int(float(os.getenv("V10_OI_LOOKBACK_PERIODS", "12")))  # ×5dk
+V10_USE_ORDERBOOK    = os.getenv("V10_USE_ORDERBOOK", "true").lower() == "true"
+V10_OB_DEPTH         = int(float(os.getenv("V10_OB_DEPTH", "20")))
+V10_OB_WALL_MULT     = float(os.getenv("V10_OB_WALL_MULT", "3.0"))
+V10_ALERT_COOLDOWN_MIN = int(float(os.getenv("V10_ALERT_COOLDOWN_MIN", "60")))
+V10_MAX_OPEN         = int(float(os.getenv("V10_MAX_OPEN_POSITIONS", "12")))
+V10_RISK_PCT         = float(os.getenv("V10_RISK_PCT", "1.5"))
+V10_LEARN_MIN_TRADES = int(float(os.getenv("V10_LEARN_MIN_TRADES", "30")))
+V10_LEARN_AUTO_ADJUST = os.getenv("V10_LEARN_AUTO_ADJUST", "false").lower() == "true"
+
+v10_last_alert: Dict[str, float] = {}
+v10_sent_candle: Dict[str, str] = {}
+
+
+class V10Swing:
+    __slots__ = ("idx", "price", "kind")
+    def __init__(self, idx, price, kind):
+        self.idx = idx; self.price = price; self.kind = kind
+
+
+def v10_find_swings(k, left, right):
+    H = highs(k); L = lows(k); n = len(k); sw = []
+    for i in range(left, n - right):
+        wh = H[i-left:i+right+1]; wl = L[i-left:i+right+1]
+        if H[i] == max(wh) and wh.count(H[i]) == 1:
+            sw.append(V10Swing(i, H[i], "H"))
+        elif L[i] == min(wl) and wl.count(L[i]) == 1:
+            sw.append(V10Swing(i, L[i], "L"))
+    return sw
+
+
+def v10_market_structure(k):
+    sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT)
+    res = {"trend":"RANGE","hh":False,"hl":False,"lh":False,"ll":False,
+           "last_sh":0.0,"last_sh_idx":-1,"last_sl":0.0,"last_sl_idx":-1,
+           "event":None,"event_side":None,"event_level":0.0,"event_idx":-1}
+    hs = [s for s in sw if s.kind == "H"]; ls = [s for s in sw if s.kind == "L"]
+    if hs: res["last_sh"] = hs[-1].price; res["last_sh_idx"] = hs[-1].idx
+    if ls: res["last_sl"] = ls[-1].price; res["last_sl_idx"] = ls[-1].idx
+    if len(hs) >= 2:
+        res["hh"] = hs[-1].price > hs[-2].price; res["lh"] = hs[-1].price < hs[-2].price
+    if len(ls) >= 2:
+        res["hl"] = ls[-1].price > ls[-2].price; res["ll"] = ls[-1].price < ls[-2].price
+    if res["hh"] and res["hl"]: res["trend"] = "UP"
+    elif res["lh"] and res["ll"]: res["trend"] = "DOWN"
+    lc = closes(k)[-1]
+    if res["last_sh"] > 0 and lc > res["last_sh"]:
+        res["event"] = "CHoCH" if res["trend"] == "DOWN" else "BOS"
+        res["event_side"] = "UP"; res["event_level"] = res["last_sh"]; res["event_idx"] = res["last_sh_idx"]
+    elif res["last_sl"] > 0 and lc < res["last_sl"]:
+        res["event"] = "CHoCH" if res["trend"] == "UP" else "BOS"
+        res["event_side"] = "DOWN"; res["event_level"] = res["last_sl"]; res["event_idx"] = res["last_sl_idx"]
+    return res
+
+
+def v10_structure_allows(side, ms):
+    ev, es = ms.get("event"), ms.get("event_side")
+    if side == "LONG" and es == "UP" and ev in ("BOS", "CHoCH"):
+        return True, f"Boğa {ev} ({'devam' if ev=='BOS' else 'dönüş'})"
+    if side == "SHORT" and es == "DOWN" and ev in ("BOS", "CHoCH"):
+        return True, f"Ayı {ev} ({'devam' if ev=='BOS' else 'dönüş'})"
+    return False, ""
+
+
+def v10_fomo_block(side, k):
+    c = closes(k)
+    if len(c) < V10_FOMO_LOOKBACK + 1:
+        return False, 0.0
+    mv = (c[-1] - c[-1-V10_FOMO_LOOKBACK]) / c[-1-V10_FOMO_LOOKBACK] * 100.0
+    if side == "LONG" and mv > V10_FOMO_MAX_MOVE: return True, mv
+    if side == "SHORT" and mv < -V10_FOMO_MAX_MOVE: return True, mv
+    return False, mv
+
+
+def v10_pullback(side, k, ms):
+    lvl = safe_float(ms.get("event_level"))
+    if lvl <= 0 or ms.get("event_side") not in ("UP", "DOWN"):
+        return False, ""
+    ev_idx = int(ms.get("event_idx", -1)); n = len(k)
+    seg = k[max(ev_idx+1, n-V10_PULLBACK_WAIT):]
+    if len(seg) < 2:
+        return False, ""
+    tol = V10_PULLBACK_TOL / 100.0
+    last = k[-1]; lc=safe_float(last[4]); ll=safe_float(last[3]); lh=safe_float(last[2]); lo=safe_float(last[1])
+    if side == "LONG":
+        touched = any(safe_float(r[3]) <= lvl*(1+tol) for r in seg)
+        if (touched and lc > lvl and lc > lo) or (lc > lvl and ll <= lvl*(1+tol)):
+            return True, f"retest @ {lvl:.6g}"
+    else:
+        touched = any(safe_float(r[2]) >= lvl*(1-tol) for r in seg)
+        if (touched and lc < lvl and lc < lo) or (lc < lvl and lh >= lvl*(1-tol)):
+            return True, f"retest @ {lvl:.6g}"
+    return False, ""
+
+
+def v10_detect_order_block(side, k):
+    n = len(k); seg = k[max(0, n-V10_OB_LOOKBACK):]
+    zone = None
+    for r in reversed(seg):
+        o = safe_float(r[1]); c = safe_float(r[4])
+        if side == "LONG" and c < o: zone = (safe_float(r[3]), safe_float(r[2])); break
+        if side == "SHORT" and c > o: zone = (safe_float(r[3]), safe_float(r[2])); break
+    if not zone: return 0.0
+    lo, hi = zone; price = safe_float(k[-1][4])
+    tol = (hi-lo)*0.5 if hi > lo else price*0.003
+    if side == "LONG":
+        return 1.0 if lo-tol <= price <= hi+tol else 0.3 if price > hi else 0.0
+    return 1.0 if lo-tol <= price <= hi+tol else 0.3 if price < lo else 0.0
+
+
+def v10_detect_fvg(side, k):
+    n = len(k); best = None
+    for i in range(max(1, n-V10_FVG_LOOKBACK), n-1):
+        if i+1 >= n: break
+        if side == "LONG":
+            h0 = safe_float(k[i-1][2]); l2 = safe_float(k[i+1][3])
+            if h0 < l2 and not any(safe_float(k[j][3]) <= h0 for j in range(i+2, n)): best = True
+        else:
+            l0 = safe_float(k[i-1][3]); h2 = safe_float(k[i+1][2])
+            if l0 > h2 and not any(safe_float(k[j][2]) >= l0 for j in range(i+2, n)): best = True
+    return 1.0 if best else 0.0
+
+
+def v10_volume_profile(k):
+    seg = k[-V10_VP_LOOKBACK:] if len(k) > V10_VP_LOOKBACK else k
+    H = highs(seg); L = lows(seg); lo = min(L); hi = max(H)
+    if hi <= lo: return None
+    w = (hi-lo)/V10_VP_BINS; prof = [0.0]*V10_VP_BINS
+    for r in seg:
+        mid = (safe_float(r[2])+safe_float(r[3]))/2; v = safe_float(r[5])
+        idx = min(V10_VP_BINS-1, max(0, int((mid-lo)/w))); prof[idx] += v
+    poc_idx = max(range(V10_VP_BINS), key=lambda i: prof[i])
+    poc = lo + (poc_idx+0.5)*w
+    total = sum(prof); target = total*0.7
+    order = sorted(range(V10_VP_BINS), key=lambda i: prof[i], reverse=True)
+    acc = 0.0; sel = set()
+    for i in order:
+        acc += prof[i]; sel.add(i)
+        if acc >= target: break
+    return {"poc":poc,"vah":lo+(max(sel)+1)*w,"val":lo+min(sel)*w}
+
+
+def v10_vp_score(side, price, vp):
+    if not vp: return 0.5
+    if side == "LONG":
+        return 1.0 if price > vp["poc"] else 0.5 if price >= vp["val"] else 0.2
+    return 1.0 if price < vp["poc"] else 0.5 if price <= vp["vah"] else 0.2
+
+
+def v10_cvd_proxy(k):
+    seg = k[-V10_CVD_WINDOW:]; cvd = 0.0; series = []
+    for r in seg:
+        o = safe_float(r[1]); c = safe_float(r[4]); v = safe_float(r[5])
+        cvd += v if c >= o else -v; series.append(cvd)
+    return (series[-1]-series[0]) if len(series) >= 2 else 0.0
+
+
+def v10_detect_sweep(side, k, ms):
+    seg = k[-V10_SWEEP_LOOKBACK:]
+    sl = safe_float(ms.get("last_sl")); sh = safe_float(ms.get("last_sh"))
+    if side == "LONG" and sl > 0:
+        for r in seg:
+            o=safe_float(r[1]); c=safe_float(r[4]); l=safe_float(r[3])
+            if l < sl and c > sl and (min(o,c)-l) > (abs(c-o)+1e-9)*V10_SWEEP_MIN_WICK:
+                return 1.0
+    if side == "SHORT" and sh > 0:
+        for r in seg:
+            o=safe_float(r[1]); c=safe_float(r[4]); h=safe_float(r[2])
+            if h > sh and c < sh and (h-max(o,c)) > (abs(c-o)+1e-9)*V10_SWEEP_MIN_WICK:
+                return 1.0
+    return 0.0
+
+
+def v10_quality_score(side, k, ms, ext):
+    p = {}
+    ok, _ = v10_structure_allows(side, ms)
+    s = 18.0 if ok else 0.0
+    if ok and ms.get("event") == "CHoCH": s *= 0.85
+    p["structure"] = s
+    vols = [safe_float(r[5]) for r in k[-21:-1]]; av = sum(vols)/len(vols) if vols else 0.0
+    lv = safe_float(k[-1][5]); p["volume"] = 7.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
+    r = rsi(closes(k))[-1]
+    if side == "LONG": p["rsi"] = 7.0*(1.0 if 45 <= r <= 65 else 0.5 if 35 <= r <= 75 else 0.1)
+    else: p["rsi"] = 7.0*(1.0 if 35 <= r <= 55 else 0.5 if 25 <= r <= 65 else 0.1)
+    oi = safe_float(ext.get("oi_change_pct")); p["oi"] = 9.0*(1.0 if oi > 0.5 else 0.5 if oi > 0 else 0.2)
+    fr = safe_float(ext.get("funding"))
+    if side == "LONG": p["funding"] = 7.0*(0.2 if fr > 0.0008 else 1.0 if fr < 0 else 0.7)
+    else: p["funding"] = 7.0*(0.2 if fr < -0.0008 else 1.0 if fr > 0 else 0.7)
+    btc = str(ext.get("btc_dir", "FLAT")).upper()
+    if side == "LONG": p["btc"] = 9.0*(1.0 if btc == "UP" else 0.3 if btc == "DOWN" else 0.6)
+    else: p["btc"] = 9.0*(1.0 if btc == "DOWN" else 0.3 if btc == "UP" else 0.6)
+    ob = ext.get("orderbook") or {}; imb = safe_float(ob.get("imbalance"))
+    if side == "LONG":
+        obs = (0.6 if imb > 0.15 else 0.3 if imb > 0 else 0.0) + (0.4 if ob.get("bid_wall") else 0.0)
+    else:
+        obs = (0.6 if imb < -0.15 else 0.3 if imb < 0 else 0.0) + (0.4 if ob.get("ask_wall") else 0.0)
+    p["orderbook"] = 7.0*min(1.0, obs)
+    p["order_block"] = 11.0*v10_detect_order_block(side, k)
+    p["fvg"] = 8.0*v10_detect_fvg(side, k)
+    p["volume_profile"] = 5.0*v10_vp_score(side, safe_float(k[-1][4]), v10_volume_profile(k))
+    cv = v10_cvd_proxy(k)
+    p["cvd"] = 5.0*(1.0 if (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT") else 0.2)
+    p["sweep"] = 7.0*v10_detect_sweep(side, k, ms)
+    return round(sum(p.values()), 1), {kk: round(vv, 1) for kk, vv in p.items()}, round(r, 1)
+
+
+def v10_targets(side, entry, a):
+    dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
+    stop = entry-dist if side == "LONG" else entry+dist
+    risk = abs(entry-stop)
+    if side == "LONG":
+        tp1, tp2, tp3 = entry+risk*V10_TP1_RR, entry+risk*V10_TP2_RR, entry+risk*V10_TP3_RR
+    else:
+        tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
+    return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,"tp1":tp1,"tp2":tp2,"tp3":tp3}
+
+
+async def v10_fetch_orderbook(symbol):
+    blank = {"imbalance":0.0,"bid_wall":False,"ask_wall":False}
+    if not V10_USE_ORDERBOOK:
+        return blank
+    try:
+        data = await asyncio.to_thread(_okx_get, "/api/v5/market/books",
+                                       {"instId": symbol, "sz": V10_OB_DEPTH})
+        if not data:
+            return blank
+        book = data[0]
+        bsz = [safe_float(x[1]) for x in book.get("bids", [])[:V10_OB_DEPTH]]
+        asz = [safe_float(x[1]) for x in book.get("asks", [])[:V10_OB_DEPTH]]
+        bids = sum(bsz); asks = sum(asz); tot = bids+asks
+        imb = (bids-asks)/tot if tot > 0 else 0.0
+        bmean = bids/len(bsz) if bsz else 0; amean = asks/len(asz) if asz else 0
+        return {"imbalance": imb,
+                "bid_wall": (max(bsz) > bmean*V10_OB_WALL_MULT) if bsz and bmean > 0 else False,
+                "ask_wall": (max(asz) > amean*V10_OB_WALL_MULT) if asz and amean > 0 else False}
+    except Exception as e:
+        logger.debug("V10 ob fail %s: %s", symbol, e)
+        return blank
+
+
+def v10_structure_gate(symbol, k1h, k4h):
+    k = _s_closed(k1h)
+    if len(k) < 40:
+        return None
+    ms = v10_market_structure(k)
+    trend4 = "FLAT"
+    if V10_USE_4H_FILTER and k4h and len(k4h) >= 52:
+        c4 = closes(_s_closed(k4h)); e = ema(c4, min(50, len(c4)-1))
+        trend4 = "UP" if c4[-1] > e[-1] else "DOWN"
+    for side in ("LONG", "SHORT"):
+        ok, why = v10_structure_allows(side, ms)
+        if not ok: continue
+        if V10_USE_4H_FILTER and trend4 != "FLAT":
+            if side == "LONG" and trend4 != "UP": continue
+            if side == "SHORT" and trend4 != "DOWN": continue
+        blk, mv = v10_fomo_block(side, k)
+        if blk: continue
+        pb, note = v10_pullback(side, k, ms)
+        if not pb: continue
+        return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),"pullback":note,"k":k}
+    return None
+
+
+async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    symbol = normalize_symbol(symbol)
+    k1h = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
+    if len(k1h) < 40:
+        return None
+    k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
+    gate = v10_structure_gate(symbol, k1h, k4h)
+    if not gate:
+        return None
+    side = gate["side"]; k = gate["k"]
+    oi = await fetch_okx_oi_change(symbol, V10_OI_LOOKBACK_PER)
+    funding = await fetch_okx_funding_rate(symbol)
+    btc = (await get_btc_trend_bias()).get("trend", "FLAT")
+    ob = await v10_fetch_orderbook(symbol)
+    ext = {"oi_change_pct": oi if oi is not None else 0.0,
+           "funding": funding, "btc_dir": btc, "orderbook": ob}
+    score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
+    if score < V10_MIN_QUALITY:
+        return None
+    entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a)
+    return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
+            "event":gate["ms"]["event"],"structure":gate["why"],
+            "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
+            "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
+            "score":score,"score_parts":parts,"rsi":r,"atr":round(a,8),
+            "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
+            "funding":funding,"ob_imbalance":ob.get("imbalance",0),**tgt}
+
+
+def _v10_fmt(x):
+    x = safe_float(x)
+    if x == 0: return "0"
+    if x >= 100: return f"{x:.2f}"
+    if x >= 1: return f"{x:.4f}"
+    return f"{x:.6f}"
+
+
+def build_v10_message(sig):
+    p = sig["score_parts"]
+    tag = lambda key, lbl: f"{lbl}{'✅' if p.get(key,0) > 0 else '▫️'}"
+    conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
+                     tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
+    fund = safe_float(sig.get("funding"))
+    return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
+            f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
+            f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n"
+            f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
+            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({V10_TP2_RR}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({V10_TP3_RR}R %20)\n"
+            f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
+            f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
+            f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
+
+
+def v10_score_band(s):
+    return "90-100" if s >= 90 else "80-90" if s >= 80 else "70-80" if s >= 70 else "60-70"
+
+
+def _v10_mem():
+    return memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
+
+
+def v10_open_paper(sig):
+    mp = _v10_mem()
+    mp["open"].append({
+        "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
+        "orig_stop":sig["stop"],"stop":sig["stop"],
+        "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
+        "tp1_rr":V10_TP1_RR,"tp2_rr":V10_TP2_RR,"tp3_rr":V10_TP3_RR,
+        "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
+        "score":sig["score"],"event":sig["event"],
+        "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
+        "open_ts":time.time(),"candle_ts":sig["candle_ts"]})
+
+
+def v10_check_paper(pos, price):
+    side = pos["side"]; e = pos["entry"]; w = {"tp1":0.5,"tp2":0.3,"tp3":0.2}
+    if side == "LONG":
+        if not pos["hit1"] and price <= pos["orig_stop"]: return -1.0, "STOP"
+        if pos["hit1"] and price <= e: return pos["realized"], "BE"
+        if not pos["hit1"] and price >= pos["tp1"]:
+            pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
+        if pos["hit1"] and not pos["hit2"] and price >= pos["tp2"]:
+            pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
+        if pos["hit2"] and not pos["hit3"] and price >= pos["tp3"]:
+            pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
+    else:
+        if not pos["hit1"] and price >= pos["orig_stop"]: return -1.0, "STOP"
+        if pos["hit1"] and price >= e: return pos["realized"], "BE"
+        if not pos["hit1"] and price <= pos["tp1"]:
+            pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
+        if pos["hit1"] and not pos["hit2"] and price <= pos["tp2"]:
+            pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
+        if pos["hit2"] and not pos["hit3"] and price <= pos["tp3"]:
+            pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
+    return None, None
+
+
+def v10_record_closed(pos, R, outcome):
+    mp = _v10_mem()
+    mp["closed"].append({"symbol":pos["symbol"],"side":pos["side"],"R":round(R,3),
+        "outcome":outcome,"score":pos["score"],"event":pos["event"],
+        "bucket":pos["bucket"],"close_ts":time.time()})
+    b = mp["buckets"].setdefault(pos["bucket"], {"n":0,"R":0.0,"win":0})
+    b["n"] += 1; b["R"] = round(b["R"]+R, 3)
+    if R > 0: b["win"] += 1
+
+
+def v10_learn_report():
+    mp = _v10_mem(); out = []
+    for bk, b in sorted(mp["buckets"].items(), key=lambda x: x[1]["R"], reverse=True):
+        n = b["n"]; out.append((bk, n, round(b["win"]/n*100,1) if n else 0, round(b["R"]/n,3) if n else 0))
+    return out
+
+
+def v10_learn_adjust():
+    global V10_MIN_QUALITY
+    mp = _v10_mem()
+    if not V10_LEARN_AUTO_ADJUST or len(mp["closed"]) < V10_LEARN_MIN_TRADES:
+        return None
+    worst = None
+    for bk, b in mp["buckets"].items():
+        if b["n"] >= 10:
+            ev = b["R"]/b["n"]
+            if ev < -0.1 and (worst is None or ev < worst[1]): worst = (bk, ev)
+    if worst and V10_MIN_QUALITY < 85:
+        V10_MIN_QUALITY += 2
+        logger.info("V10 ADAPTİF: %s EV=%.2f → min skor %d", worst[0], worst[1], int(V10_MIN_QUALITY))
+        return f"{worst[0]} kötü (EV {worst[1]:.2f}) → min skor {int(V10_MIN_QUALITY)}"
+    return None
+
+
+def v10_cooldown_ok(symbol):
+    return time.time() - v10_last_alert.get(symbol, 0) >= V10_ALERT_COOLDOWN_MIN*60
+
+
+async def maybe_send_v10_signal(sig):
+    if not sig:
+        return
+    symbol = sig["symbol"]; side = sig["direction"]
+    ckey = f"{symbol}:{side}"
+    if v10_sent_candle.get(ckey) == sig["candle_ts"]:
+        return
+    if not v10_cooldown_ok(symbol):
+        return
+    ok = await safe_send_telegram(build_v10_message(sig))
+    if ok:
+        v10_last_alert[symbol] = time.time()
+        v10_sent_candle[ckey] = sig["candle_ts"]
+        mp = _v10_mem()
+        if len(mp["open"]) < V10_MAX_OPEN:
+            v10_open_paper(sig)
+        stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
+        stats["last_signal"] = f"V10 {side} {symbol} skor {sig['score']}"
+        logger.info("V10 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
+    else:
+        logger.warning("V10 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
+
+
+async def v10_scan_loop() -> None:
+    if not V10_ENGINE_ENABLED:
+        return
+    await asyncio.sleep(4)
+    while True:
+        try:
+            if not COINS:
+                await refresh_coin_pool(force=True)
+            batch_size = 8
+            coins = list(COINS)[:MA_COIN_LIMIT]
+            cfail = 0; ctot = 0
+            for i in range(0, len(coins), batch_size):
+                batch = coins[i:i+batch_size]
+                tasks = [analyze_v10_symbol(sym) for sym in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in results:
+                    ctot += 1
+                    if isinstance(res, Exception):
+                        cfail += 1
+                        logger.warning("V10 batch hata: %s", res)
+                        continue
+                    stats["v10_analyzed"] = int(stats.get("v10_analyzed", 0)) + 1
+                    if res:
+                        stats["v10_candidates"] = int(stats.get("v10_candidates", 0)) + 1
+                        await maybe_send_v10_signal(res)
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.exception("v10_scan_loop hata: %s", e)
+        await asyncio.sleep(max(5.0, MA_SCAN_INTERVAL_SEC))
+
+
+async def v10_paper_loop() -> None:
+    if not V10_ENGINE_ENABLED:
+        return
+    await asyncio.sleep(12)
+    while True:
+        try:
+            mp = _v10_mem()
+            still = []
+            for pos in mp["open"]:
+                k = await get_klines(pos["symbol"], MA_KLINE_INTERVAL, 3)
+                if not k:
+                    still.append(pos); continue
+                R, oc = v10_check_paper(pos, closes(k)[-1])
+                if oc:
+                    v10_record_closed(pos, R, oc)
+                    await safe_send_telegram(
+                        f"🏁 V10 PAPER KAPANDI: {pos['side']} {pos['symbol']} → {oc} | R={round(R,2)} | skor {pos['score']}")
+                    logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
+                else:
+                    still.append(pos)
+            mp["open"] = still
+            adj = v10_learn_adjust()
+            if adj:
+                await safe_send_telegram(f"🧠 V10 öğrenen: {adj}")
+        except Exception as e:
+            logger.exception("v10_paper_loop hata: %s", e)
+        await asyncio.sleep(max(60, int(MA_SCAN_INTERVAL_SEC)))
+
+
+async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mp = _v10_mem()
+    cl = mp["closed"]; n = len(cl)
+    ev = (sum(x["R"] for x in cl)/n) if n else 0
+    wins = sum(1 for x in cl if x["R"] > 0)
+    lines = [
+        f"🆕 V10 SMC durumu",
+        f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {int(V10_MIN_QUALITY)}",
+        f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
+        f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
+        f"4H filtre: {V10_USE_4H_FILTER} | Orderbook: {V10_USE_ORDERBOOK} | Öğrenen: {V10_LEARN_AUTO_ADJUST}",
+    ]
+    rep = v10_learn_report()
+    if rep:
+        lines.append("— Setup EV —")
+        for bk, nn, wr, e in rep[:8]:
+            lines.append(f"{bk}: n={nn} WR%{wr} EV={e}R")
+    if mp["open"]:
+        lines.append("— Açık —")
+        for p in mp["open"][:10]:
+            tps = "".join("✅" if p[f"hit{i}"] else "▫️" for i in (1, 2, 3))
+            lines.append(f"{p['side']} {p['symbol']} {tps} R:{round(p['realized'],2)} skor {p['score']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================================================================ #
+#  V10 SMC MOTORU graft sonu
+# ============================================================================ #
+
+
 def build_app():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", cmd_start))
@@ -4690,6 +5637,7 @@ def build_app():
     application.add_handler(CommandHandler("paper", cmd_paper))
     application.add_handler(CommandHandler("version", cmd_version))
     application.add_handler(CommandHandler("funding", cmd_funding))
+    application.add_handler(CommandHandler("v10", cmd_v10))
     return application
 
 def main() -> None:
@@ -4720,3 +5668,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
