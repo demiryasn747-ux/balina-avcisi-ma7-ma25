@@ -96,6 +96,15 @@ SYMBOL_FAIL_MAX_STREAK = int(float(os.getenv("SYMBOL_FAIL_MAX_STREAK", "3")))
 MIN_24H_QUOTE_VOLUME = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
 MAX_24H_QUOTE_VOLUME = float(os.getenv("MAX_24H_QUOTE_VOLUME", "100000000"))  # üst sınır (mid-cap bandı); 0 = sınırsız
 
+# === COIN FİLTRESİ: fiyat + meme + blocklist (hepsi Railway Variables'tan ayarlanır) ===
+COIN_MAX_PRICE  = float(os.getenv("COIN_MAX_PRICE", "50"))   # bu USDT fiyatının ÜSTÜNDEKİ coinler elenir (QQQ vb.); 0 = kapalı
+COIN_MIN_PRICE  = float(os.getenv("COIN_MIN_PRICE", "0"))    # bu fiyatın ALTINDAKİLER elenir; 0 = kapalı
+EXCLUDE_MEMES   = os.getenv("EXCLUDE_MEMES", "true").lower() == "true"
+MEME_COIN_BASES = set(x.strip().upper() for x in os.getenv("MEME_COIN_BASES",
+    "DOGE,SHIB,PEPE,1000PEPE,1000SHIB,1000BONK,1000FLOKI,WIF,BONK,FLOKI,MEME,BRETT,MEW,TURBO,POPCAT,MOG,NEIRO,DOGS,PNUT,ACT,BOME,SLERF,MYRO,WEN,TRUMP,MELANIA,MOODENG,GOAT,CHILLGUY,BAN,PONKE,FARTCOIN,AIDOGE,BABYDOGE,GIGA,APU,HIPPO,MOTHER,DEGEN,TOSHI,SPX,WOJAK,SUNDOG"
+    ).split(",") if x.strip())
+EXTRA_BLOCKLIST = set(x.strip().upper() for x in os.getenv("EXTRA_BLOCKLIST", "").split(",") if x.strip())
+
 MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
@@ -902,6 +911,18 @@ def quote_volume_from_ticker(row: Dict[str, Any]) -> float:
     vol_ccy_24h = safe_float(row.get("volCcy24h", 0))
     return max(vol_ccy_24h, vol24h * max(last, 1e-12))
 
+def coin_allowed(ns: str, last_price: float) -> bool:
+    base = _base_of(ns)
+    if EXCLUDE_MEMES and base in MEME_COIN_BASES:
+        return False
+    if base in EXTRA_BLOCKLIST:
+        return False
+    if COIN_MAX_PRICE > 0 and last_price > COIN_MAX_PRICE:
+        return False
+    if COIN_MIN_PRICE > 0 and 0 < last_price < COIN_MIN_PRICE:
+        return False
+    return True
+
 def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: Dict[str, Dict[str, Any]]) -> List[str]:
     rows: List[Tuple[str, float]] = []
     for sym, row in tickers.items():
@@ -914,6 +935,8 @@ def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: D
         if qv < MIN_24H_QUOTE_VOLUME:   # düşük hacimli saçma coinleri ele
             continue
         if MAX_24H_QUOTE_VOLUME > 0 and qv > MAX_24H_QUOTE_VOLUME:  # mega-cap'leri ele (mid-cap bandı)
+            continue
+        if not coin_allowed(ns, safe_float(row.get("last", 0))):  # meme + yüksek fiyat + blocklist ele
             continue
         rows.append((ns, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
@@ -5412,6 +5435,26 @@ def build_v10_message(sig):
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
 
+def build_v10_close_message(pos, R, outcome, exit_price):
+    if outcome == "STOP":
+        head = "❌ STOP GELDİ"
+    elif outcome == "TP3":
+        head = "✅ TP3 GELDİ — tam hedef"
+    elif outcome == "BE":
+        head = "⚖️ BREAKEVEN — TP1 sonrası girişe döndü"
+    else:
+        head = f"🏁 {outcome}"
+    return (
+        f"🆕 V10 SMC — POZİSYON KAPANDI\n"
+        f"{head}\n"
+        f"Coin: {pos['symbol']}\n"
+        f"Yön: {pos['side']}\n"
+        f"Giriş: {_v10_fmt(pos['entry'])}\n"
+        f"Çıkış: {_v10_fmt(exit_price)}\n"
+        f"Sonuç: {R:+.2f}R (skor {pos['score']})\n"
+        f"Saat: {tr_str()}"
+    )
+
 def v10_score_band(s):
     return "90-100" if s >= 90 else "80-90" if s >= 80 else "70-80" if s >= 70 else "60-70"
 
@@ -5560,14 +5603,24 @@ async def v10_paper_loop() -> None:
                 k = await get_klines(pos["symbol"], MA_KLINE_INTERVAL, 3)
                 if not k:
                     still.append(pos); continue
+                was1, was2 = pos["hit1"], pos["hit2"]
                 R, oc = v10_check_paper(pos, closes(k)[-1])
-                if oc:
-                    v10_record_closed(pos, R, oc)
-                    await safe_send_telegram(
-                        f"🏁 V10 PAPER KAPANDI: {pos['side']} {pos['symbol']} → {oc} | R={round(R,2)} | skor {pos['score']}")
-                    logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
-                else:
+                if not oc:
+                    if pos["hit1"] and not was1:
+                        await safe_send_telegram(
+                            f"✅ V10 TP1 GELDİ — {pos['side']} {pos['symbol']}\n"
+                            f"Fiyat: {_v10_fmt(pos['tp1'])} | %50 realize\n"
+                            f"Stop girişe çekildi (artık zararsız) | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
+                    if pos["hit2"] and not was2:
+                        await safe_send_telegram(
+                            f"✅ V10 TP2 GELDİ — {pos['side']} {pos['symbol']}\n"
+                            f"Fiyat: {_v10_fmt(pos['tp2'])} | %30 realize | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
                     still.append(pos)
+                    continue
+                v10_record_closed(pos, R, oc)
+                exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp3"] if oc == "TP3" else pos["entry"])
+                await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
+                logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
             mp["open"] = still
             adj = v10_learn_adjust()
             if adj:
