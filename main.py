@@ -5297,7 +5297,7 @@ def v10_quality_score(side, k, ms, ext):
     if ok and ms.get("event") == "CHoCH": s *= 0.85
     p["structure"] = s
     vols = [safe_float(r[5]) for r in k[-21:-1]]; av = sum(vols)/len(vols) if vols else 0.0
-    lv = safe_float(k[-1][5]); p["volume"] = 7.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
+    lv = safe_float(k[-1][5]); p["volume"] = 2.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
     r = rsi(closes(k))[-1]
     if side == "LONG": p["rsi"] = 7.0*(1.0 if 45 <= r <= 65 else 0.5 if 35 <= r <= 75 else 0.1)
     else: p["rsi"] = 7.0*(1.0 if 35 <= r <= 55 else 0.5 if 25 <= r <= 65 else 0.1)
@@ -5305,9 +5305,19 @@ def v10_quality_score(side, k, ms, ext):
     fr = safe_float(ext.get("funding"))
     if side == "LONG": p["funding"] = 7.0*(0.2 if fr > 0.0008 else 1.0 if fr < 0 else 0.7)
     else: p["funding"] = 7.0*(0.2 if fr < -0.0008 else 1.0 if fr > 0 else 0.7)
-    btc = str(ext.get("btc_dir", "FLAT")).upper()
-    if side == "LONG": p["btc"] = 9.0*(1.0 if btc == "UP" else 0.3 if btc == "DOWN" else 0.6)
-    else: p["btc"] = 9.0*(1.0 if btc == "DOWN" else 0.3 if btc == "UP" else 0.6)
+    btc4h = str(ext.get("btc_dir", "FLAT")).upper()
+    btc1h = str(ext.get("btc_dir_1h", "FLAT")).upper()
+    if side == "LONG":
+        if btc4h == "UP" and btc1h == "UP": btc_mult = 1.0      # ikisi de yukarı → tam güç
+        elif btc4h == "UP" or btc1h == "UP": btc_mult = 0.7     # sadece biri yukarı
+        elif btc4h == "DOWN" and btc1h == "DOWN": btc_mult = 0.15  # ikisi de aşağı → LONG'a karşı
+        else: btc_mult = 0.5                                    # FLAT / karışık
+    else:
+        if btc4h == "DOWN" and btc1h == "DOWN": btc_mult = 1.0
+        elif btc4h == "DOWN" or btc1h == "DOWN": btc_mult = 0.7
+        elif btc4h == "UP" and btc1h == "UP": btc_mult = 0.15
+        else: btc_mult = 0.5
+    p["btc"] = 14.0 * btc_mult
     ob = ext.get("orderbook") or {}; imb = safe_float(ob.get("imbalance"))
     if side == "LONG":
         obs = (0.6 if imb > 0.15 else 0.3 if imb > 0 else 0.0) + (0.4 if ob.get("bid_wall") else 0.0)
@@ -5392,10 +5402,12 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     side = gate["side"]; k = gate["k"]
     oi = await fetch_okx_oi_change(symbol, V10_OI_LOOKBACK_PER)
     funding = await fetch_okx_funding_rate(symbol)
-    btc = (await get_btc_trend_bias()).get("trend", "FLAT")
+    btc_bias = await get_btc_trend_bias()
+    btc = btc_bias.get("trend", "FLAT")
+    btc_1h = btc_bias.get("dir_1h", "FLAT")
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
-           "funding": funding, "btc_dir": btc, "orderbook": ob}
+           "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
         return None
@@ -5408,7 +5420,8 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
             "score":score,"score_parts":parts,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
-            "funding":funding,"ob_imbalance":ob.get("imbalance",0),**tgt}
+            "funding":funding,"ob_imbalance":ob.get("imbalance",0),
+            "btc_4h":btc,"btc_1h":btc_1h,**tgt}
 
 
 def _v10_fmt(x):
@@ -5427,6 +5440,7 @@ def build_v10_message(sig):
     fund = safe_float(sig.get("funding"))
     return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
+            f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n"
             f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
             f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({V10_TP2_RR}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({V10_TP3_RR}R %20)\n"
