@@ -5517,7 +5517,7 @@ def v10_record_closed(pos, R, outcome):
     mp = _v10_mem()
     mp["closed"].append({"symbol":pos["symbol"],"side":pos["side"],"R":round(R,3),
         "outcome":outcome,"score":pos["score"],"event":pos["event"],
-        "bucket":pos["bucket"],"close_ts":time.time(),"hit2":pos.get("hit2", False)})
+        "bucket":pos["bucket"],"close_ts":time.time()})
     b = mp["buckets"].setdefault(pos["bucket"], {"n":0,"R":0.0,"win":0})
     b["n"] += 1; b["R"] = round(b["R"]+R, 3)
     if R > 0: b["win"] += 1
@@ -5670,16 +5670,6 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_sonuc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cl = _v10_mem()["closed"]
-    tp3 = sum(1 for x in cl if x["outcome"] == "TP3")
-    tp2 = sum(1 for x in cl if x["outcome"] == "BE" and x.get("hit2", False))
-    be = sum(1 for x in cl if x["outcome"] == "BE" and not x.get("hit2", False))
-    stop = sum(1 for x in cl if x["outcome"] == "STOP")
-    await update.message.reply_text(
-        f"✅ TP: {tp2 + tp3}\nTP2: {tp2}\nTP3: {tp3}\n⚖️ BE: {be}\n❌ STOP: {stop}\nToplam: {len(cl)}")
-
-
 # ============================================================================ #
 #  V10 SMC MOTORU graft sonu
 # ============================================================================ #
@@ -5704,7 +5694,6 @@ def build_app():
     application.add_handler(CommandHandler("version", cmd_version))
     application.add_handler(CommandHandler("funding", cmd_funding))
     application.add_handler(CommandHandler("v10", cmd_v10))
-    application.add_handler(CommandHandler("sonuc", cmd_sonuc))
     return application
 
 def main() -> None:
