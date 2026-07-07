@@ -4,18 +4,21 @@ import time
 import copy
 import asyncio
 import logging
+import math
+import random
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11.2 HİBRİT-MTF (1H tetik + 4H trend + ATR/RR + RiskGuard + Öğrenen Skor)"
+VERSION_NAME = "Balina Avcısı V12 TAM YIĞIN (SMC + Öğrenen Skor + 22 Motor Katmanı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V11.2")
+BOT_BUILD = os.getenv("BOT_BUILD", "V12")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -540,6 +543,7 @@ def ensure_memory_shape() -> None:
     memory.setdefault("daily_short_sent", {})
     memory.setdefault("paper_trades", [])
     memory.setdefault("v11", {})
+    memory.setdefault("v12", {})
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("last_diag_ts", 0.0)
     memory["stats"].setdefault("ma_long", 0)
@@ -622,6 +626,18 @@ def cleanup_symbol_fail_state() -> None:
             symbol_fail_state.pop(sym, None)
 
 def cleanup_memory() -> None:
+    try:  # V12 önbellek budaması (bellek optimizasyonu)
+        if len(v12_book_hist) > 300:
+            for _s in list(v12_book_hist.keys())[:-200]:
+                v12_book_hist.pop(_s, None)
+        _cut = time.time() - 3600
+        for _u in [u for u, (ts, _r) in list(v12_liq_cache.items()) if ts < _cut]:
+            v12_liq_cache.pop(_u, None)
+        _pc = v12_state.get("prem_cache", {})
+        for _b in [b for b, (ts, _v) in list(_pc.items()) if ts < _cut]:
+            _pc.pop(_b, None)
+    except Exception:
+        pass
     now_ts = time.time()
     hot = memory.get("hot", {})
     for sym in list(hot.keys()):
@@ -750,6 +766,8 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
+    if time.time() < v12_state.get("net_pause_until", 0):
+        raise RuntimeError("V12 ağ koruması: duraklatıldı")
     url = f"{OKX_BASE_URL}{path}"
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
@@ -765,12 +783,14 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
             data = resp.json()
             if str(data.get("code", "1")) != "0":
                 raise RuntimeError(f"OKX hata: code={data.get('code')} msg={data.get('msg')}")
+            v12_net_iyi()
             return data.get("data", [])
         except (requests.RequestException, ValueError) as e:
             last_err = e
             if attempt < max_retries:
                 time.sleep(0.5 + attempt * 0.5)
                 continue
+            v12_net_hata()
             raise
     if last_err:
         raise last_err
@@ -4968,11 +4988,15 @@ async def post_init(application) -> None:
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
             f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
-            f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
+            f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok\n"
+            f"🧩 V12 TAM YIĞIN: {'AÇIK' if V12_ENABLED else 'KAPALI'} | Rapor {V12_REPORT_HOUR_UTC}:00 UTC | WS: {'AÇIK' if V12_WS_ENABLED else 'REST'} | Trailing: {'AÇIK' if V12_TRAIL_ENABLED else 'KAPALI'} → /v12"
         )
 
     asyncio.create_task(hot_scan_loop())
     asyncio.create_task(deep_scan_loop())
+    asyncio.create_task(v12_report_loop())
+    if V12_WS_ENABLED:
+        asyncio.create_task(v12_ws_loop())
     asyncio.create_task(symbol_refresh_loop())
     asyncio.create_task(ma_long_scan_loop())
     asyncio.create_task(ma_short_scan_loop())
@@ -5439,11 +5463,20 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         symbol, side, gate["ms"]["event"], gate["ms"]["trend"], gate["trend4"],
         btc_1h, btc, gate["fomo"], ext["oi_change_pct"], funding, r, score, parts,
         regime=regime)
+    # ---- V12: tam yığın motorlar + merkezi kapılar + öğrenme kovaları ----
+    v12_blok, v12_keys, v12_msg, v12_info = await v12_enrich(
+        symbol, side, k, ob, ext["oi_change_pct"], funding, gate["fomo"])
+    if v12_blok:
+        logger.info("V12 BLOK %s %s: %s", side, symbol, v12_blok)
+        return None
+    v11_keys = v11_keys + v12_keys
+    v11_snap["v12"] = {"onay": v12_info.get("onay"), "durum": v12_info.get("durum")}
     v11_adj, v11_det = v11_score_adjust(v11_keys)
     final_score = round(clamp(score + v11_adj, 0.0, 100.0), 1)
     if final_score < V10_MIN_QUALITY:
         return None
     entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a)
+    v12_boy = v12_pozisyon_boyu(entry, safe_float(tgt.get("stop_pct")))
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
@@ -5451,6 +5484,8 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "score":final_score,"score_base":score,
             "v11_adjust":v11_adj,"v11_detail":v11_det,
             "v11_keys":v11_keys,"v11_snap":v11_snap,"regime":regime,
+            "v12_msg":v12_msg,"v12_boyut":v12_boy,
+            "v12_onay":v12_info.get("onay"),"v12_durum":v12_info.get("durum"),
             "score_parts":parts,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
@@ -5471,6 +5506,7 @@ def build_v10_message(sig):
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
                      tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
     fund = safe_float(sig.get("funding"))
+    b = sig.get("v12_boyut") or v12_pozisyon_boyu(safe_float(sig["entry"]), safe_float(sig.get("stop_pct")))
     return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')} | Rejim:{sig.get('regime','-')}\n"
@@ -5479,7 +5515,9 @@ def build_v10_message(sig):
             f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({V10_TP2_RR}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({V10_TP3_RR}R %20)\n"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
-            f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
+            f"Boyut: {b['miktar']} adet ≈ {b['nominal']:.0f}$ nominal (risk {b['risk_usdt']}$, eq {V12_EQUITY_USDT:g}$)\n"
+            f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem"
+            + (("\n— V12 —\n" + sig["v12_msg"]) if sig.get("v12_msg") else ""))
 
 
 def build_v10_close_message(pos, R, outcome, exit_price):
@@ -5489,6 +5527,8 @@ def build_v10_close_message(pos, R, outcome, exit_price):
         head = "✅ TP3 GELDİ — tam hedef"
     elif outcome == "BE":
         head = "⚖️ BREAKEVEN — TP1 sonrası girişe döndü"
+    elif outcome == "TRAIL":
+        head = "🎯 TRAILING STOP — TP2 sonrası kâr kilitlendi"
     else:
         head = f"🏁 {outcome}"
     return (
@@ -5520,6 +5560,7 @@ def v10_open_paper(sig):
         "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
         "score":sig["score"],"event":sig["event"],
         "score_base":sig.get("score_base", sig["score"]),
+        "atr":safe_float(sig.get("atr")),"peak":sig["entry"],
         "v11_keys":sig.get("v11_keys", []),
         "v11_snap":sig.get("v11_snap", {}),
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
@@ -5535,6 +5576,13 @@ def v10_check_paper(pos, price):
             pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
         if pos["hit1"] and not pos["hit2"] and price >= pos["tp2"]:
             pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
+        if V12_TRAIL_ENABLED and pos["hit2"] and not pos["hit3"]:
+            pos["peak"] = max(safe_float(pos.get("peak", e)), price)
+            ta = safe_float(pos.get("atr")); risk = e - pos["orig_stop"]
+            if ta > 0 and risk > 0:
+                trail = pos["peak"] - V12_TRAIL_ATR_MULT * ta
+                if trail > e and price <= trail:
+                    return pos["realized"] + w["tp3"] * (price - e) / risk, "TRAIL"
         if pos["hit2"] and not pos["hit3"] and price >= pos["tp3"]:
             pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
     else:
@@ -5544,6 +5592,13 @@ def v10_check_paper(pos, price):
             pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
         if pos["hit1"] and not pos["hit2"] and price <= pos["tp2"]:
             pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
+        if V12_TRAIL_ENABLED and pos["hit2"] and not pos["hit3"]:
+            pos["peak"] = min(safe_float(pos.get("peak", e)) or e, price)
+            ta = safe_float(pos.get("atr")); risk = pos["orig_stop"] - e
+            if ta > 0 and risk > 0:
+                trail = pos["peak"] + V12_TRAIL_ATR_MULT * ta
+                if trail < e and price >= trail:
+                    return pos["realized"] + w["tp3"] * (e - price) / risk, "TRAIL"
         if pos["hit2"] and not pos["hit3"] and price <= pos["tp3"]:
             pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
     return None, None
@@ -5558,6 +5613,13 @@ def v10_record_closed(pos, R, outcome):
     b["n"] += 1; b["R"] = round(b["R"]+R, 3)
     if R > 0: b["win"] += 1
     v11_record_trade(pos, R, outcome)
+    toplam_gun = v12_add_day_r(R)
+    if toplam_gun <= -V12_DAILY_MAX_R:
+        _, _gun = v12_gunluk_r()
+        if v12_state.get("daily_alarm") != _gun:
+            v12_state["daily_alarm"] = _gun
+            v12_state["daily_alarm_pending"] = (
+                f"Günlük zarar limiti aşıldı: {toplam_gun:+.2f}R ≤ -{V12_DAILY_MAX_R:g}R — bugün yeni V10 sinyali BLOK")
 
 
 def v10_learn_report():
@@ -5608,7 +5670,8 @@ V11_ADJ_TOTAL       = float(os.getenv("V11_ADJ_TOTAL", "15"))
 # Skora yansıyan kova aileleri (HEPSİ kaydedilir/raporlanır; sadece bunlar puana işler)
 V11_ADJ_FAMILIES = set(x.strip() for x in os.getenv(
     "V11_ADJ_FAMILIES",
-    "skor,yon,olay,1H+olay,btc1h,btc1h+yon,btc4h,fomo,oi,fund,rejim,coin,coin+olay").split(",") if x.strip())
+    "skor,yon,olay,1H+olay,btc1h,btc1h+yon,btc4h,fomo,oi,fund,rejim,coin,coin+olay,"
+    "onayN,durum,sqz,mss,brk,ifvg,pdz,whale,mom,vol2,korel,prem,pool,kitap2").split(",") if x.strip())
 # --- Hızlı öğrenme: son N işlemde kötüleşen kova cezası BEKLEMEDEN artar ---
 #     Örn: son 30 işlemde fomo:>1.2 kovası başarısızsa cezası anında büyür.
 V11_FAST_ENABLED    = os.getenv("V11_FAST_ENABLED", "true").lower() == "true"
@@ -5978,6 +6041,1161 @@ async def cmd_v11(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+# ============================================================================ #
+#  V12 TAM YIĞIN MOTORLAR — 22 kategori
+#  Saf fonksiyon motorları (trend/momentum/volatilite/hacim/yapı/SMC/balina/
+#  kitap/likidite) + rejim + portföy + risk + rapor + MC/opt/WF + güvenlik +
+#  opsiyonel WebSocket. Tüm yeni durumlar V11 öğrenme kovası olur (adaptif skor).
+# ============================================================================ #
+V12_ENABLED          = os.getenv("V12_ENABLED", "true").lower() == "true"
+V12_EQUITY_USDT      = float(os.getenv("V12_EQUITY_USDT", "1000"))
+V12_RISK_PCT         = float(os.getenv("V12_RISK_PCT", "1.5"))
+V12_TRAIL_ENABLED    = os.getenv("V12_TRAIL_ENABLED", "true").lower() == "true"
+V12_TRAIL_ATR_MULT   = float(os.getenv("V12_TRAIL_ATR_MULT", "1.2"))
+V12_DAILY_MAX_R      = float(os.getenv("V12_DAILY_MAX_R", "4.0"))     # günlük zarar limiti (R)
+V12_CORR_MAX         = float(os.getenv("V12_CORR_MAX", "0.85"))       # aynı yön korelasyon tavanı
+V12_DIR_MAX_SKEW     = int(float(os.getenv("V12_DIR_MAX_SKEW", "6"))) # LONG-SHORT yön dengesizliği tavanı
+V12_BTC_CRASH_PCT    = float(os.getenv("V12_BTC_CRASH_PCT", "2.5"))   # BTC 1H düşüş → çöküş filtresi
+V12_PANIC_BLOCK_MIN  = int(float(os.getenv("V12_PANIC_BLOCK_MIN", "45")))
+V12_REPORT_HOUR_UTC  = int(float(os.getenv("V12_REPORT_HOUR_UTC", "6")))
+V12_DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+V12_DISCORD_SIGNALS  = os.getenv("V12_DISCORD_SIGNALS", "false").lower() == "true"
+V12_WS_ENABLED       = os.getenv("V12_WS_ENABLED", "false").lower() == "true"
+V12_WS_TOP           = int(float(os.getenv("V12_WS_TOP", "15")))
+V12_NET_FAIL_LIMIT   = int(float(os.getenv("V12_NET_FAIL_LIMIT", "12")))  # art arda hata → duraklat
+V12_NET_PAUSE_SEC    = int(float(os.getenv("V12_NET_PAUSE_SEC", "120")))
+
+# ---- V12 durum (runtime) ----
+v12_state = {"emergency": False, "net_pause_until": 0.0, "net_fail": 0,
+             "panic_until": 0.0, "last_side": {}, "day_r": {},   # {gün: R toplamı}
+             "market": {"ts": 0.0, "state": "NORMAL", "detay": ""},
+             "dom": {"ts": 0.0}, "prem_cache": {}}
+v12_book_hist: Dict[str, Any] = {}          # symbol -> deque[(ts, bidw, askw, imb, close)]
+v12_tape: Dict[str, Any] = {}               # symbol -> deque[(ts, px, sz, side)]  (WS açıksa)
+v12_ws_liqs = deque(maxlen=2000)            # WS likidasyon akışı
+v12_liq_cache: Dict[str, Any] = {}          # uly -> (ts, rows)
+
+
+# ============================ 2) TREND MOTORU =============================== #
+def v12_wma(vals, period):
+    if len(vals) < period: return []
+    out, denom = [], period * (period + 1) / 2.0
+    for i in range(period - 1, len(vals)):
+        s = sum(vals[i - period + 1 + j] * (j + 1) for j in range(period))
+        out.append(s / denom)
+    return out
+
+
+def v12_vwma(k, period=20):
+    c, v = closes(k), volumes(k)
+    if len(c) < period: return []
+    out = []
+    for i in range(period - 1, len(c)):
+        pv = sum(c[j] * v[j] for j in range(i - period + 1, i + 1))
+        vv = sum(v[j] for j in range(i - period + 1, i + 1)) or 1e-12
+        out.append(pv / vv)
+    return out
+
+
+def v12_hull(vals, period=21):
+    half, sq = max(2, period // 2), max(2, int(math.sqrt(period)))
+    w1, w2 = v12_wma(vals, half), v12_wma(vals, period)
+    if not w1 or not w2: return []
+    n = min(len(w1), len(w2))
+    raw = [2 * w1[-n + i] - w2[-n + i] for i in range(n)]
+    return v12_wma(raw, sq)
+
+
+def v12_adx(k, period=14):
+    """Wilder ADX → (+DI, -DI, ADX) son değerler."""
+    h, l, c = highs(k), lows(k), closes(k)
+    n = len(k)
+    if n < period * 2 + 2: return 0.0, 0.0, 0.0
+    trs, pdms, ndms = [], [], []
+    for i in range(1, n):
+        tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+        up, dn = h[i] - h[i-1], l[i-1] - l[i]
+        trs.append(tr)
+        pdms.append(up if (up > dn and up > 0) else 0.0)
+        ndms.append(dn if (dn > up and dn > 0) else 0.0)
+    def wilder(xs):
+        s = sum(xs[:period]); out = [s]
+        for x in xs[period:]:
+            s = s - s / period + x; out.append(s)
+        return out
+    trw, pw, nw = wilder(trs), wilder(pdms), wilder(ndms)
+    pdis = [100 * pw[i] / trw[i] if trw[i] else 0 for i in range(len(trw))]
+    ndis = [100 * nw[i] / trw[i] if trw[i] else 0 for i in range(len(trw))]
+    dxs = [100 * abs(pdis[i] - ndis[i]) / ((pdis[i] + ndis[i]) or 1e-12) for i in range(len(pdis))]
+    if len(dxs) < period: return pdis[-1], ndis[-1], 0.0
+    a = sum(dxs[:period]) / period
+    for x in dxs[period:]:
+        a = (a * (period - 1) + x) / period
+    return round(pdis[-1], 1), round(ndis[-1], 1), round(a, 1)
+
+
+def v12_trend(k):
+    """Kesişimler + hizalanma + ADX gücü + rejim + trend değişimi."""
+    c = closes(k)
+    if len(c) < 60:
+        return {"rejim": "RANGE", "guc": 0, "adx": 0, "kesisim": [], "degisim": False, "hull_yon": "FLAT"}
+    e7, e9, e21, e25, e50 = (ema(c, p) for p in (7, 9, 21, 25, 50))
+    e200 = ema(c, 200) if len(c) >= 200 else e50
+    kes = []
+    def cross(a, b, ad, isim):
+        if len(a) > 1 and len(b) > 1:
+            if a[-2] <= b[-2] and a[-1] > b[-1]: kes.append(f"{isim}↑")
+            if a[-2] >= b[-2] and a[-1] < b[-1]: kes.append(f"{isim}↓")
+    cross(e7, e25, None, "7/25"); cross(e9, e21, None, "9/21"); cross(e50, e200, None, "50/200")
+    pdi, ndi, adx = v12_adx(k)
+    hizali_up = c[-1] > e25[-1] > e50[-1]
+    hizali_dn = c[-1] < e25[-1] < e50[-1]
+    if adx >= 22 and (hizali_up or pdi > ndi + 8) and c[-1] > e50[-1]: rejim = "UP"
+    elif adx >= 22 and (hizali_dn or ndi > pdi + 8) and c[-1] < e50[-1]: rejim = "DOWN"
+    else: rejim = "RANGE"
+    hl = v12_hull(c, 21)
+    hull_yon = "FLAT" if len(hl) < 2 else ("UP" if hl[-1] > hl[-2] else "DOWN")
+    guc = int(clamp(adx * 2 + (10 if hizali_up or hizali_dn else 0), 0, 100))
+    return {"rejim": rejim, "guc": guc, "adx": adx, "pdi": pdi, "ndi": ndi,
+            "kesisim": kes, "degisim": bool(kes), "hull_yon": hull_yon,
+            "vwma": (v12_vwma(k, 20) or [0])[-1]}
+
+
+# =========================== 3) MOMENTUM MOTORU ============================= #
+def v12_stochrsi(vals, period=14, klen=3):
+    r = rsi(vals, period)
+    if len(r) < period + klen: return 50.0, 50.0
+    ks = []
+    for i in range(period - 1, len(r)):
+        win = r[i - period + 1:i + 1]
+        hi, lo = max(win), min(win)
+        ks.append(100 * (r[i] - lo) / ((hi - lo) or 1e-12))
+    k_ = sum(ks[-klen:]) / klen
+    d_ = sum(ks[-klen*2:-klen]) / klen if len(ks) >= klen * 2 else k_
+    return round(k_, 1), round(d_, 1)
+
+
+def v12_macd(vals, f=12, s=26, sig=9):
+    if len(vals) < s + sig + 2: return 0.0, 0.0, 0.0, "NOTR"
+    ef, es = ema(vals, f), ema(vals, s)
+    n = min(len(ef), len(es))
+    line = [ef[-n + i] - es[-n + i] for i in range(n)]
+    sg = ema(line, sig)
+    m, g = line[-1], sg[-1]
+    h, hp = m - g, (line[-2] - sg[-2]) if len(sg) > 1 else 0.0
+    if hp <= 0 < h: st = "KESISIM_UP"
+    elif hp >= 0 > h: st = "KESISIM_DOWN"
+    else: st = "POZITIF" if h > 0 else "NEGATIF"
+    return round(m, 6), round(g, 6), round(h, 6), st
+
+
+def v12_roc(vals, p=12):
+    return round(100 * (vals[-1] / vals[-p - 1] - 1), 2) if len(vals) > p else 0.0
+
+
+def v12_tsi(vals, long=25, short=13):
+    if len(vals) < long + short + 2: return 0.0
+    mom = [vals[i] - vals[i - 1] for i in range(1, len(vals))]
+    d1 = ema(ema(mom, long), short)
+    d2 = ema(ema([abs(x) for x in mom], long), short)
+    return round(100 * d1[-1] / (d2[-1] or 1e-12), 1)
+
+
+def v12_cci(k, p=20):
+    h, l, c = highs(k), lows(k), closes(k)
+    if len(c) < p: return 0.0
+    tp = [(h[i] + l[i] + c[i]) / 3 for i in range(len(c))]
+    m = sum(tp[-p:]) / p
+    md = sum(abs(x - m) for x in tp[-p:]) / p or 1e-12
+    return round((tp[-1] - m) / (0.015 * md), 1)
+
+
+def v12_mfi(k, p=14):
+    h, l, c, v = highs(k), lows(k), closes(k), volumes(k)
+    if len(c) < p + 1: return 50.0
+    tp = [(h[i] + l[i] + c[i]) / 3 for i in range(len(c))]
+    pos = neg = 0.0
+    for i in range(-p, 0):
+        mf = tp[i] * v[i]
+        if tp[i] > tp[i - 1]: pos += mf
+        else: neg += mf
+    return round(100 - 100 / (1 + pos / (neg or 1e-12)), 1)
+
+
+def v12_momentum(k):
+    c = closes(k)
+    if len(c) < 40:
+        return {"skor": 0, "macd": "NOTR", "srsi_k": 50, "srsi_d": 50, "roc": 0,
+                "mom": 0, "tsi": 0, "cci": 0, "mfi": 50}
+    srk, srd = v12_stochrsi(c)
+    _, _, hist, mst = v12_macd(c)
+    roc = v12_roc(c); tsi = v12_tsi(c); cci = v12_cci(k); mfi = v12_mfi(k)
+    mom = round(c[-1] - c[-11], 6) if len(c) > 10 else 0.0
+    sk = 0
+    sk += 20 if mst in ("KESISIM_UP", "POZITIF") else -20
+    sk += 15 if srk > srd else -15
+    sk += int(clamp(roc * 4, -20, 20))
+    sk += int(clamp(tsi, -20, 20))
+    sk += 12 if cci > 100 else (-12 if cci < -100 else 0)
+    sk += 13 if mfi > 60 else (-13 if mfi < 40 else 0)
+    return {"skor": int(clamp(sk, -100, 100)), "macd": mst, "srsi_k": srk, "srsi_d": srd,
+            "roc": roc, "mom": mom, "tsi": tsi, "cci": cci, "mfi": mfi}
+
+
+# ========================== 4) VOLATİLİTE MOTORU ============================ #
+def v12_bollinger(vals, p=20, mult=2.0):
+    if len(vals) < p: return 0.0, 0.0, 0.0, 0.0
+    win = vals[-p:]
+    mid = sum(win) / p
+    var = sum((x - mid) ** 2 for x in win) / p
+    sd = math.sqrt(var)
+    up, lo = mid + mult * sd, mid - mult * sd
+    return mid, up, lo, (up - lo) / (mid or 1e-12) * 100
+
+
+def v12_keltner(k, p=20, mult=1.5):
+    c = closes(k)
+    if len(c) < p: return 0.0, 0.0, 0.0
+    mid = ema(c, p)[-1]
+    a = atr(k, p)[-1]
+    return mid, mid + mult * a, mid - mult * a
+
+
+def v12_volatilite(k):
+    c = closes(k)
+    if len(c) < 40:
+        return {"rejim": "NORMAL", "atr_pct": 0, "sqz_on": 0, "patlama": 0, "bw": 0}
+    a = atr(k, 14)[-1]
+    atr_pct = 100 * a / (c[-1] or 1e-12)
+    hist = []
+    for i in range(30, len(k)):
+        aa = atr(k[:i + 1], 14)
+        if aa: hist.append(100 * aa[-1] / (closes(k[:i + 1])[-1] or 1e-12))
+    if hist:
+        srt = sorted(hist); pos = srt.index(min(srt, key=lambda x: abs(x - atr_pct)))
+        pct = pos / max(1, len(srt) - 1)
+    else:
+        pct = 0.5
+    rejim = "LOW" if pct < 0.25 else ("HIGH" if pct > 0.75 else "NORMAL")
+    _, bu, bl, bw = v12_bollinger(c)
+    _, ku, kl = v12_keltner(k)
+    sqz = 1 if (bu and ku and bu < ku and bl > kl) else 0
+    _, _, _, bw_prev = v12_bollinger(c[:-3]) if len(c) > 25 else (0, 0, 0, bw)
+    patlama = 1 if (bw_prev and bw > bw_prev * 1.6 and sqz == 0) else 0
+    return {"rejim": rejim, "atr_pct": round(atr_pct, 2), "sqz_on": sqz,
+            "patlama": patlama, "bw": round(bw, 2)}
+
+
+# ============================ 5) HACİM ANALİZİ ============================== #
+def v12_obv(k):
+    c, v = closes(k), volumes(k)
+    o = 0.0; out = [0.0]
+    for i in range(1, len(c)):
+        o += v[i] if c[i] > c[i - 1] else (-v[i] if c[i] < c[i - 1] else 0)
+        out.append(o)
+    return out
+
+
+def v12_hacim(k):
+    c, v = closes(k), volumes(k)
+    if len(v) < 25:
+        return {"rvol": 1.0, "spike": 0, "obv_yon": "FLAT", "delta": 0.0, "anomali": 0}
+    ort = sum(v[-21:-1]) / 20 or 1e-12
+    rvol = v[-1] / ort
+    mu = ort
+    sd = math.sqrt(sum((x - mu) ** 2 for x in v[-21:-1]) / 20) or 1e-12
+    z = (v[-1] - mu) / sd
+    # Volume delta: mum-yönü PROXY (gerçek tick delta için v12_tape_delta / WS)
+    delta = 0.0
+    for i in range(-min(10, len(c) - 1), 0):
+        delta += v[i] if c[i] >= c[i - 1] else -v[i]
+    obv = v12_obv(k)
+    obv_yon = "UP" if obv[-1] > obv[-6] else ("DOWN" if obv[-1] < obv[-6] else "FLAT")
+    return {"rvol": round(rvol, 2), "spike": 1 if rvol >= 2.0 else 0,
+            "obv_yon": obv_yon, "delta": round(delta, 1), "anomali": 1 if abs(z) >= 3 else 0}
+
+
+def v12_tape_delta(symbol, sec=300):
+    """WS tape açıksa GERÇEK CVD delta (son sec saniye); yoksa None."""
+    dq = v12_tape.get(symbol)
+    if not dq: return None
+    now = time.time(); buy = sell = 0.0
+    for ts, px, sz, side in dq:
+        if now - ts <= sec:
+            if side == "buy": buy += sz * px
+            else: sell += sz * px
+    return round(buy - sell, 1)
+
+
+# ===================== 6) MARKET STRUCTURE (SMC) EK ======================== #
+def v12_swings(k, left=3, right=3):
+    """[(idx, fiyat, 'H'|'L')] — dış yapı swingleri.
+    Kural: sola KATI büyük/küçük, sağa eşit-veya (eşit tepelerde ilk bar seçilir)."""
+    h, l = highs(k), lows(k)
+    out = []
+    for i in range(left, len(k) - right):
+        if all(h[i] > h[j] for j in range(i - left, i)) and \
+           all(h[i] >= h[j] for j in range(i + 1, i + right + 1)):
+            out.append((i, h[i], "H"))
+        if all(l[i] < l[j] for j in range(i - left, i)) and \
+           all(l[i] <= l[j] for j in range(i + 1, i + right + 1)):
+            out.append((i, l[i], "L"))
+    return out
+
+
+def v12_structure(k):
+    """BOS/CHoCH/MSS + iç/dış yapı + EQH/EQL + inducement + liquidity grab."""
+    c, h, l = closes(k), highs(k), lows(k)
+    bos = {"olay": None, "mss": 0, "ic_yapi": "RANGE", "dis_yapi": "RANGE",
+           "eqh": [], "eql": [], "inducement": 0, "grab": None, "sw": []}
+    if len(k) < 40: return bos
+    a = atr(k, 14)[-1] or 1e-12
+    ext = v12_swings(k, 3, 3); ic = v12_swings(k[-30:], 1, 1)
+    bos["sw"] = ext[-6:]
+    hs = [s for s in ext if s[2] == "H"]; ls = [s for s in ext if s[2] == "L"]
+    def yapi(hh, ll):
+        if len(hh) >= 2 and len(ll) >= 2:
+            if hh[-1][1] > hh[-2][1] and ll[-1][1] > ll[-2][1]: return "UP"
+            if hh[-1][1] < hh[-2][1] and ll[-1][1] < ll[-2][1]: return "DOWN"
+        return "RANGE"
+    bos["dis_yapi"] = yapi(hs, ls)
+    ih = [s for s in ic if s[2] == "H"]; il = [s for s in ic if s[2] == "L"]
+    bos["ic_yapi"] = yapi(ih, il)
+    # BOS / CHoCH / MSS (son kapanışa göre)
+    olaylar = []
+    if hs and c[-1] > hs[-1][1]:
+        olaylar.append("BOS_UP" if bos["dis_yapi"] == "UP" else "CHoCH_UP")
+    if ls and c[-1] < ls[-1][1]:
+        olaylar.append("BOS_DOWN" if bos["dis_yapi"] == "DOWN" else "CHoCH_DOWN")
+    bos["olay"] = olaylar[-1] if olaylar else None
+    # MSS: CHoCH + iç yapının da aynı yöne dönmesi (onaylı yapı değişimi)
+    if bos["olay"] == "CHoCH_UP" and bos["ic_yapi"] == "UP": bos["mss"] = 1
+    if bos["olay"] == "CHoCH_DOWN" and bos["ic_yapi"] == "DOWN": bos["mss"] = 1
+    # EQH / EQL (tolerans 0.2×ATR) → likidite
+    tol = 0.2 * a
+    for grp, out in ((hs, "eqh"), (ls, "eql")):
+        for i in range(1, len(grp)):
+            if abs(grp[i][1] - grp[i - 1][1]) <= tol:
+                bos[out].append(round((grp[i][1] + grp[i - 1][1]) / 2, 8))
+    bos["eqh"] = bos["eqh"][-3:]; bos["eql"] = bos["eql"][-3:]
+    # Liquidity grab: swing ötesine fitil ≥0.5×ATR + geri kapanış
+    if hs and h[-1] > hs[-1][1] + 0.1 * a and c[-1] < hs[-1][1] and (h[-1] - hs[-1][1]) >= 0.5 * a:
+        bos["grab"] = "UST"     # üst likidite alındı → düşüş yakıtı
+    if ls and l[-1] < ls[-1][1] - 0.1 * a and c[-1] > ls[-1][1] and (ls[-1][1] - l[-1]) >= 0.5 * a:
+        bos["grab"] = "ALT"
+    # Inducement: dış yön UP iken iç dip süpürülüp toparlanma (tuzak temizliği)
+    if bos["dis_yapi"] == "UP" and il and l[-1] < il[-1][1] and c[-1] > il[-1][1]: bos["inducement"] = 1
+    if bos["dis_yapi"] == "DOWN" and ih and h[-1] > ih[-1][1] and c[-1] < ih[-1][1]: bos["inducement"] = 1
+    return bos
+
+
+# ======================= 7) SMART MONEY CONCEPTS EK ========================= #
+def v12_smc(k, yapi):
+    c, h, l = closes(k), highs(k), lows(k)
+    o = [safe_float(r[1]) for r in k]
+    res = {"ob": None, "breaker": 0, "mitigation": 0, "fvg": [], "ifvg": 0,
+           "pd_bolge": "MID", "pd_pct": 50.0, "pool_ust": None, "pool_alt": None}
+    if len(k) < 40: return res
+    a = atr(k, 14)[-1] or 1e-12
+    # Order Block: impuls (gövde>1.2×ATR) öncesi son zıt mum bölgesi
+    for i in range(len(k) - 2, max(len(k) - 25, 2), -1):
+        gov = c[i] - o[i]
+        if abs(gov) >= 1.2 * a:
+            j = i - 1
+            while j > i - 6 and j > 0:
+                if (gov > 0 and c[j] < o[j]) or (gov < 0 and c[j] > o[j]):
+                    zone = (min(o[j], c[j]), max(o[j], c[j]))
+                    res["ob"] = {"yon": "BULL" if gov > 0 else "BEAR",
+                                 "alt": round(zone[0], 8), "ust": round(zone[1], 8), "idx": j}
+                    break
+                j -= 1
+            if res["ob"]: break
+    # Breaker / Mitigation
+    if res["ob"]:
+        ob = res["ob"]
+        kirildi = (ob["yon"] == "BULL" and min(l[ob["idx"] + 1:]) < ob["alt"] - 0.1 * a) or \
+                  (ob["yon"] == "BEAR" and max(h[ob["idx"] + 1:]) > ob["ust"] + 0.1 * a)
+        icinde = ob["alt"] - 0.2 * a <= c[-1] <= ob["ust"] + 0.2 * a
+        if kirildi and icinde: res["breaker"] = 1          # kırılıp ters yönden retest
+        elif (not kirildi) and icinde: res["mitigation"] = 1  # kısmi dönüş (mitigasyon)
+    # FVG + Inverse FVG (son 20 mum)
+    for i in range(len(k) - 20, len(k) - 1):
+        if i < 2: continue
+        if l[i] > h[i - 2] + 0.05 * a:      # bull FVG
+            dolu = min(l[i:]) <= h[i - 2]
+            kapandi = c[-1] < h[i - 2] - 0.1 * a
+            res["fvg"].append({"yon": "BULL", "alt": round(h[i - 2], 8), "ust": round(l[i], 8)})
+            if dolu and kapandi and h[-1] >= h[i - 2]: res["ifvg"] = 1
+        if h[i] < l[i - 2] - 0.05 * a:      # bear FVG
+            dolu = max(h[i:]) >= l[i - 2]
+            kapandi = c[-1] > l[i - 2] + 0.1 * a
+            res["fvg"].append({"yon": "BEAR", "alt": round(h[i], 8), "ust": round(l[i - 2], 8)})
+            if dolu and kapandi and l[-1] <= l[i - 2]: res["ifvg"] = 1
+    res["fvg"] = res["fvg"][-3:]
+    # Premium / Discount: dış aralıkta konum
+    sw = yapi.get("sw") or []
+    rng_h = max([s[1] for s in sw if s[2] == "H"] or [max(h[-40:])])
+    rng_l = min([s[1] for s in sw if s[2] == "L"] or [min(l[-40:])])
+    pct = 100 * (c[-1] - rng_l) / ((rng_h - rng_l) or 1e-12)
+    res["pd_pct"] = round(clamp(pct, 0, 100), 1)
+    res["pd_bolge"] = "DISC" if pct < 40 else ("PREM" if pct > 60 else "MID")
+    # Likidite havuzları: EQH/EQL + dokunulmamış swing uçları
+    ust = (yapi.get("eqh") or []) + [s[1] for s in sw[-4:] if s[2] == "H" and s[1] > c[-1]]
+    alt = (yapi.get("eql") or []) + [s[1] for s in sw[-4:] if s[2] == "L" and s[1] < c[-1]]
+    if ust: res["pool_ust"] = round(min(ust), 8)   # en yakın üst havuz
+    if alt: res["pool_alt"] = round(max(alt), 8)
+    return res
+
+
+# =========================== 8) BALİNA TAKİBİ =============================== #
+def v12_balina(oi_pct, funding, fiyat_chg_pct, vol_spike):
+    oi = safe_float(oi_pct); f = safe_float(funding); p = safe_float(fiyat_chg_pct)
+    matris = "NOTR"
+    if oi > 0.5 and p > 0.15: matris = "YENI_LONG"
+    elif oi > 0.5 and p < -0.15: matris = "YENI_SHORT"
+    elif oi < -0.5 and p > 0.15: matris = "SHORT_KAPAMA"
+    elif oi < -0.5 and p < -0.15: matris = "LONG_KAPAMA"
+    giris = 1 if (oi > 1.0 and vol_spike) else 0
+    cikis = 1 if (oi < -1.0 and vol_spike) else 0
+    sikisma = "YOK"
+    if f >= 0.0003 and oi > 0.8 and p <= 0: sikisma = "LONG_SIKISMA"    # kalabalık long, fiyat gelmiyor
+    if f <= -0.0003 and oi > 0.8 and p >= 0: sikisma = "SHORT_SIKISMA"
+    return {"matris": matris, "giris": giris, "cikis": cikis, "sikisma": sikisma}
+
+
+# ========================= 9) ORDER BOOK ANALİZİ EK ========================= #
+def v12_kitap(symbol, ob, k):
+    """Spoof/Iceberg/Absorption/Sweep — REST anlık görüntü HEURİSTİĞİ.
+    (Gerçek tick doğrulaması için WS tape gerekir; WS açıksa delta desteklenir.)"""
+    res = {"spoof": 0, "iceberg": 0, "absorption": 0, "sweep": 0, "oran": 0.0, "not": "HEURISTIK"}
+    if not isinstance(ob, dict): return res
+    imb = safe_float(ob.get("imbalance"))
+    res["oran"] = round((1 + imb) / (1 - imb), 2) if abs(imb) < 1 else 99.0
+    bw, aw = bool(ob.get("bid_wall")), bool(ob.get("ask_wall"))
+    c, v = closes(k), volumes(k)
+    dq = v12_book_hist.setdefault(symbol, deque(maxlen=6))
+    if dq:
+        ts0, bw0, aw0, imb0, c0 = dq[-1]
+        chg = 100 * (c[-1] - c0) / (c0 or 1e-12)
+        # Spoof: duvar vardı→yok oldu ve fiyat o duvarı YEMEDEN uzaklaştı
+        if bw0 and not bw and chg > 0.05: res["spoof"] = 1     # bid duvarı çekildi (sahte destek)
+        if aw0 and not aw and chg < -0.05: res["spoof"] = 1
+        # Iceberg: aynı taraf duvarı ısrarla yerinde + fiyat üstüne gelmiş
+        if sum(1 for t in dq if t[1]) >= 4 and bw and chg <= 0: res["iceberg"] = 1
+        if sum(1 for t in dq if t[2]) >= 4 and aw and chg >= 0: res["iceberg"] = 1
+    if len(v) > 21:
+        ort = sum(v[-21:-1]) / 20 or 1e-12
+        rng = abs(c[-1] - c[-2]) / (c[-1] or 1e-12) * 100
+        if v[-1] / ort >= 2.0 and rng <= 0.12 and (bw or aw):
+            res["absorption"] = 1                               # yüksek hacim + fiyat kımıldamadı
+        if v[-1] / ort >= 2.5 and rng >= 0.6 and not (bw or aw):
+            res["sweep"] = 1                                    # seviyeler süpürüldü
+    dq.append((time.time(), bw, aw, imb, c[-1]))
+    return res
+
+
+# ========================== 10) LİKİDİTE ANALİZİ ============================ #
+async def fetch_okx_liquidations(symbol):
+    """OKX public likidasyon emirleri (SWAP). 120s cache. Format savunmacı parse edilir."""
+    uly = _base_of(symbol) + "-USDT"
+    now = time.time()
+    ts, rows = v12_liq_cache.get(uly, (0, []))
+    if now - ts < 120: return rows
+    try:
+        data = await asyncio.to_thread(_okx_get, "/api/v5/public/liquidation-orders",
+                                       {"instType": "SWAP", "uly": uly, "state": "filled", "limit": "100"})
+        rows = v12_parse_liqs(data)
+    except Exception as e:
+        logger.debug("liq fetch hata %s: %s", uly, e)
+        rows = rows or []
+    v12_liq_cache[uly] = (now, rows)
+    return rows
+
+
+def v12_parse_liqs(data):
+    """[(fiyat, buyuklukUSDT, posSide, ts)] — hem düz hem details şemasını okur."""
+    out = []
+    try:
+        for row in (data or []):
+            dets = row.get("details") if isinstance(row, dict) else None
+            for d in (dets if isinstance(dets, list) else [row]):
+                px = safe_float(d.get("bkPx") or d.get("px"))
+                sz = safe_float(d.get("sz"))
+                if px <= 0 or sz <= 0: continue
+                out.append((px, sz * px, str(d.get("posSide") or d.get("side") or "?"),
+                            safe_float(d.get("ts"))))
+    except Exception:
+        pass
+    return out[:400]
+
+
+def v12_likidite(liq_rows, ref_price, smc):
+    """Likidasyon kümeleri + stop havuzları + mıknatıs + temizlik."""
+    res = {"long_kume": None, "short_kume": None, "miknatis": "YOK",
+           "temizlik": 0, "stop_ust": smc.get("pool_ust"), "stop_alt": smc.get("pool_alt")}
+    if ref_price <= 0: return res
+    ust, alt = {}, {}
+    for px, usdt, pside, _ in (liq_rows or []):
+        b = round(px / ref_price, 3)                     # %0.1 hassas kova
+        if px >= ref_price: ust[b] = ust.get(b, 0) + usdt
+        else: alt[b] = alt.get(b, 0) + usdt
+    if alt:                                              # altta LONG likidasyonları birikir
+        bb = max(alt, key=alt.get)
+        res["long_kume"] = {"fiyat": round(bb * ref_price, 8), "usdt": round(alt[bb], 0)}
+    if ust:
+        bb = max(ust, key=ust.get)
+        res["short_kume"] = {"fiyat": round(bb * ref_price, 8), "usdt": round(ust[bb], 0)}
+    # Mıknatıs: en yakın büyük havuz/küme yönü (likidite çekimi)
+    adaylar = []
+    if res["stop_ust"]: adaylar.append(("UST", abs(res["stop_ust"] - ref_price)))
+    if res["stop_alt"]: adaylar.append(("ALT", abs(ref_price - res["stop_alt"])))
+    if res["short_kume"]: adaylar.append(("UST", abs(res["short_kume"]["fiyat"] - ref_price)))
+    if res["long_kume"]: adaylar.append(("ALT", abs(ref_price - res["long_kume"]["fiyat"])))
+    if adaylar:
+        yon, mesafe = min(adaylar, key=lambda x: x[1])
+        if mesafe / ref_price <= 0.02: res["miknatis"] = yon
+    return res
+
+
+# ============ 1-ek) PREMIUM / DOMINANCE / STABLECOIN AKIŞ (PROXY) ========== #
+def v12_premium(symbol, okx_last):
+    """OKX-Binance premium %. 60s cache. Binance yoksa None."""
+    base = _base_of(symbol)
+    now = time.time()
+    ts, val = v12_state["prem_cache"].get(base, (0, None))
+    if now - ts < 60: return val
+    val = None
+    try:
+        d = _binance_get("/api/v3/ticker/price", {"symbol": base + "USDT"})
+        bp = safe_float((d or {}).get("price"))
+        if bp > 0 and okx_last > 0:
+            val = round(100 * (okx_last - bp) / bp, 3)
+    except Exception:
+        pass
+    v12_state["prem_cache"][base] = (now, val)
+    return val
+
+
+async def v12_dominance():
+    """BTC hacim payı + toplam USDT hacim akışı (PROXY — 5 dk cache, tek API çağrısı)."""
+    d = v12_state["dom"]
+    now = time.time()
+    if now - d.get("ts", 0) < 300: return d
+    try:
+        data = await asyncio.to_thread(_okx_get, "/api/v5/market/tickers", {"instType": "SWAP"})
+        top, btc, up = 0.0, 0.0, 0
+        n = 0
+        for r in (data or []):
+            if not str(r.get("instId", "")).endswith("-USDT-SWAP"): continue
+            vol = safe_float(r.get("volCcy24h")) * safe_float(r.get("last")) or safe_float(r.get("vol24h"))
+            top += vol; n += 1
+            if r.get("instId") == "BTC-USDT-SWAP": btc = vol
+            if safe_float(r.get("last")) >= safe_float(r.get("open24h")): up += 1
+        prev = d.get("toplam", 0.0)
+        d.update({"ts": now, "btc_pay": round(100 * btc / (top or 1e-12), 1),
+                  "toplam": round(top, 0), "genislik_up": round(100 * up / max(1, n), 1),
+                  "akis": round(top - prev, 0) if prev else 0.0})
+    except Exception as e:
+        logger.debug("dominance hata: %s", e)
+        d.setdefault("btc_pay", 0.0); d.setdefault("genislik_up", 50.0); d["ts"] = now
+    return d
+
+
+# ================= 15-16) BTC FİLTRELERİ + PİYASA REJİMİ ==================== #
+async def v12_piyasa_durumu():
+    """NORMAL / KONSOLIDASYON / FOMO / PANIK / SOK(haber-benzeri, PROXY). 60s cache."""
+    st = v12_state["market"]
+    now = time.time()
+    if now - st.get("ts", 0) < 60: return st
+    try:
+        k1 = await get_klines("BTC-USDT-SWAP", "1H", 120)
+        k4 = await get_klines("BTC-USDT-SWAP", "4H", 120)
+        dom = await v12_dominance()
+        c1 = closes(k1)
+        chg1h = 100 * (c1[-1] / c1[-2] - 1) if len(c1) > 1 else 0.0
+        vol = v12_volatilite(k1)
+        hac = v12_hacim(k1)
+        tr4 = v12_trend(k4)
+        # Donchian 20 kırılımı (4H)
+        h4, l4 = highs(k4), lows(k4)
+        kirilim = "YOK"
+        if len(h4) > 21:
+            if c1[-1] > max(h4[-21:-1]): kirilim = "UP"
+            elif c1[-1] < min(l4[-21:-1]): kirilim = "DOWN"
+        genis = dom.get("genislik_up", 50.0)
+        durum, detay = "NORMAL", ""
+        if chg1h <= -V12_BTC_CRASH_PCT and genis <= 30:
+            durum, detay = "PANIK", f"BTC 1H {chg1h:.1f}%, yükselen coin %{genis:.0f}"
+            v12_state["panic_until"] = now + V12_PANIC_BLOCK_MIN * 60
+        elif abs(chg1h) >= V12_BTC_CRASH_PCT and hac["spike"] and vol["patlama"]:
+            durum, detay = "SOK", f"BTC 1H {chg1h:+.1f}% + hacim/vol patlaması (haber-benzeri, PROXY)"
+        elif genis >= 78 and chg1h >= 1.0:
+            durum, detay = "FOMO", f"Yükselen coin %{genis:.0f}, BTC +{chg1h:.1f}%"
+        elif vol["sqz_on"] and tr4["adx"] < 18:
+            durum, detay = "KONSOLIDASYON", f"Squeeze açık, ADX {tr4['adx']}"
+        st.update({"ts": now, "state": durum, "detay": detay, "btc_1h_chg": round(chg1h, 2),
+                   "btc_kirilim": kirilim, "btc_adx": tr4["adx"], "btc_vol": vol["rejim"],
+                   "btc_macd": v12_momentum(k1)["macd"], "genislik": genis,
+                   "btc_pay": dom.get("btc_pay", 0.0)})
+    except Exception as e:
+        logger.debug("piyasa durumu hata: %s", e)
+        st["ts"] = now
+    return st
+
+
+# ===================== 14) PORTFÖY + KORELASYON KONTROLÜ ==================== #
+async def v12_korelasyon(sym_a, sym_b, bars=48):
+    try:
+        ka = await get_klines(sym_a, "1H", bars + 2)
+        kb = await get_klines(sym_b, "1H", bars + 2)
+        ca, cb = closes(ka), closes(kb)
+        n = min(len(ca), len(cb), bars)
+        if n < 20: return 0.0
+        ra = [ca[-n + i] / ca[-n + i - 1] - 1 for i in range(1, n)]
+        rb = [cb[-n + i] / cb[-n + i - 1] - 1 for i in range(1, n)]
+        ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+        cov = sum((ra[i] - ma) * (rb[i] - mb) for i in range(len(ra)))
+        va = math.sqrt(sum((x - ma) ** 2 for x in ra)) or 1e-12
+        vb = math.sqrt(sum((x - mb) ** 2 for x in rb)) or 1e-12
+        return round(cov / (va * vb), 2)
+    except Exception:
+        return 0.0
+
+
+async def v12_portfoy_kontrol(symbol, side):
+    """Aşırı yüklenme + korelasyon + yön dengesi + toplam risk. → (blok_sebebi|None, btc_corr)"""
+    mp = _v10_mem()
+    acik = mp.get("open", [])
+    longs = sum(1 for p in acik if p["side"] == "LONG")
+    shorts = len(acik) - longs
+    if side == "LONG" and longs - shorts >= V12_DIR_MAX_SKEW:
+        return f"yön dengesi: {longs}L/{shorts}S", 0.0
+    if side == "SHORT" and shorts - longs >= V12_DIR_MAX_SKEW:
+        return f"yön dengesi: {longs}L/{shorts}S", 0.0
+    ayni_yon = [p for p in acik if p["side"] == side and p["symbol"] != symbol][:4]
+    for p in ayni_yon:
+        cr = await v12_korelasyon(symbol, p["symbol"])
+        if cr >= V12_CORR_MAX:
+            return f"korelasyon {cr:.2f} ({_base_of(p['symbol'])} ile aşırı yüklenme)", 0.0
+    btc_corr = await v12_korelasyon(symbol, "BTC-USDT-SWAP")
+    return None, btc_corr
+
+
+def v12_gunluk_r():
+    gun = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return safe_float(_v12_mem()["day_r"].get(gun, 0.0)), gun
+
+
+# ===================== 11) SİNYAL KAPILARI + ORKESTRATÖR ==================== #
+def v12_gate(symbol, side):
+    """Merkezi engeller: acil durdurma, ağ, günlük zarar, panik, çakışan sinyal."""
+    now = time.time()
+    if v12_state["emergency"]:
+        return "ACİL DURDURMA aktif (/devam ile aç)"
+    if now < v12_state["net_pause_until"]:
+        return "ağ koruması: API hataları nedeniyle duraklatıldı"
+    r_gun, _ = v12_gunluk_r()
+    if r_gun <= -V12_DAILY_MAX_R:
+        return f"günlük zarar limiti: {r_gun:+.1f}R ≤ -{V12_DAILY_MAX_R:g}R"
+    if side == "LONG" and now < v12_state["panic_until"]:
+        return "PANİK rejimi: LONG blok"
+    st = v12_state["market"]
+    if st.get("state") == "SOK":
+        return "haber-benzeri ŞOK: tüm sinyaller kısa süre blok"
+    for p in _v10_mem().get("open", []):
+        if p["symbol"] == symbol and p["side"] != side:
+            return f"çakışan sinyal: {p['side']} pozisyon açık"
+    onceki = v12_state["last_side"].get(symbol)
+    if onceki and onceki[0] != side and now - onceki[1] < 3600:
+        return f"çakışan sinyal: 1 saat içinde zıt {onceki[0]} sinyali"
+    return None
+
+
+def v12_pozisyon_boyu(entry, stop_pct):
+    risk_usdt = V12_EQUITY_USDT * V12_RISK_PCT / 100.0
+    nominal = risk_usdt / (max(stop_pct, 0.05) / 100.0)
+    miktar = nominal / max(entry, 1e-12)
+    marj10 = nominal / 10.0
+    return {"risk_usdt": round(risk_usdt, 2), "nominal": round(nominal, 2),
+            "miktar": round(miktar, 6), "marj10x": round(marj10, 2)}
+
+
+async def v12_enrich(symbol, side, k, ob, oi_pct, funding, fomo):
+    """Tüm V12 motorlarını çalıştırır → (blok|None, v11_ek_kovalar, mesaj_bloğu, bilgi)."""
+    if not V12_ENABLED:
+        return None, [], "", {}
+    blok = v12_gate(symbol, side)
+    info: Dict[str, Any] = {}
+    keys: List[str] = []
+    try:
+        st = await v12_piyasa_durumu()
+        tr = v12_trend(k); mo = v12_momentum(k); vo = v12_volatilite(k); ha = v12_hacim(k)
+        yp = v12_structure(k); sm = v12_smc(k, yp)
+        c = closes(k)
+        chg = 100 * (c[-1] / c[-2] - 1) if len(c) > 1 else 0.0
+        ba = v12_balina(oi_pct, funding, chg, ha["spike"])
+        kb = v12_kitap(symbol, ob, k)
+        liq_rows = await fetch_okx_liquidations(symbol)
+        li = v12_likidite(liq_rows, c[-1], sm)
+        li["temizlik"] = 1 if yp.get("grab") else 0
+        prem = v12_premium(symbol, c[-1])
+        if blok is None and not v12_state["emergency"]:
+            pblok, btc_corr = await v12_portfoy_kontrol(symbol, side)
+            blok = pblok
+        else:
+            btc_corr = 0.0
+        tape_d = v12_tape_delta(symbol)
+        # Çoklu onay sayacı: kaç motor sinyal yönüyle aynı fikirde
+        yon = 1 if side == "LONG" else -1
+        onay = 0
+        onay += 1 if (tr["rejim"] == ("UP" if yon > 0 else "DOWN")) else 0
+        onay += 1 if (mo["skor"] * yon > 15) else 0
+        onay += 1 if (ha["obv_yon"] == ("UP" if yon > 0 else "DOWN")) else 0
+        onay += 1 if ((sm["pd_bolge"] == "DISC" and yon > 0) or (sm["pd_bolge"] == "PREM" and yon < 0)) else 0
+        onay += 1 if (ba["matris"] == ("YENI_LONG" if yon > 0 else "YENI_SHORT")) else 0
+        onay += 1 if ((yp.get("olay") or "").endswith("UP") if yon > 0 else (yp.get("olay") or "").endswith("DOWN")) else 0
+        onay += 1 if (yp["mss"] and ((yp["ic_yapi"] == "UP") == (yon > 0))) else 0
+        onay += 1 if ((li["miknatis"] == "UST" and yon > 0) or (li["miknatis"] == "ALT" and yon < 0)) else 0
+        info = {"trend": tr, "mom": mo, "vol": vo, "hacim": ha, "yapi": yp, "smc": sm,
+                "balina": ba, "kitap": kb, "likidite": li, "premium": prem,
+                "btc_corr": btc_corr, "onay": onay, "durum": st.get("state", "NORMAL"),
+                "tape_delta": tape_d, "boyut": None}
+        # V11 öğrenme kovaları (hepsi adaptif skora girer)
+        keys = [
+            f"onayN:{'0-2' if onay <= 2 else ('3-4' if onay <= 4 else '5+')}",
+            f"durum:{st.get('state','NORMAL')}",
+            f"sqz:{vo['sqz_on']}",
+            f"mss:{yp['mss']}",
+            f"brk:{sm['breaker']}",
+            f"ifvg:{sm['ifvg']}",
+            f"pdz:{sm['pd_bolge']}",
+            f"whale:{ba['matris']}",
+            f"mom:{mo['macd']}",
+            f"vol2:{'<1' if ha['rvol'] < 1 else ('1-2' if ha['rvol'] < 2 else '2+')}",
+            f"korel:{'DUSUK' if abs(btc_corr) < 0.4 else ('ORTA' if abs(btc_corr) < 0.75 else 'YUKSEK')}",
+            f"kitap2:{'SPOOF' if kb['spoof'] else ('ICE' if kb['iceberg'] else ('ABS' if kb['absorption'] else 'NOTR'))}",
+        ]
+        if prem is not None:
+            keys.append(f"prem:{'NEG' if prem < -0.15 else ('POZ' if prem > 0.15 else 'NOTR')}")
+        if li["miknatis"] != "YOK":
+            keys.append(f"pool:{li['miknatis']}")
+        # Mesaj bloğu
+        satir = [
+            f"V12 Onay: {onay}/8 | Durum: {st.get('state','NORMAL')}"
+            + (f" ({st.get('detay')})" if st.get("detay") else ""),
+            f"Trend: {tr['rejim']} ADX:{tr['adx']} güç:{tr['guc']}"
+            + (f" kesişim:{','.join(tr['kesisim'])}" if tr['kesisim'] else ""),
+            f"Mom: {mo['skor']:+d} MACD:{mo['macd']} sRSI:{mo['srsi_k']:.0f} MFI:{mo['mfi']:.0f} CCI:{mo['cci']:.0f}",
+            f"Vol: {vo['rejim']} ATR%{vo['atr_pct']} SQZ:{'AÇIK' if vo['sqz_on'] else '-'}"
+            + (" PATLAMA" if vo['patlama'] else ""),
+            f"Hacim: RVOL {ha['rvol']}x OBV:{ha['obv_yon']}"
+            + (" SPIKE" if ha['spike'] else "") + (" ANOMALİ" if ha['anomali'] else "")
+            + (f" | tapeΔ:{tape_d}" if tape_d is not None else ""),
+            f"Yapı: dış:{yp['dis_yapi']} iç:{yp['ic_yapi']}"
+            + (f" {yp['olay']}" if yp['olay'] else "") + (" MSS" if yp['mss'] else "")
+            + (" IND" if yp['inducement'] else "") + (f" GRAB:{yp['grab']}" if yp['grab'] else ""),
+            f"SMC: {sm['pd_bolge']}(%{sm['pd_pct']:.0f})"
+            + (" BRK" if sm['breaker'] else "") + (" MIT" if sm['mitigation'] else "")
+            + (" iFVG" if sm['ifvg'] else "")
+            + (f" havuz↑{sm['pool_ust']}" if sm['pool_ust'] else "")
+            + (f" havuz↓{sm['pool_alt']}" if sm['pool_alt'] else ""),
+            f"Balina: {ba['matris']}" + (" GİRİŞ" if ba['giris'] else "")
+            + (" ÇIKIŞ" if ba['cikis'] else "")
+            + (f" {ba['sikisma']}" if ba['sikisma'] != 'YOK' else ""),
+            f"Kitap: oran {kb['oran']}" + (" SPOOF?" if kb['spoof'] else "")
+            + (" ICEBERG?" if kb['iceberg'] else "") + (" ABSORP" if kb['absorption'] else "")
+            + " (heuristik)",
+        ]
+        if li["long_kume"] or li["short_kume"]:
+            satir.append("Likidasyon: "
+                + (f"↓{li['long_kume']['fiyat']} ({li['long_kume']['usdt']:.0f}$) " if li['long_kume'] else "")
+                + (f"↑{li['short_kume']['fiyat']} ({li['short_kume']['usdt']:.0f}$)" if li['short_kume'] else "")
+                + (f" mıknatıs:{li['miknatis']}" if li['miknatis'] != 'YOK' else ""))
+        if prem is not None:
+            satir.append(f"Premium(OKX-Binance): {prem:+.2f}% | BTC korel: {btc_corr:.2f}")
+        msg = "\n".join(satir)
+    except Exception as e:
+        logger.exception("v12_enrich hata %s: %s", symbol, e)
+        return blok, [], "", {}
+    return blok, keys, msg, info
+
+
+# ======================= 17-18) RAPORLAMA SİSTEMİ ========================== #
+def _v12_mem():
+    m = memory.setdefault("v12", {})
+    m.setdefault("day_r", {})
+    m.setdefault("last_daily", ""); m.setdefault("last_weekly", ""); m.setdefault("last_monthly", "")
+    return m
+
+
+def v12_add_day_r(R):
+    m = _v12_mem()
+    gun = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    m["day_r"][gun] = round(safe_float(m["day_r"].get(gun, 0.0)) + safe_float(R), 3)
+    if len(m["day_r"]) > 60:
+        for kk in sorted(m["day_r"])[:-60]:
+            m["day_r"].pop(kk, None)
+    return m["day_r"][gun]
+
+
+def v12_metrikler(rs):
+    """R serisinden: winrate, PF, expectancy, maxDD(R), ardışık kayıp."""
+    n = len(rs)
+    if n == 0:
+        return {"n": 0, "wr": 0.0, "pf": 0.0, "exp": 0.0, "maxdd": 0.0, "seri_kayip": 0}
+    win = [r for r in rs if r > 0]; los = [r for r in rs if r <= 0]
+    pf = (sum(win) / abs(sum(los))) if los and sum(los) != 0 else (99.0 if win else 0.0)
+    cum = pk = dd = 0.0; sk = wk = 0
+    for r in rs:
+        cum += r; pk = max(pk, cum); dd = min(dd, cum - pk)
+        sk = sk + 1 if r <= 0 else 0
+        wk = max(wk, sk)
+    return {"n": n, "wr": round(100 * len(win) / n, 1), "pf": round(pf, 2),
+            "exp": round(sum(rs) / n, 3), "maxdd": round(dd, 2), "seri_kayip": wk}
+
+
+def v12_rapor(gun_sayisi, baslik):
+    m = _v11_mem()
+    esik = time.time() - gun_sayisi * 86400
+    tr = [t for t in m.get("trades", []) if safe_float(t.get("ts")) >= esik]
+    rs = [safe_float(t.get("R")) for t in tr]
+    mt = v12_metrikler(rs)
+    tp = {"STOP": 0, "TP1": 0, "TP2": 0, "TP3": 0}
+    for t in tr:
+        tp[t.get("result", "STOP")] = tp.get(t.get("result", "STOP"), 0) + 1
+    lines = [f"📊 {baslik} RAPOR ({gun_sayisi} gün)",
+             f"İşlem: {mt['n']} | WinRate: %{mt['wr']} | PF: {mt['pf']}",
+             f"Expectancy: {mt['exp']:+.3f}R | MaxDD: {mt['maxdd']:.2f}R | Seri kayıp: {mt['seri_kayip']}",
+             f"Toplam: {sum(rs):+.2f}R | Dağılım: STOP {tp['STOP']} / TP1 {tp['TP1']} / TP2 {tp['TP2']} / TP3 {tp['TP3']}"]
+    if tr:
+        agg: Dict[str, List[float]] = {}
+        for t in tr:
+            agg.setdefault(_base_of(t.get("symbol") or "?"), []).append(safe_float(t.get("R")))
+        srt = sorted(agg.items(), key=lambda x: sum(x[1]))
+        en_kotu = " ".join(f"{s}:{sum(r):+.1f}R" for s, r in srt[:3])
+        en_iyi = " ".join(f"{s}:{sum(r):+.1f}R" for s, r in srt[-3:][::-1])
+        lines.append(f"En iyi: {en_iyi}")
+        lines.append(f"En kötü: {en_kotu}")
+    return "\n".join(lines)
+
+
+async def v12_report_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            m = _v12_mem()
+            gun = now.strftime("%Y-%m-%d")
+            if now.hour == V12_REPORT_HOUR_UTC and m["last_daily"] != gun:
+                m["last_daily"] = gun
+                await safe_send_telegram(v12_rapor(1, "GÜNLÜK"))
+                if now.weekday() == 0 and m["last_weekly"] != gun:
+                    m["last_weekly"] = gun
+                    await safe_send_telegram(v12_rapor(7, "HAFTALIK"))
+                if now.day == 1 and m["last_monthly"] != gun:
+                    m["last_monthly"] = gun
+                    await safe_send_telegram(v12_rapor(30, "AYLIK"))
+        except Exception as e:
+            logger.exception("rapor döngüsü hatası: %s", e)
+        await asyncio.sleep(1800)
+
+
+# ================ 19) MONTE CARLO + REPLAY + OPT + WALK-FORWARD ============= #
+def v12_montecarlo(rs, iters=1000, seed=7):
+    if len(rs) < 10:
+        return None
+    rnd = random.Random(seed)
+    fin, dds, ruin = [], [], 0
+    n = len(rs)
+    for _ in range(iters):
+        cum = pk = dd = 0.0
+        mn = 0.0
+        for _ in range(n):
+            r = rs[rnd.randrange(n)]
+            cum += r; pk = max(pk, cum); dd = min(dd, cum - pk); mn = min(mn, cum)
+        fin.append(cum); dds.append(dd)
+        if mn <= -20: ruin += 1
+    fin.sort(); dds.sort()
+    q = lambda arr, p: arr[int(p * (len(arr) - 1))]
+    return {"n": n, "iters": iters,
+            "son_p5": round(q(fin, 0.05), 1), "son_p50": round(q(fin, 0.5), 1), "son_p95": round(q(fin, 0.95), 1),
+            "dd_p5": round(q(dds, 0.05), 1), "dd_p50": round(q(dds, 0.5), 1),
+            "ruin_pct": round(100 * ruin / iters, 1)}
+
+
+def v12_replay(k, minq=65.0, atrm=1.5, max_bars=96):
+    """Fiyat-tabanlı hızlı replay (OI/funding/kitap HARİÇ — parametre yönü için).
+    EMA7/25 + RSI + swing kırılımı skoru; hedef 2R sabit, ATR×atrm stop."""
+    c, h, l = closes(k), highs(k), lows(k)
+    n = len(c)
+    if n < 120: return []
+    e7, e25, e50 = ema(c, 7), ema(c, 25), ema(c, 50)
+    r14 = rsi(c, 14); at = atr(k, 14)
+    sw = v12_swings(k, 3, 3)
+    sw_h = [(i, p) for i, p, t in sw if t == "H"]
+    sw_l = [(i, p) for i, p, t in sw if t == "L"]
+    rs, i = [], 60
+    while i < n - 2:
+        yon = 0
+        lh = [p for j, p in sw_h if j < i][-1:] or [h[i]]
+        ll = [p for j, p in sw_l if j < i][-1:] or [l[i]]
+        skor = 50.0
+        if e7[i] > e25[i] and c[i] > e50[i]: skor += 12; yon = 1
+        elif e7[i] < e25[i] and c[i] < e50[i]: skor += 12; yon = -1
+        if yon == 1 and c[i] > lh[0]: skor += 15
+        if yon == -1 and c[i] < ll[0]: skor += 15
+        if yon == 1 and 45 <= r14[i] <= 68: skor += 8
+        if yon == -1 and 32 <= r14[i] <= 55: skor += 8
+        if yon != 0 and skor >= minq:
+            entry = c[i]; stop_d = max(at[i] * atrm, entry * 0.004)
+            tp_d = 2.0 * stop_d
+            done = False
+            for j in range(i + 1, min(n, i + max_bars)):
+                if yon == 1:
+                    if l[j] <= entry - stop_d: rs.append(-1.0); done = True; break
+                    if h[j] >= entry + tp_d: rs.append(2.0); done = True; break
+                else:
+                    if h[j] >= entry + stop_d: rs.append(-1.0); done = True; break
+                    if l[j] <= entry - tp_d: rs.append(2.0); done = True; break
+            if not done:
+                j = min(n - 1, i + max_bars)
+                rs.append(round(clamp(yon * (c[j] - entry) / stop_d, -1.0, 2.0), 2))
+            i += 6
+        i += 1
+    return rs
+
+
+V12_OPT_GRID = [(mq, am) for mq in (60.0, 65.0, 70.0) for am in (1.2, 1.5, 1.8)]
+
+
+async def v12_opt(symbols, days=30):
+    """Grid optimizasyon (fiyat-tabanlı replay üzerinde)."""
+    out = ["🔧 PARAMETRE OPTİMİZASYONU (fiyat-tabanlı replay — OI/funding hariç)"]
+    sonuc: Dict[Any, List[float]] = {g: [] for g in V12_OPT_GRID}
+    for s in symbols:
+        k = await get_klines_paginated(s, "1H", min(days * 24, 2000))
+        if len(k) < 200:
+            out.append(f"{_base_of(s)}: veri yetersiz"); continue
+        for g in V12_OPT_GRID:
+            sonuc[g].extend(v12_replay(k, *g))
+    skorlu = []
+    for (mq, am), rs in sonuc.items():
+        mt = v12_metrikler(rs)
+        skorlu.append((mt["exp"] * math.sqrt(max(mt["n"], 1)), mq, am, mt))
+    skorlu.sort(reverse=True)
+    for _, mq, am, mt in skorlu[:5]:
+        out.append(f"minq={mq:g} atr×{am:g} → n={mt['n']} WR%{mt['wr']} PF{mt['pf']} exp{mt['exp']:+.2f}R DD{mt['maxdd']:.1f}R")
+    if skorlu:
+        _, mq, am, mt = skorlu[0]
+        out.append(f"✅ En iyi: minq={mq:g}, ATR×{am:g} (exp {mt['exp']:+.2f}R, {mt['n']} işlem)")
+    return "\n".join(out)
+
+
+async def v12_walkforward(symbol, days=60, folds=4):
+    """Anchored Walk-Forward: her pencerede önceki dilimde optimize et, sonrakinde test et."""
+    k = await get_klines_paginated(symbol, "1H", min(days * 24, 3000))
+    if len(k) < folds * 150:
+        return f"WF: {_base_of(symbol)} için veri yetersiz ({len(k)} mum)"
+    boy = len(k) // folds
+    out = [f"🚶 WALK-FORWARD {_base_of(symbol)} — {folds} pencere, {len(k)} mum (fiyat-tabanlı)"]
+    test_exps = []
+    for i in range(1, folds):
+        egitim, test = k[: i * boy], k[i * boy - 60: (i + 1) * boy]
+        best, best_g = -1e9, V12_OPT_GRID[0]
+        for g in V12_OPT_GRID:
+            mt = v12_metrikler(v12_replay(egitim, *g))
+            sc = mt["exp"] * math.sqrt(max(mt["n"], 1))
+            if mt["n"] >= 8 and sc > best: best, best_g = sc, g
+        mt_t = v12_metrikler(v12_replay(test, *best_g))
+        test_exps.append(mt_t["exp"])
+        out.append(f"P{i}: eğitimde seçilen minq={best_g[0]:g}/ATR×{best_g[1]:g} → "
+                   f"testte n={mt_t['n']} WR%{mt_t['wr']} exp{mt_t['exp']:+.2f}R")
+    poz = sum(1 for e in test_exps if e > 0)
+    out.append(f"Stabilite: {poz}/{len(test_exps)} pencerede pozitif expectancy"
+               + (" ✅ tutarlı" if poz >= len(test_exps) - 1 else " ⚠️ değişken"))
+    return "\n".join(out)
+
+
+# ==================== 20-21) ALARM + GÜVENLİK + WS ========================== #
+def _discord_post(text):
+    try:
+        SESSION.post(V12_DISCORD_WEBHOOK, json={"content": text[:1900]}, timeout=8)
+    except Exception as e:
+        logger.debug("discord hata: %s", e)
+
+
+async def v12_alarm(text, kritik=False):
+    """Kritik alarm sistemi: Telegram + (varsa) Discord aynası."""
+    on = ("🚨 " if kritik else "") + text
+    await safe_send_telegram(on)
+    if V12_DISCORD_WEBHOOK and (kritik or V12_DISCORD_SIGNALS):
+        await asyncio.to_thread(_discord_post, on)
+
+
+def v12_net_iyi():
+    v12_state["net_fail"] = 0
+
+
+def v12_net_hata():
+    v12_state["net_fail"] += 1
+    if v12_state["net_fail"] >= V12_NET_FAIL_LIMIT and time.time() >= v12_state["net_pause_until"]:
+        v12_state["net_pause_until"] = time.time() + V12_NET_PAUSE_SEC
+        v12_state["net_fail"] = 0
+        logger.warning("AĞ KORUMASI: %d sn duraklatıldı", V12_NET_PAUSE_SEC)
+        return True
+    return False
+
+
+def v12_sinyal_dogrula(sig):
+    """Emir/sinyal doğrulama: alanlar tutarlı mı? (paper güvenliği)"""
+    try:
+        e, st = safe_float(sig["entry"]), safe_float(sig["stop"])
+        t1, t2, t3 = (safe_float(sig[x]) for x in ("tp1", "tp2", "tp3"))
+        if e <= 0 or st <= 0: return "geçersiz fiyat"
+        if sig["direction"] == "LONG" and not (st < e < t1 < t2 < t3): return "LONG seviyeleri tutarsız"
+        if sig["direction"] == "SHORT" and not (st > e > t1 > t2 > t3): return "SHORT seviyeleri tutarsız"
+        if not (0.05 <= safe_float(sig.get("stop_pct")) <= 8.0): return "stop % aralık dışı"
+    except Exception:
+        return "eksik alan"
+    return None
+
+
+async def v12_ws_loop():
+    """Opsiyonel OKX public WS: trades + tickers + likidasyon. Varsayılan KAPALI.
+    Açmak için: requirements'a `websockets` ekle + V12_WS_ENABLED=true."""
+    if not V12_WS_ENABLED:
+        return
+    try:
+        import websockets  # type: ignore
+    except Exception:
+        await v12_alarm("V12 WS: `websockets` paketi yok — REST modunda devam", kritik=False)
+        return
+    url = "wss://ws.okx.com:8443/ws/v5/public"
+    while True:
+        try:
+            syms = list(COINS or [])[:V12_WS_TOP] or ["BTC-USDT-SWAP"]
+            subs = [{"channel": "trades", "instId": s} for s in syms] + \
+                   [{"channel": "tickers", "instId": s} for s in syms] + \
+                   [{"channel": "liquidation-orders", "instType": "SWAP"}]
+            async with websockets.connect(url, ping_interval=20, close_timeout=5) as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": subs}))
+                logger.info("V12 WS bağlı (%d coin)", len(syms))
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    ch = (msg.get("arg") or {}).get("channel")
+                    data = msg.get("data") or []
+                    if ch == "trades":
+                        inst = (msg.get("arg") or {}).get("instId")
+                        dq = v12_tape.setdefault(inst, deque(maxlen=400))
+                        for d in data:
+                            dq.append((safe_float(d.get("ts")) / 1000 or time.time(),
+                                       safe_float(d.get("px")), safe_float(d.get("sz")),
+                                       str(d.get("side") or "buy")))
+                    elif ch == "liquidation-orders":
+                        for d in data:
+                            for r in v12_parse_liqs([d]):
+                                v12_ws_liqs.append((d.get("instId"),) + r)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("V12 WS koptu: %s — 10 sn sonra yeniden", e)
+            await asyncio.sleep(10)
+
+
+# ============================ V12 KOMUTLARI ================================ #
+async def cmd_v12(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = await v12_piyasa_durumu()
+    r_gun, gun = v12_gunluk_r()
+    lines = [
+        "🧩 V12 TAM YIĞIN DURUM",
+        f"Piyasa: {st.get('state')} {('— ' + st['detay']) if st.get('detay') else ''}",
+        f"BTC: 1H {st.get('btc_1h_chg', 0):+.2f}% | kırılım:{st.get('btc_kirilim','-')} | ADX:{st.get('btc_adx','-')} | vol:{st.get('btc_vol','-')} | MACD:{st.get('btc_macd','-')}",
+        f"Genişlik: %{st.get('genislik','-')} yükselen | BTC payı(PROXY): %{st.get('btc_pay','-')}",
+        f"Bugün ({gun}): {r_gun:+.2f}R (limit -{V12_DAILY_MAX_R:g}R)",
+        f"Acil durdurma: {'AKTİF 🛑' if v12_state['emergency'] else 'kapalı'} | Ağ: {'DURAKLATILDI' if time.time() < v12_state['net_pause_until'] else 'normal'}",
+        f"Trailing: {'AÇIK ATR×' + format(V12_TRAIL_ATR_MULT, 'g') if V12_TRAIL_ENABLED else 'KAPALI'} | Korelasyon tavanı: {V12_CORR_MAX:g} | Yön dengesi: ±{V12_DIR_MAX_SKEW}",
+        f"WS: {'AÇIK' if V12_WS_ENABLED else 'KAPALI (REST)'} | Discord: {'bağlı' if V12_DISCORD_WEBHOOK else 'yok'}",
+        f"Pozisyon boyu (örnek %1 stop): {v12_pozisyon_boyu(1.0, 1.0)['nominal']:.0f}$ nominal (eq {V12_EQUITY_USDT:g}$, risk %{V12_RISK_PCT:g})",
+        "Komutlar: /analiz SEMBOL | /rapor [gun|hafta|ay] | /montecarlo | /opt [gün] | /wf SEMBOL [gün] | /durdur /devam",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_analiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    sym = (args[0].upper() if args else "BTC") 
+    if not sym.endswith("-USDT-SWAP"):
+        sym = sym.replace("USDT", "").replace("-", "") + "-USDT-SWAP"
+    try:
+        k = await get_klines(sym, "1H", 200)
+        if len(k) < 60:
+            await update.message.reply_text(f"{sym}: veri yok"); return
+        mtf_satir = []
+        for tf in ("1m", "5m", "15m", "1H", "4H", "1D"):
+            kk = k if tf == "1H" else await get_klines(sym, tf, 120)
+            t = v12_trend(kk) if len(kk) >= 60 else {"rejim": "-", "adx": 0}
+            mtf_satir.append(f"{tf}:{t['rejim']}({t['adx']})")
+        blok, keys, msg, info = await v12_enrich(sym, "LONG", k, {}, 0.0, 0.0, 0.0)
+        boy = v12_pozisyon_boyu(closes(k)[-1], max(v12_volatilite(k)["atr_pct"] * 1.5, 0.4))
+        out = (f"🔬 ANALİZ {sym}\nMTF: " + " ".join(mtf_satir) + "\n" + msg +
+               f"\nBoyut önerisi: {boy['miktar']} adet ≈ {boy['nominal']:.0f}$ nominal (risk {boy['risk_usdt']}$)")
+        await update.message.reply_text(out[:4000])
+    except Exception as e:
+        await update.message.reply_text(f"analiz hatası: {e}")
+
+
+async def cmd_rapor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = (context.args[0].lower() if context.args else "gun")
+    gun, ad = (7, "HAFTALIK") if arg.startswith("haf") else ((30, "AYLIK") if arg.startswith("ay") else (1, "GÜNLÜK"))
+    await update.message.reply_text(v12_rapor(gun, ad))
+
+
+async def cmd_montecarlo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rs = [safe_float(t.get("R")) for t in _v11_mem().get("trades", [])]
+    mc = v12_montecarlo(rs)
+    if not mc:
+        await update.message.reply_text("Monte Carlo için en az 10 kapanmış işlem gerekli."); return
+    await update.message.reply_text(
+        f"🎲 MONTE CARLO ({mc['iters']}× yeniden örnekleme, {mc['n']} işlem)\n"
+        f"Sonuç R: p5 {mc['son_p5']:+.1f} | medyan {mc['son_p50']:+.1f} | p95 {mc['son_p95']:+.1f}\n"
+        f"MaxDD: medyan {mc['dd_p50']:.1f}R | kötü senaryo(p5) {mc['dd_p5']:.1f}R\n"
+        f"-20R iflas olasılığı: %{mc['ruin_pct']}")
+
+
+async def cmd_opt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    days = int(safe_float(context.args[0])) if context.args else 30
+    syms = list(COINS or ["BTC-USDT-SWAP"])[:3]
+    await update.message.reply_text(f"🔧 Optimizasyon başladı: {', '.join(_base_of(s) for s in syms)} × {days} gün (birkaç dk sürebilir)")
+    try:
+        await update.message.reply_text((await v12_opt(syms, days))[:4000])
+    except Exception as e:
+        await update.message.reply_text(f"opt hatası: {e}")
+
+
+async def cmd_wf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    sym = (args[0].upper() + "-USDT-SWAP") if args and not args[0].upper().endswith("-USDT-SWAP") else (args[0].upper() if args else "BTC-USDT-SWAP")
+    days = int(safe_float(args[1])) if len(args) > 1 else 60
+    await update.message.reply_text(f"🚶 Walk-forward başladı: {sym} × {days} gün")
+    try:
+        await update.message.reply_text((await v12_walkforward(sym, days))[:4000])
+    except Exception as e:
+        await update.message.reply_text(f"wf hatası: {e}")
+
+
+async def cmd_durdur(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    v12_state["emergency"] = True
+    await v12_alarm("ACİL DURDURMA aktif — yeni sinyal gönderilmeyecek (/devam ile aç)", kritik=True)
+
+
+async def cmd_devam(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    v12_state["emergency"] = False
+    await update.message.reply_text("✅ Sinyal akışı yeniden AÇIK")
+
+
 def v10_cooldown_ok(symbol):
     return time.time() - v10_last_alert.get(symbol, 0) >= V10_ALERT_COOLDOWN_MIN*60
 
@@ -5991,9 +7209,16 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
+    dogrulama = v12_sinyal_dogrula(sig)
+    if dogrulama:
+        logger.warning("V12 sinyal doğrulama reddi %s %s: %s", side, symbol, dogrulama)
+        return
     ok = await safe_send_telegram(build_v10_message(sig))
     if ok:
         v10_last_alert[symbol] = time.time()
+        v12_state["last_side"][symbol] = (side, time.time())
+        if V12_DISCORD_WEBHOOK and V12_DISCORD_SIGNALS:
+            await asyncio.to_thread(_discord_post, build_v10_message(sig))
         v10_sent_candle[ckey] = sig["candle_ts"]
         mp = _v10_mem()
         if len(mp["open"]) < V10_MAX_OPEN:
@@ -6073,6 +7298,9 @@ async def v10_paper_loop() -> None:
             v11_msg = v11_maybe_recalc()
             if v11_msg:
                 await safe_send_telegram(v11_msg)
+            bekleyen = v12_state.pop("daily_alarm_pending", None)
+            if bekleyen:
+                await v12_alarm(bekleyen, kritik=True)
         except Exception as e:
             logger.exception("v10_paper_loop hata: %s", e)
         await asyncio.sleep(max(60, int(MA_SCAN_INTERVAL_SEC)))
@@ -6130,6 +7358,14 @@ def build_app():
     application.add_handler(CommandHandler("funding", cmd_funding))
     application.add_handler(CommandHandler("v10", cmd_v10))
     application.add_handler(CommandHandler("v11", cmd_v11))
+    application.add_handler(CommandHandler("v12", cmd_v12))
+    application.add_handler(CommandHandler("analiz", cmd_analiz))
+    application.add_handler(CommandHandler("rapor", cmd_rapor))
+    application.add_handler(CommandHandler("montecarlo", cmd_montecarlo))
+    application.add_handler(CommandHandler("opt", cmd_opt))
+    application.add_handler(CommandHandler("wf", cmd_wf))
+    application.add_handler(CommandHandler("durdur", cmd_durdur))
+    application.add_handler(CommandHandler("devam", cmd_devam))
     return application
 
 def main() -> None:
