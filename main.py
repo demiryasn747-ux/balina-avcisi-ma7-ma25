@@ -1167,11 +1167,23 @@ async def refresh_coin_pool(force: bool = False) -> Tuple[int, int]:
     okx_live_symbols.update(instruments)
 
     source_symbols = list(COINS)
-    if DYNAMIC_TOP_200_COIN_POOL and not RAW_COINS_ENV:
+    if not DYNAMIC_TOP_200_COIN_POOL:
+        stats["pool_mode"] = "DİNAMİK KAPALI (DYNAMIC_TOP_200_COIN_POOL=false)"
+    elif RAW_COINS_ENV:
+        stats["pool_mode"] = f"SABİT LİSTE (COINS env, {len(COINS)} coin) — dinamik seçim devre dışı"
+    else:
         tickers = await get_24h_tickers()
-        top_symbols = pick_top_200_from_tickers(tickers, instruments)
-        if top_symbols:
-            source_symbols = top_symbols
+        if not tickers:
+            stats["pool_mode"] = "TICKER ALINAMADI → yedek 69'luk listeye düşüldü"
+            logger.warning("HAVUZ FALLBACK: OKX ticker boş geldi, yedek listeyle devam")
+        else:
+            top_symbols = pick_top_200_from_tickers(tickers, instruments)
+            if top_symbols:
+                source_symbols = top_symbols
+                stats["pool_mode"] = f"DİNAMİK TOP-{len(top_symbols)}"
+            else:
+                stats["pool_mode"] = "FİLTRELER HEPSİNİ ELEDİ → yedek listeye düşüldü (hacim bandını kontrol et)"
+                logger.warning("HAVUZ FALLBACK: filtre sonrası 0 coin kaldı | diag=%s", stats.get("pool_diag"))
 
     valid: List[str] = []
     invalid: List[str] = []
@@ -1276,22 +1288,30 @@ def coin_allowed(ns: str, last_price: float) -> bool:
 
 def pick_top_200_from_tickers(tickers: Dict[str, Dict[str, Any]], instruments: Dict[str, Dict[str, Any]]) -> List[str]:
     rows: List[Tuple[str, float]] = []
+    diag = {"ticker": 0, "hacim_alt": 0, "hacim_ust": 0, "meme_fiyat": 0}
     for sym, row in tickers.items():
         ns = normalize_symbol(sym)
         if not ns.endswith("-USDT-SWAP"):
             continue
         if instruments and ns not in instruments:
             continue
+        diag["ticker"] += 1
         qv = quote_volume_from_ticker(row)
         if qv < MIN_24H_QUOTE_VOLUME:   # düşük hacimli saçma coinleri ele
+            diag["hacim_alt"] += 1
             continue
         if MAX_24H_QUOTE_VOLUME > 0 and qv > MAX_24H_QUOTE_VOLUME:  # mega-cap'leri ele (mid-cap bandı)
+            diag["hacim_ust"] += 1
             continue
         if not coin_allowed(ns, safe_float(row.get("last", 0))):  # meme + yüksek fiyat + blocklist ele
+            diag["meme_fiyat"] += 1
             continue
         rows.append((ns, qv))
     rows.sort(key=lambda x: x[1], reverse=True)
-    return [sym for sym, _ in rows[:MA_COIN_LIMIT]]
+    secilen = rows[:MA_COIN_LIMIT]
+    diag["secilen"] = len(secilen)
+    stats["pool_diag"] = diag
+    return [sym for sym, _ in secilen]
 
 def normalize_binance_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
@@ -5039,6 +5059,12 @@ def build_status_report() -> str:
     lines = [f"\U0001F4CA BALİNA AVCISI DURUM — BUILD {BOT_BUILD}",
              f"Saat: {tr_str()}",
              f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT} | API fail: {int(stats.get('api_fail', 0))} | Bloklu: {get_blocked_symbol_count()}"]
+    if stats.get("pool_mode"):
+        lines.append(f"Havuz modu: {stats['pool_mode']}")
+    pd_ = stats.get("pool_diag") or {}
+    if pd_:
+        lines.append(f"Havuz süzgeci: ticker={pd_.get('ticker', 0)} | hacim<{MIN_24H_QUOTE_VOLUME/1e6:.0f}M eledi={pd_.get('hacim_alt', 0)} | "
+                     f"hacim>{MAX_24H_QUOTE_VOLUME/1e6:.0f}M eledi={pd_.get('hacim_ust', 0)} | meme/fiyat eledi={pd_.get('meme_fiyat', 0)} | seçilen={pd_.get('secilen', 0)}")
 
     # --- V10 SMC kalici defter ---
     try:
