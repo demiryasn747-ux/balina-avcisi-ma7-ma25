@@ -13,7 +13,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V9 HİBRİT-MTF (1H tetik + 4H trend + ATR/RR + RiskGuard)"
+VERSION_NAME = "Balina Avcısı V10.4 GÖRSEL (SMC + HİBRİT + Grafik Sinyal + Haber Radarı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
 BOT_BUILD = os.getenv("BOT_BUILD", "V5")
 
@@ -40,7 +40,7 @@ MA_RECORD_TTL_DAYS = float(os.getenv("MA_RECORD_TTL_DAYS", "3"))  # ma_signals/m
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", "Europe/Istanbul").strip()
 
 AUTO_START_MESSAGE = os.getenv("AUTO_START_MESSAGE", "true").lower() == "true"
-AUTO_HEARTBEAT = os.getenv("AUTO_HEARTBEAT", "true").lower() == "true"
+AUTO_HEARTBEAT = os.getenv("AUTO_HEARTBEAT", "false").lower() == "true"  # V10.4: durum spami kapali, /status ile bak
 HEARTBEAT_INTERVAL_SEC = int(float(os.getenv("HEARTBEAT_INTERVAL_SEC", "7200")))
 HOT_SCAN_INTERVAL_SEC = float(os.getenv("HOT_SCAN_INTERVAL_SEC", "1.5"))
 DEEP_SCAN_INTERVAL_SEC = float(os.getenv("DEEP_SCAN_INTERVAL_SEC", "8"))
@@ -82,6 +82,7 @@ SCORE_OVERRIDE_GAP = float(os.getenv("SCORE_OVERRIDE_GAP", "8"))
 PRICE_OVERRIDE_MOVE_PCT = float(os.getenv("PRICE_OVERRIDE_MOVE_PCT", "0.55"))
 
 NO_SIGNAL_DIAG_SEC = int(float(os.getenv("NO_SIGNAL_DIAG_SEC", str(4 * 3600))))
+AUTO_DIAGNOSTIC = os.getenv("AUTO_DIAGNOSTIC", "false").lower() == "true"  # V10.4: teshis spami kapali
 
 KLINE_CACHE_SEC = int(float(os.getenv("KLINE_CACHE_SEC", "5")))
 TICKER_CACHE_SEC = int(float(os.getenv("TICKER_CACHE_SEC", "8")))
@@ -734,6 +735,356 @@ async def safe_send_telegram(text: str, retry: int = 3, delay_sec: float = 1.5) 
         await asyncio.sleep(delay_sec * i)
     stats["telegram_fail"] += 1
     return False
+
+# ============================================================================ #
+# === GÖRSEL SİNYAL MOTORU + HABER RADARI (BEGIN) ============================ #
+# Sinyaller artık renkli grafik (mum + EMA + Giriş/Stop/TP bölgeleri) ve       #
+# Google News haber taramasıyla zenginleştirilmiş gönderilir.                  #
+# Grafik veya haber alınamazsa sinyal ASLA kaybolmaz -> düz metne düşer.       #
+# ============================================================================ #
+import io as _io
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # Railway/sunucu: ekransız mod şart
+    import matplotlib.pyplot as _plt
+    from matplotlib.patches import Rectangle as _Rect
+    _MPL_OK = True
+except Exception:
+    _MPL_OK = False
+
+SIGNAL_CHART_ENABLED = os.getenv("SIGNAL_CHART_ENABLED", "true").lower() == "true"
+SIGNAL_CHART_TF = os.getenv("SIGNAL_CHART_TF", "1H").strip()
+SIGNAL_CHART_CANDLES = int(float(os.getenv("SIGNAL_CHART_CANDLES", "72")))
+SIGNAL_NEWS_ENABLED = os.getenv("SIGNAL_NEWS_ENABLED", "true").lower() == "true"
+SIGNAL_NEWS_MAX = int(float(os.getenv("SIGNAL_NEWS_MAX", "2")))
+SIGNAL_NEWS_CACHE_SEC = int(float(os.getenv("SIGNAL_NEWS_CACHE_SEC", "900")))
+SIGNAL_NEWS_TIMEOUT_SEC = float(os.getenv("SIGNAL_NEWS_TIMEOUT_SEC", "6"))
+SIGNAL_NEWS_MAX_AGE_H = float(os.getenv("SIGNAL_NEWS_MAX_AGE_H", "48"))
+
+_news_cache: Dict[str, Tuple[float, str]] = {}
+
+
+def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any]],
+                              entry: float, stop: float, tps: Dict[str, Any],
+                              meta: Dict[str, Any], tz_name: str) -> Optional[bytes]:
+    """Koyu temalı, renkli sinyal grafiği üretir (PNG bytes). Hata -> None."""
+    if not _MPL_OK:
+        return None
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        def _f(v, d=0.0):
+            try:
+                return float(v)
+            except Exception:
+                return d
+
+        def _fmt(x):
+            x = _f(x)
+            if x == 0:
+                return "0"
+            if x >= 100:
+                return f"{x:,.2f}"
+            if x >= 1:
+                return f"{x:.4f}"
+            return f"{x:.6f}"
+
+        rows = [r for r in klines if r and len(r) >= 6]
+        if len(rows) < 30:
+            return None
+        rows = rows[-max(40, min(SIGNAL_CHART_CANDLES, 200)):]
+        ts = [_f(r[0]) for r in rows]
+        op = [_f(r[1]) for r in rows]
+        hi = [_f(r[2]) for r in rows]
+        lo = [_f(r[3]) for r in rows]
+        cl = [_f(r[4]) for r in rows]
+        vo = [_f(r[5]) for r in rows]
+        n = len(rows)
+
+        def _ema_local(vals, period):
+            if len(vals) < period:
+                return []
+            k = 2.0 / (period + 1.0)
+            out = [sum(vals[:period]) / period]
+            for v in vals[period:]:
+                out.append(v * k + out[-1] * (1 - k))
+            return [None] * (period - 1) + out
+
+        ema20 = _ema_local(cl, 20)
+        ema50 = _ema_local(cl, 50)
+
+        BG, PANEL, GRID = "#0b0f17", "#0f1522", "#1f2937"
+        UP, DOWN = "#22c55e", "#ef4444"
+        TXT, SUB = "#e5e7eb", "#9ca3af"
+
+        d = (direction or "").upper()
+        dir_col = UP if d == "LONG" else (DOWN if d == "SHORT" else SUB)
+
+        fig = _plt.figure(figsize=(10.4, 6.4), dpi=115, facecolor=BG)
+        gs = fig.add_gridspec(2, 1, height_ratios=[3.4, 1.0], hspace=0.06,
+                              left=0.055, right=0.905, top=0.90, bottom=0.09)
+        ax = fig.add_subplot(gs[0])
+        axv = fig.add_subplot(gs[1], sharex=ax)
+        for a in (ax, axv):
+            a.set_facecolor(PANEL)
+            for s in a.spines.values():
+                s.set_color(GRID)
+            a.tick_params(colors=SUB, labelsize=8)
+            a.grid(True, color=GRID, alpha=0.35, linewidth=0.6)
+
+        # Mumlar
+        for i in range(n):
+            c = UP if cl[i] >= op[i] else DOWN
+            ax.plot([i, i], [lo[i], hi[i]], color=c, linewidth=0.9, alpha=0.95, zorder=3)
+            body_low = min(op[i], cl[i])
+            body_h = max(abs(cl[i] - op[i]), max(cl) * 1e-6)
+            ax.add_patch(_Rect((i - 0.33, body_low), 0.66, body_h,
+                               facecolor=c, edgecolor=c, linewidth=0.5, zorder=4))
+            axv.bar(i, vo[i], width=0.72, color=c, alpha=0.85, zorder=3)
+
+        # EMA çizgileri
+        if ema20:
+            ax.plot(range(n), ema20, color="#f59e0b", linewidth=1.4, alpha=0.95,
+                    label="EMA20", zorder=5)
+        if ema50:
+            ax.plot(range(n), ema50, color="#3b82f6", linewidth=1.4, alpha=0.95,
+                    label="EMA50", zorder=5)
+
+        entry = _f(entry)
+        stop = _f(stop)
+        tp_items = [(k, _f(v)) for k, v in (tps or {}).items() if _f(v) > 0]
+
+        x_right = n - 1 + max(6.0, n * 0.14)
+        ax.set_xlim(-1, x_right)
+
+        y_all = lo + hi + [v for v in (entry, stop) if v > 0] + [v for _, v in tp_items]
+        y_min, y_max = min(y_all), max(y_all)
+        pad = (y_max - y_min) * 0.06 or y_max * 0.01
+        ax.set_ylim(y_min - pad, y_max + pad)
+
+        # Risk (kırmızı) ve hedef (yeşil) bölgeleri
+        if entry > 0 and stop > 0:
+            ax.axhspan(min(entry, stop), max(entry, stop), color=DOWN, alpha=0.10, zorder=1)
+        if entry > 0 and tp_items:
+            best_tp = max((v for _, v in tp_items), key=lambda v: abs(v - entry))
+            ax.axhspan(min(entry, best_tp), max(entry, best_tp), color=UP, alpha=0.08, zorder=1)
+
+        def _hline(y, color, style, label):
+            if y <= 0:
+                return
+            ax.axhline(y, color=color, linestyle=style, linewidth=1.3, alpha=0.95, zorder=6)
+            ax.text(x_right, y, f" {label} {_fmt(y)}", color=color, fontsize=8.2,
+                    va="center", ha="left", fontweight="bold", clip_on=False)
+
+        _hline(entry, "#e5e7eb", "--", "GİRİŞ")
+        _hline(stop, DOWN, "-", "STOP")
+        tp_cols = ["#10b981", "#34d399", "#6ee7b7"]
+        for idx, (name, val) in enumerate(sorted(tp_items, key=lambda kv: abs(kv[1] - entry))):
+            _hline(val, tp_cols[min(idx, 2)], "-.", name)
+
+        # Zaman ekseni
+        try:
+            tz = _ZI(tz_name)
+        except Exception:
+            tz = None
+        ticks = [int(i) for i in [0, n * 0.25, n * 0.5, n * 0.75, n - 1]]
+        ax.set_xticks(ticks)
+        labels = []
+        for i in ticks:
+            try:
+                dt = _dt.fromtimestamp(ts[i] / 1000.0, tz)
+                labels.append(dt.strftime("%d.%m %H:%M"))
+            except Exception:
+                labels.append("")
+        ax.set_xticklabels([])
+        axv.set_xticks(ticks)
+        axv.set_xticklabels(labels, color=SUB, fontsize=7.6)
+        axv.set_yticks([])
+
+        # Başlık + meta satırı
+        meta = meta or {}
+        score = meta.get("score")
+        rsi = meta.get("rsi")
+        fund = meta.get("funding")
+        oi = meta.get("oi")
+        fig.text(0.055, 0.955, f"{symbol}", color=TXT, fontsize=14, fontweight="bold")
+        fig.text(0.055 + 0.012 * len(str(symbol)) + 0.02, 0.955, d or "-",
+                 color=dir_col, fontsize=14, fontweight="bold")
+        bits = [f"TF {SIGNAL_CHART_TF}"]
+        if score is not None:
+            bits.append(f"Skor {round(_f(score))}/100")
+        if rsi is not None:
+            bits.append(f"RSI {round(_f(rsi))}")
+        if fund is not None:
+            bits.append(f"Funding %{_f(fund) * 100:.4f}")
+        if oi is not None:
+            bits.append(f"OI Δ %{_f(oi):+.2f}")
+        fig.text(0.902, 0.955, "  ·  ".join(bits), color=SUB, fontsize=9, ha="right")
+
+        try:
+            now_txt = _dt.now(tz).strftime("%d.%m.%Y %H:%M") if tz else ""
+        except Exception:
+            now_txt = ""
+        fig.text(0.902, 0.925, now_txt, color=SUB, fontsize=8, ha="right")
+        ax.text(0.5, 0.5, "BALİNA AVCISI", transform=ax.transAxes, color=TXT,
+                fontsize=34, fontweight="bold", alpha=0.06, ha="center", va="center", zorder=2)
+        if ema20 or ema50:
+            leg = ax.legend(loc="upper left", fontsize=7.5, framealpha=0.15,
+                            facecolor=PANEL, edgecolor=GRID, labelcolor=SUB)
+            leg.set_zorder(7)
+
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", facecolor=BG, bbox_inches="tight")
+        _plt.close(fig)
+        return buf.getvalue()
+    except Exception as e:
+        try:
+            _plt.close("all")
+        except Exception:
+            pass
+        try:
+            logger.warning("Grafik üretilemedi %s: %s", symbol, e)
+        except Exception:
+            pass
+        return None
+
+
+async def render_signal_chart(symbol: str, direction: str, entry: float, stop: float,
+                              tps: Dict[str, Any], meta: Dict[str, Any]) -> Optional[bytes]:
+    try:
+        k = await get_klines(symbol, SIGNAL_CHART_TF, SIGNAL_CHART_CANDLES)
+        if len(k) < 30:
+            return None
+        return await asyncio.to_thread(_render_signal_chart_sync, symbol, direction,
+                                       k, entry, stop, tps or {}, meta or {}, TIMEZONE_NAME)
+    except Exception as e:
+        logger.warning("render_signal_chart hata %s: %s", symbol, e)
+        return None
+
+
+def _telegram_api_send_photo(caption: str, png_bytes: bytes) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram token/chat_id eksik (foto)")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": (caption or "")[:1024]}
+    files = {"photo": ("sinyal.png", png_bytes, "image/png")}
+    resp = SESSION.post(url, data=data, files=files, timeout=max(HTTP_TIMEOUT, 25))
+    ok = resp.status_code == 200 and resp.json().get("ok") is True
+    if not ok:
+        logger.error("Telegram sendPhoto hata: code=%s body=%s", resp.status_code, resp.text[:400])
+    return ok
+
+
+async def safe_send_telegram_photo(caption: str, png_bytes: bytes,
+                                   retry: int = 2, delay_sec: float = 1.5) -> bool:
+    for i in range(1, retry + 1):
+        try:
+            if await asyncio.to_thread(_telegram_api_send_photo, caption, png_bytes):
+                return True
+        except Exception as e:
+            logger.warning("Foto gönderim hatası %s/%s: %s", i, retry, e)
+        await asyncio.sleep(delay_sec * i)
+    return False
+
+
+def _fetch_coin_news_sync(base: str) -> str:
+    """Google News RSS'ten coin haber başlıkları. Hata -> boş string (sinyali bloklamaz)."""
+    import xml.etree.ElementTree as _ET
+    from email.utils import parsedate_to_datetime as _pd
+    url = "https://news.google.com/rss/search"
+    params = {"q": f"{base} coin kripto", "hl": "tr", "gl": "TR", "ceid": "TR:tr"}
+    resp = SESSION.get(url, params=params, timeout=SIGNAL_NEWS_TIMEOUT_SEC)
+    if resp.status_code != 200:
+        return ""
+    root = _ET.fromstring(resp.content)
+    out: List[str] = []
+    now = time.time()
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        if not title:
+            continue
+        age_txt = ""
+        try:
+            dt = _pd(item.findtext("pubDate") or "")
+            age_h = (now - dt.timestamp()) / 3600.0
+            if age_h > SIGNAL_NEWS_MAX_AGE_H or age_h < -1:
+                continue
+            age_txt = f" ({int(age_h * 60)}dk önce)" if age_h < 1 else f" ({age_h:.0f}sa önce)"
+        except Exception:
+            pass
+        if len(title) > 95:
+            title = title[:92] + "..."
+        out.append(f"• {title}{age_txt}")
+        if len(out) >= SIGNAL_NEWS_MAX:
+            break
+    return "\n".join(out)
+
+
+async def fetch_coin_news(symbol: str) -> str:
+    if not SIGNAL_NEWS_ENABLED:
+        return ""
+    base = (symbol or "").split("-")[0].strip().upper()
+    if not base:
+        return ""
+    now = time.time()
+    cached = _news_cache.get(base)
+    if cached and now - cached[0] <= SIGNAL_NEWS_CACHE_SEC:
+        return cached[1]
+    try:
+        text = await asyncio.to_thread(_fetch_coin_news_sync, base)
+    except Exception as e:
+        logger.warning("Haber taraması hata %s: %s", base, e)
+        text = ""
+    _news_cache[base] = (now, text)
+    if len(_news_cache) > 300:
+        oldest = sorted(_news_cache.items(), key=lambda kv: kv[1][0])[:100]
+        for k_, _ in oldest:
+            _news_cache.pop(k_, None)
+    return text
+
+
+async def send_rich_signal(text: str, symbol: str, direction: str,
+                           entry: float = 0.0, stop: float = 0.0,
+                           tps: Optional[Dict[str, Any]] = None,
+                           meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Sinyali grafik + haberle zengin gönderir. Her adım başarısız olabilir,
+    sinyal asla kaybolmaz: en kötü ihtimalle düz metin gider."""
+    full_text = text or ""
+    try:
+        news = await fetch_coin_news(symbol)
+        if news:
+            full_text = f"{full_text}\n📰 Haber Radarı ({(symbol or '').split('-')[0]}):\n{news}"
+            stats["news_hit"] = int(stats.get("news_hit", 0)) + 1
+    except Exception:
+        pass
+
+    png = None
+    if SIGNAL_CHART_ENABLED and _MPL_OK:
+        try:
+            png = await render_signal_chart(symbol, direction, safe_float(entry),
+                                            safe_float(stop), tps or {}, meta or {})
+        except Exception:
+            png = None
+
+    if png:
+        try:
+            if len(full_text) <= 1024:
+                if await safe_send_telegram_photo(full_text, png):
+                    stats["chart_sent"] = int(stats.get("chart_sent", 0)) + 1
+                    return True
+            else:
+                head = "\n".join(full_text.split("\n")[:3]) + "\n📊 Detaylar altta ⤵"
+                if await safe_send_telegram_photo(head, png):
+                    stats["chart_sent"] = int(stats.get("chart_sent", 0)) + 1
+                return await safe_send_telegram(full_text)
+        except Exception as e:
+            logger.warning("Zengin sinyal foto aşaması hata %s: %s", symbol, e)
+
+    return await safe_send_telegram(full_text)
+# === GÖRSEL SİNYAL MOTORU + HABER RADARI (END) ============================== #
 
 def normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper().replace("/", "-")
@@ -2964,7 +3315,14 @@ async def maybe_send_ma_signal(res: Dict[str, Any]) -> None:
         logger.exception("MA mesajı oluşturulamadı %s %s: %s", symbol, direction, e)
         return
 
-    ok = await safe_send_telegram(msg)
+    ok = await send_rich_signal(
+        msg, symbol, direction,
+        entry=safe_float(res.get("entry")), stop=safe_float(res.get("stop")),
+        tps={"TP1": res.get("tp1"), "TP2": res.get("tp2"), "TP3": res.get("tp3")},
+        meta={"score": res.get("score"), "rsi": res.get("rsi"),
+              "funding": res.get("institutional_funding_pct_8h"),
+              "oi": res.get("institutional_oi_change_pct")},
+    )
     if ok:
         async with memory_lock:
             mark_ma_sent(res)
@@ -3145,7 +3503,15 @@ async def maybe_send_hybrid_signal(res: Dict[str, Any]) -> None:
         logger.exception("HİBRİT mesajı oluşturulamadı %s %s: %s", symbol, direction, e)
         return
         
-    ok = await safe_send_telegram(msg)
+    ok = await send_rich_signal(
+        msg, symbol, direction,
+        entry=safe_float(res.get("entry")), stop=safe_float(res.get("stop")),
+        tps={"TP1": res.get("tp1"), "TP2": res.get("tp2"), "TP3": res.get("tp3")},
+        meta={"score": (res.get("signal_score_result") or {}).get("score"),
+              "rsi": res.get("rsi"),
+              "funding": res.get("institutional_funding_pct_8h"),
+              "oi": res.get("institutional_oi_change_pct")},
+    )
     if ok:
         async with memory_lock:
             mark_ma_sent(res)
@@ -4289,7 +4655,12 @@ async def maybe_send_signal(res: Dict[str, Any]) -> None:
             logger.info("COOLDOWN RED %s skor=%s", symbol, res.get("score"))
             return
 
-        ok = await safe_send_telegram(build_signal_message(res))
+        ok = await send_rich_signal(
+            build_signal_message(res), symbol, res.get("direction") or res.get("trend") or "",
+            entry=safe_float(res.get("price")), stop=safe_float(res.get("stop")),
+            tps={"TP1": res.get("tp1"), "TP2": res.get("tp2"), "TP3": res.get("tp3")},
+            meta={"score": res.get("score"), "rsi": res.get("rsi")},
+        )
         if ok:
             logger.info("TELEGRAM GÖNDERİLDİ %s", symbol)
             stats["signal_sent"] += 1
@@ -4501,6 +4872,8 @@ async def heartbeat_loop() -> None:
         await asyncio.sleep(max(60, HEARTBEAT_INTERVAL_SEC))
 
 async def diagnostic_loop() -> None:
+    if not AUTO_DIAGNOSTIC:
+        return
     while True:
         try:
             last_sig = safe_float(memory.get("last_signal_ts", 0))
@@ -4661,8 +5034,65 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ok = await safe_send_telegram(f"✅ Test mesajı başarılı. Saat: {tr_str()}")
     await update.message.reply_text("Test mesajı gönderildi." if ok else "Test mesajı gönderilemedi.")
 
+def build_status_report() -> str:
+    """Kisa sonuc raporu: kac sinyal, kac TP1/TP2/TP3, kac STOP."""
+    lines = [f"\U0001F4CA BALİNA AVCISI DURUM — BUILD {BOT_BUILD}",
+             f"Saat: {tr_str()}",
+             f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT} | API fail: {int(stats.get('api_fail', 0))} | Bloklu: {get_blocked_symbol_count()}"]
+
+    # --- V10 SMC kalici defter ---
+    try:
+        mp = _v10_mem()
+        vopen = mp.get("open", []) or []
+        vclosed = mp.get("closed", []) or []
+        n = len(vclosed)
+        lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
+                  f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}"]
+        if n:
+            stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
+            be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
+            tp3_n = sum(1 for r in vclosed if r.get("outcome") == "TP3")
+            tp1_n = sum(1 for r in vclosed if r.get("hit1", r.get("outcome") in ("TP3", "BE")))
+            tp2_n = sum(1 for r in vclosed if r.get("hit2", r.get("outcome") == "TP3"))
+            tot_r = sum(safe_float(r.get("R")) for r in vclosed)
+            win = sum(1 for r in vclosed if safe_float(r.get("R")) > 0)
+            lines += [f"TP1'e ulaşan: {tp1_n} | TP2'ye: {tp2_n} | TP3'e: {tp3_n}",
+                      f"STOP: {stop_n} | BE (TP1 sonrası girişe dönüş): {be_n}",
+                      f"Toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}"]
+        else:
+            lines.append("Kapanan işlem yok — TP/STOP sayıları kapanışla dolar.")
+    except Exception as e:
+        lines.append(f"V10 defteri okunamadı: {e}")
+
+    # --- Hibrit/MA paper defteri ---
+    try:
+        trades = memory.get("paper_trades", []) or []
+        closed = [t for t in trades if t.get("status") == "CLOSED"]
+        open_n = sum(1 for t in trades if t.get("status") == "OPEN")
+        n = len(closed)
+        lines += ["", "\u2501\u2501 HİBRİT / MA PAPER \u2501\u2501",
+                  f"Sinyal (toplam kayıt): {len(trades)} | Açık: {open_n} | Kapanan: {n}"]
+        if n:
+            cnt = lambda k: sum(1 for t in closed if str(t.get("result")) == k)
+            tp1, tp2, tp3 = cnt("TP1"), cnt("TP2"), cnt("TP3")
+            stop_n, tmo = cnt("STOP"), cnt("TIMEOUT")
+            tot_r = sum(safe_float(t.get("r")) for t in closed)
+            win = sum(1 for t in closed if safe_float(t.get("r")) > 0)
+            lines += [f"Çıkış dağılımı: TP1={tp1} TP2={tp2} TP3={tp3} STOP={stop_n} TIMEOUT={tmo}",
+                      f"TP1 seviyesini gören: {tp1 + tp2 + tp3} | TP2'yi gören: {tp2 + tp3} | TP3'ü gören: {tp3}",
+                      f"Toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}"]
+        else:
+            lines.append("Kapanan işlem yok.")
+    except Exception as e:
+        lines.append(f"Paper defteri okunamadı: {e}")
+
+    lines += ["", f"Son sinyal: {stats.get('last_signal', 'Yok')}",
+              "Detay: /paper (tam defter) | /v10 (motor)"]
+    return "\n".join(lines)
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(build_heartbeat_message())
+    await update.message.reply_text(build_status_report())
 
 async def cmd_hot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hot = memory.get("hot", {})
@@ -5516,7 +5946,8 @@ def v10_check_paper(pos, price):
 def v10_record_closed(pos, R, outcome):
     mp = _v10_mem()
     mp["closed"].append({"symbol":pos["symbol"],"side":pos["side"],"R":round(R,3),
-        "outcome":outcome,"score":pos["score"],"event":pos["event"],
+        "outcome":outcome,
+        "hit1":bool(pos.get("hit1")),"hit2":bool(pos.get("hit2")),"hit3":bool(pos.get("hit3")),"score":pos["score"],"event":pos["event"],
         "bucket":pos["bucket"],"close_ts":time.time()})
     b = mp["buckets"].setdefault(pos["bucket"], {"n":0,"R":0.0,"win":0})
     b["n"] += 1; b["R"] = round(b["R"]+R, 3)
@@ -5560,7 +5991,13 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
-    ok = await safe_send_telegram(build_v10_message(sig))
+    ok = await send_rich_signal(
+        build_v10_message(sig), symbol, side,
+        entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
+        tps={"TP1": sig.get("tp1"), "TP2": sig.get("tp2"), "TP3": sig.get("tp3")},
+        meta={"score": sig.get("score"), "rsi": sig.get("rsi"),
+              "funding": sig.get("funding"), "oi": sig.get("oi_change_pct")},
+    )
     if ok:
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[ckey] = sig["candle_ts"]
