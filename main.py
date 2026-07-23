@@ -5073,7 +5073,9 @@ def build_status_report() -> str:
         vclosed = mp.get("closed", []) or []
         n = len(vclosed)
         lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
-                  f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}"]
+                  f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
+                  f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5850,10 +5852,12 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
     if len(k1h) < 40:
+        stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
         return None
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
     gate = v10_structure_gate(symbol, k1h, k4h)
     if not gate:
+        stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
     side = gate["side"]; k = gate["k"]
     oi = await fetch_okx_oi_change(symbol, V10_OI_LOOKBACK_PER)
@@ -5865,9 +5869,13 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
            "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
+    if score > safe_float(stats.get("v10_best_score", 0)):
+        stats["v10_best_score"] = round(score, 1)
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
+        stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
         return None
     if score < V10_MIN_QUALITY:
+        stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
         return None
     entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a)
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
