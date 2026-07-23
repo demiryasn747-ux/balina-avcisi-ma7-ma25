@@ -753,6 +753,13 @@ try:
 except Exception:
     _MPL_OK = False
 
+if not _MPL_OK:
+    try:
+        logger.warning("GRAFİK MOTORU DEVRE DIŞI: matplotlib import edilemedi — "
+                       "requirements.txt'e 'matplotlib' ekleyin, yoksa sinyaller düz metin gider")
+    except Exception:
+        pass
+
 SIGNAL_CHART_ENABLED = os.getenv("SIGNAL_CHART_ENABLED", "true").lower() == "true"
 SIGNAL_CHART_TF = os.getenv("SIGNAL_CHART_TF", "1H").strip()
 SIGNAL_CHART_CANDLES = int(float(os.getenv("SIGNAL_CHART_CANDLES", "72")))
@@ -5065,6 +5072,12 @@ def build_status_report() -> str:
     if pd_:
         lines.append(f"Havuz süzgeci: ticker={pd_.get('ticker', 0)} | hacim<{MIN_24H_QUOTE_VOLUME/1e6:.0f}M eledi={pd_.get('hacim_alt', 0)} | "
                      f"hacim>{MAX_24H_QUOTE_VOLUME/1e6:.0f}M eledi={pd_.get('hacim_ust', 0)} | meme/fiyat eledi={pd_.get('meme_fiyat', 0)} | seçilen={pd_.get('secilen', 0)}")
+    if not _MPL_OK:
+        lines.append("Grafik motoru: KAPALI ⛔ matplotlib kurulu değil — requirements.txt'e 'matplotlib' ekle")
+    elif not SIGNAL_CHART_ENABLED:
+        lines.append("Grafik motoru: KAPALI (SIGNAL_CHART_ENABLED=false)")
+    else:
+        lines.append(f"Grafik motoru: AÇIK ✅ | gönderilen grafik: {int(stats.get('chart_sent', 0))} | haber isabeti: {int(stats.get('news_hit', 0))}")
 
     # --- V10 SMC kalici defter ---
     try:
