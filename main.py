@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.5 FİB (SMC + Fibonacci + Grafik Sinyal + Haber Radarı)"
+VERSION_NAME = "Balina Avcısı V10.7 (SMC + Fibonacci + Tekrar Koruması + Grafik + Haber)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.7")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -32,8 +32,8 @@ BINANCE_CONFIRM_FAIL_OPEN_SCORE = float(os.getenv("BINANCE_CONFIRM_FAIL_OPEN_SCO
 MAX_BINANCE_OKX_PRICE_GAP_PCT = float(os.getenv("MAX_BINANCE_OKX_PRICE_GAP_PCT", "0.40"))
 HARD_BINANCE_OKX_PRICE_GAP_PCT = float(os.getenv("HARD_BINANCE_OKX_PRICE_GAP_PCT", "0.90"))
 
-MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_avcisi_v527_hibrit_onayli_memory.json").strip()
-LOG_FILE = os.getenv("LOG_FILE", "balina_avcisi_v527_hibrit_onayli.log").strip()
+MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_memory.json").strip()
+LOG_FILE = os.getenv("LOG_FILE", "balina_avcisi.log").strip()
 LOG_MAX_MB = float(os.getenv("LOG_MAX_MB", "10"))      # log dosyası bu boyuta ulaşınca döner
 LOG_BACKUPS = int(float(os.getenv("LOG_BACKUPS", "3")))  # kaç eski log dosyası saklansın
 MA_RECORD_TTL_DAYS = float(os.getenv("MA_RECORD_TTL_DAYS", "3"))  # ma_signals/ma_follows kayıt ömrü (leak önleme)
@@ -893,7 +893,7 @@ def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any
             _hline(val, tp_cols[min(idx, 2)], "-.", name)
 
 
-        # --- FİBONACCİ KATMANI (bantlar + golden + uzatma hedefleri) ---
+        # --- FİBONACCİ KATMANI (TV stili: dolgun bantlar + golden kutu + uzatmalar) ---
         if SIGNAL_CHART_FIB and d in ("LONG", "SHORT"):
             try:
                 fL = fH = fi0 = fi1 = None
@@ -913,24 +913,45 @@ def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any
                     def _fp(k_):
                         return (fH - k_ * rngf) if d == "LONG" else (fL + k_ * rngf)
 
-                    levels = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
-                    band_cols = ["#ef4444", "#f59e0b", "#22c55e", "#eab308", "#3b82f6", "#94a3b8"]
-                    for bi in range(6):
-                        ya, yb = _fp(levels[bi]), _fp(levels[bi + 1])
-                        alp = 0.16 if levels[bi] == 0.5 else 0.05
-                        ax.axhspan(min(ya, yb), max(ya, yb), color=band_cols[bi], alpha=alp, zorder=1)
-                    for lv in [0.236, 0.382, 0.5, 0.618, 0.786, 1.272, 1.414, 1.618]:
+                    x0 = max(0.0, fi0 - 0.5)
+                    bw = x_right - x0
+                    retr = [(0.0, 0.236, "#ef4444"), (0.236, 0.382, "#f97316"),
+                            (0.382, 0.5, "#22c55e"), (0.5, 0.618, "#eab308"),
+                            (0.618, 0.786, "#06b6d4"), (0.786, 1.0, "#64748b")]
+                    for a_, b_, col in retr:
+                        ya, yb = _fp(a_), _fp(b_)
+                        alp = 0.30 if a_ == 0.5 else 0.14
+                        ax.add_patch(_Rect((x0, min(ya, yb)), bw, abs(yb - ya),
+                                           facecolor=col, edgecolor="none", alpha=alp, zorder=1))
+                    g1, g2 = _fp(0.5), _fp(0.618)
+                    ax.add_patch(_Rect((x0, min(g1, g2)), bw, abs(g2 - g1), facecolor="none",
+                                       edgecolor="#eab308", linewidth=1.3, alpha=0.9, zorder=6))
+                    ax.text(x_right - 0.6, (g1 + g2) / 2, "GOLDEN 0.5-0.618 ", color="#eab308",
+                            fontsize=8, va="center", ha="right", fontweight="bold", zorder=7)
+                    for a_, b_, col in [(1.0, 1.272, "#a78bfa"), (1.272, 1.414, "#f43f5e"),
+                                        (1.414, 1.618, "#38bdf8")]:
+                        ya, yb = _fp(a_), _fp(b_)
+                        ax.add_patch(_Rect((x0, min(ya, yb)), bw, abs(yb - ya),
+                                           facecolor=col, edgecolor="none", alpha=0.08, zorder=1))
+                    lvl_cols = {0.236: "#ef4444", 0.382: "#f97316", 0.5: "#22c55e",
+                                0.618: "#06b6d4", 0.786: "#3b82f6",
+                                1.272: "#a78bfa", 1.414: "#f43f5e", 1.618: "#38bdf8"}
+                    for lv, cl_ in lvl_cols.items():
                         yv = _fp(lv)
                         if yv <= 0:
                             continue
-                        cl_ = "#eab308" if lv in (0.5, 0.618) else ("#22d3ee" if lv > 1 else "#94a3b8")
-                        ax.axhline(yv, color=cl_, linestyle=(":" if lv <= 1 else "-."),
-                                   linewidth=0.9, alpha=0.7, zorder=2)
-                        ax.text(0.3, yv, f"{lv}", color=cl_, fontsize=6.8, va="bottom", ha="left")
-                    ax.text(0.3, (_fp(0.5) + _fp(0.618)) / 2, "GOLDEN", color="#eab308",
-                            fontsize=7.2, va="center", ha="left", fontweight="bold", alpha=0.95)
+                        ax.plot([x0, x_right], [yv, yv], color=cl_, linestyle="-",
+                                linewidth=1.2, alpha=0.85, zorder=2)
+                        ax.text(x0 + 0.6, yv, f"{lv}", color=cl_, fontsize=8, va="center",
+                                ha="left", fontweight="bold", zorder=7)
+                    for lv in (0.0, 1.0):
+                        yv = _fp(lv)
+                        ax.plot([x0, x_right], [yv, yv], color="#e5e7eb", linewidth=1.0,
+                                alpha=0.5, zorder=2)
+                        ax.text(x0 + 0.6, yv, f"{int(lv)}", color="#e5e7eb", fontsize=8,
+                                va="center", ha="left", fontweight="bold", alpha=0.8, zorder=7)
                     ax.plot([fi0, fi1], [fL, fH] if d == "LONG" else [fH, fL],
-                            color="#e5e7eb", linestyle="--", linewidth=0.8, alpha=0.45, zorder=2)
+                            color="#e5e7eb", linestyle="--", linewidth=1.0, alpha=0.55, zorder=2)
                     exts = [v for v in (_fp(1.272), _fp(1.618)) if v > 0]
                     if exts:
                         ylo_, yhi_ = ax.get_ylim()
@@ -2192,7 +2213,7 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
 
     liq_safe_v5, liq_gap_v5 = check_stop_vs_liquidation(entry, stop, "SHORT")
     if not liq_safe_v5 and LEVERAGE > 1:
-        logger.warning("V5 sinyal RED (likidasyon riski): %s | kaldıraç=%sx | gap=%.2f%%", symbol, LEVERAGE, liq_gap_v5)
+        logger.warning("Sinyal RED (likidasyon riski): %s | kaldıraç=%sx | gap=%.2f%%", symbol, LEVERAGE, liq_gap_v5)
         return None
 
     if rr < 0.72 and stage == "SIGNAL":
@@ -5134,8 +5155,9 @@ def build_status_report() -> str:
         n = len(vclosed)
         lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
+                  f"Açıklarda: TP1 vurdu {sum(1 for p_ in vopen if p_.get('hit1'))} | TP2 {sum(1 for p_ in vopen if p_.get('hit2'))} | TP3 {sum(1 for p_ in vopen if p_.get('hit3'))} | kilitli {sum(safe_float(p_.get('realized')) for p_ in vopen):+.2f}R (TP1 vuran risksiz)",
                   f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
-                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}"]
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))} | tekrar={int(stats.get('v10_red_tekrar', 0))} | ceza={int(stats.get('v10_red_ceza', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5144,7 +5166,7 @@ def build_status_report() -> str:
             tp2_n = sum(1 for r in vclosed if r.get("hit2", r.get("outcome") == "TP3"))
             tot_r = sum(safe_float(r.get("R")) for r in vclosed)
             win = sum(1 for r in vclosed if safe_float(r.get("R")) > 0)
-            lines += [f"TP1'e ulaşan: {tp1_n} | TP2'ye: {tp2_n} | TP3'e: {tp3_n}",
+            lines += [f"Kapananlarda TP1 gören: {tp1_n} | TP2: {tp2_n} | TP3: {tp3_n}",
                       f"STOP: {stop_n} | BE (TP1 sonrası girişe dönüş): {be_n}",
                       f"Toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}"]
         else:
@@ -5480,7 +5502,7 @@ async def post_init(application) -> None:
             f"💰 Funding eşik: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}%, LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
             f"💰 Funding bonus: SHORT +{FUNDING_SHORT_BONUS:.0f}, LONG +{FUNDING_LONG_BONUS:.0f}\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API\n"
+            f"Kurumsal motor: OI + Funding, LONG mirror, retry'lı OKX API\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
@@ -5624,6 +5646,9 @@ V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
 V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
+V10_BLOCK_IF_OPEN    = os.getenv("V10_BLOCK_IF_OPEN", "true").lower() == "true"
+V10_STOP_COOLDOWN_H  = float(os.getenv("V10_STOP_COOLDOWN_H", "12"))
+V10_REENTRY_COOLDOWN_H = float(os.getenv("V10_REENTRY_COOLDOWN_H", "3"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
 
@@ -6162,6 +6187,21 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
+    # V10.7 TEKRAR KORUMASI — aynı coinde açık pozisyon varken yeni giriş yok
+    mp0 = _v10_mem()
+    if V10_BLOCK_IF_OPEN and any(p_.get("symbol") == symbol for p_ in mp0.get("open", [])):
+        stats["v10_red_tekrar"] = int(stats.get("v10_red_tekrar", 0)) + 1
+        return
+    # V10.7 CEZA KUTUSU — aynı yönde STOP yediyse 12s, diğer tüm tekrarlar 3s bekler
+    now_ = time.time()
+    for r_ in reversed(mp0.get("closed", [])):
+        if r_.get("symbol") == symbol:
+            age_h = (now_ - safe_float(r_.get("close_ts"))) / 3600.0
+            lim_ = V10_STOP_COOLDOWN_H if (r_.get("side") == side and r_.get("outcome") == "STOP") else V10_REENTRY_COOLDOWN_H
+            if age_h < lim_:
+                stats["v10_red_ceza"] = int(stats.get("v10_red_ceza", 0)) + 1
+                return
+            break
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
