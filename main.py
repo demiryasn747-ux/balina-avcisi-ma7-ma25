@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.4 GÖRSEL (SMC + HİBRİT + Grafik Sinyal + Haber Radarı)"
+VERSION_NAME = "Balina Avcısı V10.5 FİB (SMC + Fibonacci + Grafik Sinyal + Haber Radarı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.5")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -763,6 +763,7 @@ if not _MPL_OK:
 SIGNAL_CHART_ENABLED = os.getenv("SIGNAL_CHART_ENABLED", "true").lower() == "true"
 SIGNAL_CHART_TF = os.getenv("SIGNAL_CHART_TF", "1H").strip()
 SIGNAL_CHART_CANDLES = int(float(os.getenv("SIGNAL_CHART_CANDLES", "72")))
+SIGNAL_CHART_FIB = os.getenv("SIGNAL_CHART_FIB", "true").lower() == "true"
 SIGNAL_NEWS_ENABLED = os.getenv("SIGNAL_NEWS_ENABLED", "true").lower() == "true"
 SIGNAL_NEWS_MAX = int(float(os.getenv("SIGNAL_NEWS_MAX", "2")))
 SIGNAL_NEWS_CACHE_SEC = int(float(os.getenv("SIGNAL_NEWS_CACHE_SEC", "900")))
@@ -890,6 +891,52 @@ def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any
         tp_cols = ["#10b981", "#34d399", "#6ee7b7"]
         for idx, (name, val) in enumerate(sorted(tp_items, key=lambda kv: abs(kv[1] - entry))):
             _hline(val, tp_cols[min(idx, 2)], "-.", name)
+
+
+        # --- FİBONACCİ KATMANI (bantlar + golden + uzatma hedefleri) ---
+        if SIGNAL_CHART_FIB and d in ("LONG", "SHORT"):
+            try:
+                fL = fH = fi0 = fi1 = None
+                if d == "LONG":
+                    fi0 = min(range(n), key=lambda i: lo[i])
+                    if fi0 < n - 3:
+                        fi1 = fi0 + max(range(n - fi0), key=lambda j: hi[fi0 + j])
+                        fL, fH = lo[fi0], hi[fi1]
+                else:
+                    fi0 = max(range(n), key=lambda i: hi[i])
+                    if fi0 < n - 3:
+                        fi1 = fi0 + min(range(n - fi0), key=lambda j: lo[fi0 + j])
+                        fH, fL = hi[fi0], lo[fi1]
+                if fL is not None and fH is not None and fH > fL:
+                    rngf = fH - fL
+
+                    def _fp(k_):
+                        return (fH - k_ * rngf) if d == "LONG" else (fL + k_ * rngf)
+
+                    levels = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+                    band_cols = ["#ef4444", "#f59e0b", "#22c55e", "#eab308", "#3b82f6", "#94a3b8"]
+                    for bi in range(6):
+                        ya, yb = _fp(levels[bi]), _fp(levels[bi + 1])
+                        alp = 0.16 if levels[bi] == 0.5 else 0.05
+                        ax.axhspan(min(ya, yb), max(ya, yb), color=band_cols[bi], alpha=alp, zorder=1)
+                    for lv in [0.236, 0.382, 0.5, 0.618, 0.786, 1.272, 1.414, 1.618]:
+                        yv = _fp(lv)
+                        if yv <= 0:
+                            continue
+                        cl_ = "#eab308" if lv in (0.5, 0.618) else ("#22d3ee" if lv > 1 else "#94a3b8")
+                        ax.axhline(yv, color=cl_, linestyle=(":" if lv <= 1 else "-."),
+                                   linewidth=0.9, alpha=0.7, zorder=2)
+                        ax.text(0.3, yv, f"{lv}", color=cl_, fontsize=6.8, va="bottom", ha="left")
+                    ax.text(0.3, (_fp(0.5) + _fp(0.618)) / 2, "GOLDEN", color="#eab308",
+                            fontsize=7.2, va="center", ha="left", fontweight="bold", alpha=0.95)
+                    ax.plot([fi0, fi1], [fL, fH] if d == "LONG" else [fH, fL],
+                            color="#e5e7eb", linestyle="--", linewidth=0.8, alpha=0.45, zorder=2)
+                    exts = [v for v in (_fp(1.272), _fp(1.618)) if v > 0]
+                    if exts:
+                        ylo_, yhi_ = ax.get_ylim()
+                        ax.set_ylim(min([ylo_] + exts), max([yhi_] + exts))
+            except Exception:
+                pass
 
         # Zaman ekseni
         try:
@@ -5088,7 +5135,7 @@ def build_status_report() -> str:
         lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
                   f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
-                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))}"]
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5577,6 +5624,60 @@ V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
 V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
+V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
+V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
+
+
+def fib_leg_and_depth(side, lo_v, hi_v, cl_v):
+    """İmpuls bacağını bulur, mevcut geri çekilme derinliğini ölçer.
+    LONG: pencere dibi -> sonrasındaki tepe. SHORT: tepe -> sonrasındaki dip.
+    depth: 0 = bacağın ucu (hiç çekilme yok), 1 = bacak tamamen geri alınmış."""
+    try:
+        n = len(lo_v)
+        if n < 20:
+            return None
+        if side == "LONG":
+            i0 = min(range(n), key=lambda i: lo_v[i])
+            if i0 >= n - 3:
+                return None
+            i1 = i0 + max(range(n - i0), key=lambda j: hi_v[i0 + j])
+            L, H = lo_v[i0], hi_v[i1]
+            rng = H - L
+            if rng <= 0 or rng / max(L, 1e-12) < 0.005:
+                return None
+            depth = (H - cl_v[-1]) / rng
+            e1272, e1414, e1618 = L + 1.272 * rng, L + 1.414 * rng, L + 1.618 * rng
+        else:
+            i0 = max(range(n), key=lambda i: hi_v[i])
+            if i0 >= n - 3:
+                return None
+            i1 = i0 + min(range(n - i0), key=lambda j: lo_v[i0 + j])
+            H, L = hi_v[i0], lo_v[i1]
+            rng = H - L
+            if rng <= 0 or rng / max(L, 1e-12) < 0.005:
+                return None
+            depth = (cl_v[-1] - L) / rng
+            e1272, e1414, e1618 = H - 1.272 * rng, H - 1.414 * rng, H - 1.618 * rng
+        depth = max(-0.5, min(1.5, depth))
+        if depth < 0.236:
+            zone, bonus = "SIĞ <0.236", -6.0
+        elif depth < 0.382:
+            zone, bonus = "0.236-0.382", 2.0
+        elif depth < 0.5:
+            zone, bonus = "0.382-0.5", 6.0
+        elif depth <= 0.618:
+            zone, bonus = "GOLDEN 0.5-0.618", 10.0
+        elif depth <= 0.786:
+            zone, bonus = "DERİN 0.618-0.786", 4.0
+        else:
+            zone, bonus = "ÇOK DERİN >0.786", -4.0
+        return {"H": H, "L": L, "rng": rng, "depth": round(depth, 3), "zone": zone,
+                "bonus": bonus, "i0": i0, "i1": i1,
+                "ext_1272": e1272, "ext_1414": e1414, "ext_1618": e1618}
+    except Exception:
+        return None
+
+
 V10_USE_4H_FILTER    = os.getenv("V10_USE_4H_FILTER", "true").lower() == "true"
 V10_TP1_RR           = float(os.getenv("V10_TP1_RR", "1.0"))
 V10_TP2_RR           = float(os.getenv("V10_TP2_RR", "2.5"))
@@ -5804,7 +5905,7 @@ def v10_quality_score(side, k, ms, ext):
     return round(sum(p.values()), 1), {kk: round(vv, 1) for kk, vv in p.items()}, round(r, 1)
 
 
-def v10_targets(side, entry, a):
+def v10_targets(side, entry, a, fib=None):
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
@@ -5812,7 +5913,17 @@ def v10_targets(side, entry, a):
         tp1, tp2, tp3 = entry+risk*V10_TP1_RR, entry+risk*V10_TP2_RR, entry+risk*V10_TP3_RR
     else:
         tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
-    return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,"tp1":tp1,"tp2":tp2,"tp3":tp3}
+    tp_kaynak = "ATR"
+    if fib:
+        def _rr(px):
+            return (px - entry) / risk if side == "LONG" else (entry - px) / risk
+        f2, f3 = fib.get("ext_1272"), fib.get("ext_1618")
+        if f2 and f3 and f2 > 0 and f3 > 0 and _rr(f2) >= 1.5 and _rr(f3) > _rr(f2):
+            tp2, tp3 = f2, f3
+            tp_kaynak = "FİB"
+    return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
+            "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
+            "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1)}
 
 
 async def v10_fetch_orderbook(symbol):
@@ -5882,6 +5993,13 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
            "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
+    fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k)) if V10_FIB_ENABLED else None
+    if fib:
+        score = round(score + fib["bonus"], 1)
+        parts["fib"] = fib["bonus"]
+    if V10_FIB_ENABLED and V10_FIB_MIN_DEPTH > 0 and (not fib or fib["depth"] < V10_FIB_MIN_DEPTH):
+        stats["v10_red_fib"] = int(stats.get("v10_red_fib", 0)) + 1
+        return None
     if score > safe_float(stats.get("v10_best_score", 0)):
         stats["v10_best_score"] = round(score, 1)
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
@@ -5890,7 +6008,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if score < V10_MIN_QUALITY:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
         return None
-    entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a)
+    entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
@@ -5898,7 +6016,9 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "score":score,"score_parts":parts,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
-            "btc_4h":btc,"btc_1h":btc_1h,**tgt}
+            "btc_4h":btc,"btc_1h":btc_1h,
+            "fib_depth":(fib or {}).get("depth"),"fib_zone":(fib or {}).get("zone"),
+            "fib_bonus":(fib or {}).get("bonus",0),**tgt}
 
 
 def _v10_fmt(x):
@@ -5915,12 +6035,16 @@ def build_v10_message(sig):
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
                      tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
     fund = safe_float(sig.get("funding"))
+    fib_line = ""
+    if sig.get("fib_zone"):
+        fib_line = (f"Fib: derinlik %{round(safe_float(sig.get('fib_depth'))*100)} → "
+                f"{sig['fib_zone']} ({safe_float(sig.get('fib_bonus')):+.0f} puan)\n")
     return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
-            f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n"
+            f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
-            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({V10_TP2_RR}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({V10_TP3_RR}R %20)\n"
+            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
