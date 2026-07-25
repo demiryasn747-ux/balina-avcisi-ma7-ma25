@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.7 (SMC + Fibonacci + Tekrar Koruması + Grafik + Haber)"
+VERSION_NAME = "Balina Avcısı V10.8 (SMC + Fibonacci + Defter Disiplini + Grafik + Haber)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.7")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.8")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5157,7 +5157,7 @@ def build_status_report() -> str:
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
                   f"Açıklarda: TP1 vurdu {sum(1 for p_ in vopen if p_.get('hit1'))} | TP2 {sum(1 for p_ in vopen if p_.get('hit2'))} | TP3 {sum(1 for p_ in vopen if p_.get('hit3'))} | kilitli {sum(safe_float(p_.get('realized')) for p_ in vopen):+.2f}R (TP1 vuran risksiz)",
                   f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
-                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))} | tekrar={int(stats.get('v10_red_tekrar', 0))} | ceza={int(stats.get('v10_red_ceza', 0))}"]
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))} | tekrar={int(stats.get('v10_red_tekrar', 0))} | ceza={int(stats.get('v10_red_ceza', 0))} | dolu={int(stats.get('v10_red_dolu', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5643,7 +5643,7 @@ V10_ATR_PERIOD       = int(float(os.getenv("V10_ATR_PERIOD", "14")))
 V10_ATR_MULT         = float(os.getenv("V10_ATR_MULT", "1.5"))
 V10_STOP_MIN_PCT     = float(os.getenv("V10_STOP_MIN_PCT", "0.004"))
 V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
-V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
+V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "70"))  # V10.8: 65-69 bandı defterde -0.65R/işlem kanıtıyla kesildi
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
 V10_BLOCK_IF_OPEN    = os.getenv("V10_BLOCK_IF_OPEN", "true").lower() == "true"
@@ -6187,8 +6187,12 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
-    # V10.7 TEKRAR KORUMASI — aynı coinde açık pozisyon varken yeni giriş yok
+    # V10.8 DEFTER DİSİPLİNİ — defter doluysa sinyal yok (takip edilemeyen sinyal atılmaz)
     mp0 = _v10_mem()
+    if len(mp0.get("open", [])) >= V10_MAX_OPEN:
+        stats["v10_red_dolu"] = int(stats.get("v10_red_dolu", 0)) + 1
+        return
+    # V10.7 TEKRAR KORUMASI — aynı coinde açık pozisyon varken yeni giriş yok
     if V10_BLOCK_IF_OPEN and any(p_.get("symbol") == symbol for p_ in mp0.get("open", [])):
         stats["v10_red_tekrar"] = int(stats.get("v10_red_tekrar", 0)) + 1
         return
@@ -6212,9 +6216,7 @@ async def maybe_send_v10_signal(sig):
     if ok:
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[ckey] = sig["candle_ts"]
-        mp = _v10_mem()
-        if len(mp["open"]) < V10_MAX_OPEN:
-            v10_open_paper(sig)
+        v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
         stats["last_signal"] = f"V10 {side} {symbol} skor {sig['score']}"
         logger.info("V10 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
