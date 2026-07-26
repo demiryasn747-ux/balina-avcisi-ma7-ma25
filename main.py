@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.8 (SMC + Fibonacci + Defter Disiplini + Grafik + Haber)"
+VERSION_NAME = "Balina Avcısı V10.9 (SMC + %Sabit Hedef + Fibonacci + Grafik + Haber)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.8")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.9")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5649,6 +5649,11 @@ V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
 V10_BLOCK_IF_OPEN    = os.getenv("V10_BLOCK_IF_OPEN", "true").lower() == "true"
 V10_STOP_COOLDOWN_H  = float(os.getenv("V10_STOP_COOLDOWN_H", "12"))
 V10_REENTRY_COOLDOWN_H = float(os.getenv("V10_REENTRY_COOLDOWN_H", "3"))
+V10_TARGET_MODE      = os.getenv("V10_TARGET_MODE", "yuzde").strip().lower()  # yuzde | fib | atr
+V10_STOP_PCT         = float(os.getenv("V10_STOP_PCT", "2"))
+V10_TP1_PCT          = float(os.getenv("V10_TP1_PCT", "4"))
+V10_TP2_PCT          = float(os.getenv("V10_TP2_PCT", "7"))
+V10_TP3_PCT          = float(os.getenv("V10_TP3_PCT", "9"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
 
@@ -5931,6 +5936,17 @@ def v10_quality_score(side, k, ms, ext):
 
 
 def v10_targets(side, entry, a, fib=None):
+    if V10_TARGET_MODE == "yuzde":
+        m = 1.0 if side == "LONG" else -1.0
+        stop = entry * (1 - m * V10_STOP_PCT / 100.0)
+        risk = abs(entry - stop)
+        tp1 = entry * (1 + m * V10_TP1_PCT / 100.0)
+        tp2 = entry * (1 + m * V10_TP2_PCT / 100.0)
+        tp3 = entry * (1 + m * V10_TP3_PCT / 100.0)
+        return {"stop": stop, "stop_pct": round(V10_STOP_PCT, 3), "risk": risk,
+                "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp_kaynak": "%SABİT",
+                "tp1_rr": round(abs(tp1-entry)/risk, 1),
+                "tp2_rr": round(abs(tp2-entry)/risk, 1), "tp3_rr": round(abs(tp3-entry)/risk, 1)}
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
@@ -5939,7 +5955,7 @@ def v10_targets(side, entry, a, fib=None):
     else:
         tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
     tp_kaynak = "ATR"
-    if fib:
+    if fib and V10_TARGET_MODE != "atr":
         def _rr(px):
             return (px - entry) / risk if side == "LONG" else (entry - px) / risk
         f2, f3 = fib.get("ext_1272"), fib.get("ext_1618")
@@ -5948,6 +5964,7 @@ def v10_targets(side, entry, a, fib=None):
             tp_kaynak = "FİB"
     return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
             "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
+            "tp1_rr":round(V10_TP1_RR,1),
             "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1)}
 
 
@@ -6069,7 +6086,7 @@ def build_v10_message(sig):
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
-            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
+            f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr', V10_TP1_RR)}R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
@@ -6109,7 +6126,7 @@ def v10_open_paper(sig):
         "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
         "orig_stop":sig["stop"],"stop":sig["stop"],
         "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
-        "tp1_rr":V10_TP1_RR,"tp2_rr":V10_TP2_RR,"tp3_rr":V10_TP3_RR,
+        "tp1_rr":safe_float(sig.get("tp1_rr", V10_TP1_RR)),"tp2_rr":safe_float(sig.get("tp2_rr", V10_TP2_RR)),"tp3_rr":safe_float(sig.get("tp3_rr", V10_TP3_RR)),
         "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
         "score":sig["score"],"event":sig["event"],
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
