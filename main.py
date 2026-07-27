@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.9 (SMC + %Sabit Hedef + Fibonacci + Grafik + Haber)"
+VERSION_NAME = "Balina Avcısı V10.5 FİB (SMC + Fibonacci + Grafik Sinyal + Haber Radarı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.9")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.5")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -32,8 +32,8 @@ BINANCE_CONFIRM_FAIL_OPEN_SCORE = float(os.getenv("BINANCE_CONFIRM_FAIL_OPEN_SCO
 MAX_BINANCE_OKX_PRICE_GAP_PCT = float(os.getenv("MAX_BINANCE_OKX_PRICE_GAP_PCT", "0.40"))
 HARD_BINANCE_OKX_PRICE_GAP_PCT = float(os.getenv("HARD_BINANCE_OKX_PRICE_GAP_PCT", "0.90"))
 
-MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_memory.json").strip()
-LOG_FILE = os.getenv("LOG_FILE", "balina_avcisi.log").strip()
+MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_avcisi_v527_hibrit_onayli_memory.json").strip()
+LOG_FILE = os.getenv("LOG_FILE", "balina_avcisi_v527_hibrit_onayli.log").strip()
 LOG_MAX_MB = float(os.getenv("LOG_MAX_MB", "10"))      # log dosyası bu boyuta ulaşınca döner
 LOG_BACKUPS = int(float(os.getenv("LOG_BACKUPS", "3")))  # kaç eski log dosyası saklansın
 MA_RECORD_TTL_DAYS = float(os.getenv("MA_RECORD_TTL_DAYS", "3"))  # ma_signals/ma_follows kayıt ömrü (leak önleme)
@@ -893,7 +893,7 @@ def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any
             _hline(val, tp_cols[min(idx, 2)], "-.", name)
 
 
-        # --- FİBONACCİ KATMANI (TV stili: dolgun bantlar + golden kutu + uzatmalar) ---
+        # --- FİBONACCİ KATMANI (bantlar + golden + uzatma hedefleri) ---
         if SIGNAL_CHART_FIB and d in ("LONG", "SHORT"):
             try:
                 fL = fH = fi0 = fi1 = None
@@ -913,45 +913,24 @@ def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any
                     def _fp(k_):
                         return (fH - k_ * rngf) if d == "LONG" else (fL + k_ * rngf)
 
-                    x0 = max(0.0, fi0 - 0.5)
-                    bw = x_right - x0
-                    retr = [(0.0, 0.236, "#ef4444"), (0.236, 0.382, "#f97316"),
-                            (0.382, 0.5, "#22c55e"), (0.5, 0.618, "#eab308"),
-                            (0.618, 0.786, "#06b6d4"), (0.786, 1.0, "#64748b")]
-                    for a_, b_, col in retr:
-                        ya, yb = _fp(a_), _fp(b_)
-                        alp = 0.30 if a_ == 0.5 else 0.14
-                        ax.add_patch(_Rect((x0, min(ya, yb)), bw, abs(yb - ya),
-                                           facecolor=col, edgecolor="none", alpha=alp, zorder=1))
-                    g1, g2 = _fp(0.5), _fp(0.618)
-                    ax.add_patch(_Rect((x0, min(g1, g2)), bw, abs(g2 - g1), facecolor="none",
-                                       edgecolor="#eab308", linewidth=1.3, alpha=0.9, zorder=6))
-                    ax.text(x_right - 0.6, (g1 + g2) / 2, "GOLDEN 0.5-0.618 ", color="#eab308",
-                            fontsize=8, va="center", ha="right", fontweight="bold", zorder=7)
-                    for a_, b_, col in [(1.0, 1.272, "#a78bfa"), (1.272, 1.414, "#f43f5e"),
-                                        (1.414, 1.618, "#38bdf8")]:
-                        ya, yb = _fp(a_), _fp(b_)
-                        ax.add_patch(_Rect((x0, min(ya, yb)), bw, abs(yb - ya),
-                                           facecolor=col, edgecolor="none", alpha=0.08, zorder=1))
-                    lvl_cols = {0.236: "#ef4444", 0.382: "#f97316", 0.5: "#22c55e",
-                                0.618: "#06b6d4", 0.786: "#3b82f6",
-                                1.272: "#a78bfa", 1.414: "#f43f5e", 1.618: "#38bdf8"}
-                    for lv, cl_ in lvl_cols.items():
+                    levels = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+                    band_cols = ["#ef4444", "#f59e0b", "#22c55e", "#eab308", "#3b82f6", "#94a3b8"]
+                    for bi in range(6):
+                        ya, yb = _fp(levels[bi]), _fp(levels[bi + 1])
+                        alp = 0.16 if levels[bi] == 0.5 else 0.05
+                        ax.axhspan(min(ya, yb), max(ya, yb), color=band_cols[bi], alpha=alp, zorder=1)
+                    for lv in [0.236, 0.382, 0.5, 0.618, 0.786, 1.272, 1.414, 1.618]:
                         yv = _fp(lv)
                         if yv <= 0:
                             continue
-                        ax.plot([x0, x_right], [yv, yv], color=cl_, linestyle="-",
-                                linewidth=1.2, alpha=0.85, zorder=2)
-                        ax.text(x0 + 0.6, yv, f"{lv}", color=cl_, fontsize=8, va="center",
-                                ha="left", fontweight="bold", zorder=7)
-                    for lv in (0.0, 1.0):
-                        yv = _fp(lv)
-                        ax.plot([x0, x_right], [yv, yv], color="#e5e7eb", linewidth=1.0,
-                                alpha=0.5, zorder=2)
-                        ax.text(x0 + 0.6, yv, f"{int(lv)}", color="#e5e7eb", fontsize=8,
-                                va="center", ha="left", fontweight="bold", alpha=0.8, zorder=7)
+                        cl_ = "#eab308" if lv in (0.5, 0.618) else ("#22d3ee" if lv > 1 else "#94a3b8")
+                        ax.axhline(yv, color=cl_, linestyle=(":" if lv <= 1 else "-."),
+                                   linewidth=0.9, alpha=0.7, zorder=2)
+                        ax.text(0.3, yv, f"{lv}", color=cl_, fontsize=6.8, va="bottom", ha="left")
+                    ax.text(0.3, (_fp(0.5) + _fp(0.618)) / 2, "GOLDEN", color="#eab308",
+                            fontsize=7.2, va="center", ha="left", fontweight="bold", alpha=0.95)
                     ax.plot([fi0, fi1], [fL, fH] if d == "LONG" else [fH, fL],
-                            color="#e5e7eb", linestyle="--", linewidth=1.0, alpha=0.55, zorder=2)
+                            color="#e5e7eb", linestyle="--", linewidth=0.8, alpha=0.45, zorder=2)
                     exts = [v for v in (_fp(1.272), _fp(1.618)) if v > 0]
                     if exts:
                         ylo_, yhi_ = ax.get_ylim()
@@ -2213,7 +2192,7 @@ async def analyze_symbol(symbol: str, tickers24: Dict[str, Dict[str, Any]]) -> O
 
     liq_safe_v5, liq_gap_v5 = check_stop_vs_liquidation(entry, stop, "SHORT")
     if not liq_safe_v5 and LEVERAGE > 1:
-        logger.warning("Sinyal RED (likidasyon riski): %s | kaldıraç=%sx | gap=%.2f%%", symbol, LEVERAGE, liq_gap_v5)
+        logger.warning("V5 sinyal RED (likidasyon riski): %s | kaldıraç=%sx | gap=%.2f%%", symbol, LEVERAGE, liq_gap_v5)
         return None
 
     if rr < 0.72 and stage == "SIGNAL":
@@ -5155,9 +5134,8 @@ def build_status_report() -> str:
         n = len(vclosed)
         lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
-                  f"Açıklarda: TP1 vurdu {sum(1 for p_ in vopen if p_.get('hit1'))} | TP2 {sum(1 for p_ in vopen if p_.get('hit2'))} | TP3 {sum(1 for p_ in vopen if p_.get('hit3'))} | kilitli {sum(safe_float(p_.get('realized')) for p_ in vopen):+.2f}R (TP1 vuran risksiz)",
                   f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
-                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))} | tekrar={int(stats.get('v10_red_tekrar', 0))} | ceza={int(stats.get('v10_red_ceza', 0))} | dolu={int(stats.get('v10_red_dolu', 0))}"]
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5166,7 +5144,7 @@ def build_status_report() -> str:
             tp2_n = sum(1 for r in vclosed if r.get("hit2", r.get("outcome") == "TP3"))
             tot_r = sum(safe_float(r.get("R")) for r in vclosed)
             win = sum(1 for r in vclosed if safe_float(r.get("R")) > 0)
-            lines += [f"Kapananlarda TP1 gören: {tp1_n} | TP2: {tp2_n} | TP3: {tp3_n}",
+            lines += [f"TP1'e ulaşan: {tp1_n} | TP2'ye: {tp2_n} | TP3'e: {tp3_n}",
                       f"STOP: {stop_n} | BE (TP1 sonrası girişe dönüş): {be_n}",
                       f"Toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}"]
         else:
@@ -5502,7 +5480,7 @@ async def post_init(application) -> None:
             f"💰 Funding eşik: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}%, LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
             f"💰 Funding bonus: SHORT +{FUNDING_SHORT_BONUS:.0f}, LONG +{FUNDING_LONG_BONUS:.0f}\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"Kurumsal motor: OI + Funding, LONG mirror, retry'lı OKX API\n"
+            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API\n"
             f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
@@ -5643,17 +5621,9 @@ V10_ATR_PERIOD       = int(float(os.getenv("V10_ATR_PERIOD", "14")))
 V10_ATR_MULT         = float(os.getenv("V10_ATR_MULT", "1.5"))
 V10_STOP_MIN_PCT     = float(os.getenv("V10_STOP_MIN_PCT", "0.004"))
 V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
-V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "70"))  # V10.8: 65-69 bandı defterde -0.65R/işlem kanıtıyla kesildi
+V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
-V10_BLOCK_IF_OPEN    = os.getenv("V10_BLOCK_IF_OPEN", "true").lower() == "true"
-V10_STOP_COOLDOWN_H  = float(os.getenv("V10_STOP_COOLDOWN_H", "12"))
-V10_REENTRY_COOLDOWN_H = float(os.getenv("V10_REENTRY_COOLDOWN_H", "3"))
-V10_TARGET_MODE      = os.getenv("V10_TARGET_MODE", "yuzde").strip().lower()  # yuzde | fib | atr
-V10_STOP_PCT         = float(os.getenv("V10_STOP_PCT", "2"))
-V10_TP1_PCT          = float(os.getenv("V10_TP1_PCT", "4"))
-V10_TP2_PCT          = float(os.getenv("V10_TP2_PCT", "7"))
-V10_TP3_PCT          = float(os.getenv("V10_TP3_PCT", "9"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
 
@@ -5936,17 +5906,6 @@ def v10_quality_score(side, k, ms, ext):
 
 
 def v10_targets(side, entry, a, fib=None):
-    if V10_TARGET_MODE == "yuzde":
-        m = 1.0 if side == "LONG" else -1.0
-        stop = entry * (1 - m * V10_STOP_PCT / 100.0)
-        risk = abs(entry - stop)
-        tp1 = entry * (1 + m * V10_TP1_PCT / 100.0)
-        tp2 = entry * (1 + m * V10_TP2_PCT / 100.0)
-        tp3 = entry * (1 + m * V10_TP3_PCT / 100.0)
-        return {"stop": stop, "stop_pct": round(V10_STOP_PCT, 3), "risk": risk,
-                "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp_kaynak": "%SABİT",
-                "tp1_rr": round(abs(tp1-entry)/risk, 1),
-                "tp2_rr": round(abs(tp2-entry)/risk, 1), "tp3_rr": round(abs(tp3-entry)/risk, 1)}
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
@@ -5955,7 +5914,7 @@ def v10_targets(side, entry, a, fib=None):
     else:
         tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
     tp_kaynak = "ATR"
-    if fib and V10_TARGET_MODE != "atr":
+    if fib:
         def _rr(px):
             return (px - entry) / risk if side == "LONG" else (entry - px) / risk
         f2, f3 = fib.get("ext_1272"), fib.get("ext_1618")
@@ -5964,7 +5923,6 @@ def v10_targets(side, entry, a, fib=None):
             tp_kaynak = "FİB"
     return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
             "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
-            "tp1_rr":round(V10_TP1_RR,1),
             "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1)}
 
 
@@ -6086,7 +6044,7 @@ def build_v10_message(sig):
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
-            f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr', V10_TP1_RR)}R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
+            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
@@ -6126,7 +6084,7 @@ def v10_open_paper(sig):
         "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
         "orig_stop":sig["stop"],"stop":sig["stop"],
         "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
-        "tp1_rr":safe_float(sig.get("tp1_rr", V10_TP1_RR)),"tp2_rr":safe_float(sig.get("tp2_rr", V10_TP2_RR)),"tp3_rr":safe_float(sig.get("tp3_rr", V10_TP3_RR)),
+        "tp1_rr":V10_TP1_RR,"tp2_rr":V10_TP2_RR,"tp3_rr":V10_TP3_RR,
         "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
         "score":sig["score"],"event":sig["event"],
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
@@ -6204,25 +6162,6 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
-    # V10.8 DEFTER DİSİPLİNİ — defter doluysa sinyal yok (takip edilemeyen sinyal atılmaz)
-    mp0 = _v10_mem()
-    if len(mp0.get("open", [])) >= V10_MAX_OPEN:
-        stats["v10_red_dolu"] = int(stats.get("v10_red_dolu", 0)) + 1
-        return
-    # V10.7 TEKRAR KORUMASI — aynı coinde açık pozisyon varken yeni giriş yok
-    if V10_BLOCK_IF_OPEN and any(p_.get("symbol") == symbol for p_ in mp0.get("open", [])):
-        stats["v10_red_tekrar"] = int(stats.get("v10_red_tekrar", 0)) + 1
-        return
-    # V10.7 CEZA KUTUSU — aynı yönde STOP yediyse 12s, diğer tüm tekrarlar 3s bekler
-    now_ = time.time()
-    for r_ in reversed(mp0.get("closed", [])):
-        if r_.get("symbol") == symbol:
-            age_h = (now_ - safe_float(r_.get("close_ts"))) / 3600.0
-            lim_ = V10_STOP_COOLDOWN_H if (r_.get("side") == side and r_.get("outcome") == "STOP") else V10_REENTRY_COOLDOWN_H
-            if age_h < lim_:
-                stats["v10_red_ceza"] = int(stats.get("v10_red_ceza", 0)) + 1
-                return
-            break
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
@@ -6233,7 +6172,9 @@ async def maybe_send_v10_signal(sig):
     if ok:
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[ckey] = sig["candle_ts"]
-        v10_open_paper(sig)
+        mp = _v10_mem()
+        if len(mp["open"]) < V10_MAX_OPEN:
+            v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
         stats["last_signal"] = f"V10 {side} {symbol} skor {sig['score']}"
         logger.info("V10 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
