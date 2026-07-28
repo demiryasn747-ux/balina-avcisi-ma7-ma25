@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import copy
@@ -13,9 +14,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.5 FİB (SMC + Fibonacci + Grafik Sinyal + Haber Radarı)"
+VERSION_NAME = "Balina Avcısı V11.0 (SMC + Derin Araştırma + Sabit %TP + Haber Filtresi)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V11.0")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -770,7 +771,7 @@ SIGNAL_NEWS_CACHE_SEC = int(float(os.getenv("SIGNAL_NEWS_CACHE_SEC", "900")))
 SIGNAL_NEWS_TIMEOUT_SEC = float(os.getenv("SIGNAL_NEWS_TIMEOUT_SEC", "6"))
 SIGNAL_NEWS_MAX_AGE_H = float(os.getenv("SIGNAL_NEWS_MAX_AGE_H", "48"))
 
-_news_cache: Dict[str, Tuple[float, str]] = {}
+_news_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
 def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any]],
@@ -1044,60 +1045,181 @@ async def safe_send_telegram_photo(caption: str, png_bytes: bytes,
     return False
 
 
-def _fetch_coin_news_sync(base: str) -> str:
-    """Google News RSS'ten coin haber başlıkları. Hata -> boş string (sinyali bloklamaz)."""
+# --- V11 HABER DUYARLILIK SÖZLÜĞÜ ------------------------------------------
+# Ağırlıklar kabaca "haber ne kadar sert yön belirler" mantığında.
+_V11_BULL = {
+    # TR
+    "yükseliş":1.0,"yukselis":1.0,"ralli":1.5,"rekor":1.5,"zirve":1.2,"sıçradı":1.5,
+    "sicradi":1.5,"fırladı":1.5,"firladi":1.5,"arttı":0.8,"artti":0.8,"kazanç":0.8,
+    "kazanc":0.8,"boğa":1.2,"boga":1.2,"listelendi":2.0,"listeleme":1.8,"listeye":1.5,
+    "ortaklık":1.5,"ortaklik":1.5,"anlaşma":1.2,"anlasma":1.2,"iş birliği":1.2,
+    "yatırım aldı":2.0,"yatirim aldi":2.0,"fon topladı":1.8,"onaylandı":1.8,
+    "onaylandi":1.8,"onay":1.0,"etf":1.2,"satın aldı":1.5,"satin aldi":1.5,
+    "geri alım":1.5,"geri alim":1.5,"yakma":1.2,"yakıldı":1.2,"yakildi":1.2,
+    "yükseltme":1.0,"yukseltme":1.0,"güncelleme":0.6,"guncelleme":0.6,"entegrasyon":1.0,
+    "ana ağ":1.2,"mainnet":1.2,"airdrop":0.8,"stake":0.6,"talep":0.8,"giriş":0.6,
+    "toparlanma":1.0,"destek buldu":1.0,"hedef yükseltildi":1.5,
+    # EN
+    "surge":1.5,"surges":1.5,"soar":1.5,"soars":1.5,"rally":1.5,"rallies":1.5,
+    "jumps":1.2,"spikes":1.2,"breakout":1.2,"all-time high":1.8,"record high":1.8,
+    "partnership":1.5,"listing":1.8,"listed":1.5,"adoption":1.2,"approval":1.8,
+    "approved":1.8,"upgrade":1.0,"buyback":1.5,"burn":1.2,"inflow":1.2,"inflows":1.2,
+    "bullish":1.2,"raises":1.0,"funding round":1.5,"integration":1.0,
+}
+_V11_BEAR = {
+    # TR
+    "düşüş":1.0,"dusus":1.0,"çöküş":2.0,"cokus":2.0,"çakıldı":1.8,"cakildi":1.8,
+    "sert düştü":1.5,"kayıp":0.8,"kayip":0.8,"ayı":1.0,"kan":1.2,
+    "hack":2.5,"hacklendi":2.5,"saldırı":2.0,"saldiri":2.0,"güvenlik açığı":2.0,
+    "istismar":2.0,"exploit":2.5,"dava":1.8,"soruşturma":1.8,"sorusturma":1.8,
+    "sec ":1.5,"ceza":1.5,"yaptırım":1.8,"yaptirim":1.8,"delist":2.5,
+    "listeden çıkar":2.5,"listeden cikar":2.5,"iflas":2.5,"dolandırıcılık":2.5,
+    "dolandiricilik":2.5,"rug":2.5,"token kilidi":1.8,"kilit açılış":1.8,
+    "kilidi açıl":1.8,"arz artışı":1.5,"satış baskısı":1.5,"satis baskisi":1.5,
+    "tasfiye":1.5,"likidasyon":1.5,"uyarı":1.0,"uyari":1.0,"risk":0.6,
+    "durduruldu":1.5,"askıya":1.8,"askiya":1.8,"çıkış":0.8,"para çıkışı":1.5,
+    "gerileme":1.0,"baskı altında":1.0,"hedef düşürüldü":1.5,
+    # EN
+    "crash":2.0,"plunge":1.8,"plunges":1.8,"dump":1.5,"tumbles":1.5,"slides":1.0,
+    "hacked":2.5,"breach":2.0,"lawsuit":1.8,"probe":1.5,"charges":1.8,
+    "delisting":2.5,"delisted":2.5,"unlock":1.8,"unlocks":1.8,"outflow":1.2,
+    "outflows":1.2,"liquidation":1.5,"liquidations":1.5,"fraud":2.5,"halt":1.5,
+    "halted":1.5,"warning":1.0,"bearish":1.2,"selloff":1.5,"sell-off":1.5,
+    "bankruptcy":2.5,"scam":2.5,"suspended":1.8,
+}
+_V11_MARKET_WORDS = ("bitcoin", "btc", "kripto", "crypto", "fed", "faiz", "piyasa", "market")
+
+
+def _v11_lower(s: str) -> str:
+    """Türkçe güvenli küçük harf.
+    Python'un .lower() metodu 'İ' harfini 'i̇' (i + birleşen nokta) yapar ve
+    sözlük eşleşmesini bozar; onu önce sade 'i'ye çeviriyoruz.
+    'I' harfi kasten ASCII 'i' olarak bırakıldı: aksi halde MINA/SIGN gibi
+    TİKER isimleri 'mına'/'sıgn' olup hiçbir başlıkla eşleşmezdi."""
+    return (s or "").replace("İ", "i").replace("\u0130", "i").lower()
+
+
+def _v11_news_relevance(base: str, title: str) -> str:
+    """Başlık gerçekten bu coinle mi ilgili? 'AMINA' içindeki 'MINA' tuzağını keser.
+    Döner: 'coin' (doğrudan), 'genel' (piyasa geneli), '' (alakasız)."""
+    t = _v11_lower(title)
+    b = _v11_lower(base)
+    if b and re.search(r"(?<![a-z0-9])" + re.escape(b) + r"(?![a-z0-9])", t):
+        return "coin"
+    if any(w in t for w in _V11_MARKET_WORDS):
+        return "genel"
+    return ""
+
+
+def v11_news_sentiment(base: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Başlıklardan yön duyarlılığı üretir.
+    puan > 0 = boğa lehine, < 0 = ayı lehine. 'coin' haberleri tam ağırlık,
+    piyasa geneli haberleri %35 ağırlık alır (BTC/FED haberi altcoin yönünü
+    belirlemez ama tamamen de görmezden gelinemez)."""
+    score = 0.0; bull_hits: List[str] = []; bear_hits: List[str] = []; used = 0
+    for it in items or []:
+        title = it.get("title", "")
+        rel = _v11_news_relevance(base, title)
+        if not rel:
+            continue
+        w = 1.0 if rel == "coin" else 0.35
+        # taze haber daha güçlü: 6 saatten yeni tam, 48 saatte 0.3'e iner
+        age = safe_float(it.get("age_h"), 24.0)
+        fresh = 1.0 if age <= 6 else max(0.3, 1.0 - (age - 6) / 60.0)
+        t = _v11_lower(title)
+        for kw, wt in _V11_BULL.items():
+            if kw in t:
+                score += wt * w * fresh; bull_hits.append(kw)
+        for kw, wt in _V11_BEAR.items():
+            if kw in t:
+                score -= wt * w * fresh; bear_hits.append(kw)
+        used += 1
+    lbl = "NÖTR"
+    if score >= 3: lbl = "GÜÇLÜ BOĞA"
+    elif score >= 1: lbl = "BOĞA"
+    elif score <= -3: lbl = "GÜÇLÜ AYI"
+    elif score <= -1: lbl = "AYI"
+    return {"score": round(score, 2), "label": lbl, "n": used,
+            "bull": sorted(set(bull_hits))[:4], "bear": sorted(set(bear_hits))[:4]}
+
+
+def _fetch_coin_news_sync(base: str) -> List[Dict[str, Any]]:
+    """Google News RSS'ten coin haberleri — YAPISAL döner (başlık + yaş + alaka).
+    Hata -> boş liste (sinyali asla bloklamaz)."""
     import xml.etree.ElementTree as _ET
     from email.utils import parsedate_to_datetime as _pd
     url = "https://news.google.com/rss/search"
-    params = {"q": f"{base} coin kripto", "hl": "tr", "gl": "TR", "ceid": "TR:tr"}
+    # V11: tırnaklı arama + 'coin' kelimesi alakasız şirket haberlerini azaltır
+    params = {"q": f'"{base}" (coin OR kripto OR crypto OR token)',
+              "hl": "tr", "gl": "TR", "ceid": "TR:tr"}
     resp = SESSION.get(url, params=params, timeout=SIGNAL_NEWS_TIMEOUT_SEC)
     if resp.status_code != 200:
-        return ""
+        return []
     root = _ET.fromstring(resp.content)
-    out: List[str] = []
+    out: List[Dict[str, Any]] = []
     now = time.time()
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
         if not title:
             continue
-        age_txt = ""
+        age_h = 24.0
         try:
             dt = _pd(item.findtext("pubDate") or "")
             age_h = (now - dt.timestamp()) / 3600.0
             if age_h > SIGNAL_NEWS_MAX_AGE_H or age_h < -1:
                 continue
-            age_txt = f" ({int(age_h * 60)}dk önce)" if age_h < 1 else f" ({age_h:.0f}sa önce)"
         except Exception:
             pass
-        if len(title) > 95:
-            title = title[:92] + "..."
-        out.append(f"• {title}{age_txt}")
-        if len(out) >= SIGNAL_NEWS_MAX:
+        rel = _v11_news_relevance(base, title)
+        if not rel:
+            continue
+        out.append({"title": title, "age_h": round(age_h, 1), "rel": rel})
+        if len(out) >= max(SIGNAL_NEWS_MAX, 6):
             break
-    return "\n".join(out)
+    # coin'e özel haberler önce
+    out.sort(key=lambda x: (0 if x["rel"] == "coin" else 1, x["age_h"]))
+    return out
 
 
-async def fetch_coin_news(symbol: str) -> str:
+async def fetch_coin_news_items(symbol: str) -> List[Dict[str, Any]]:
     if not SIGNAL_NEWS_ENABLED:
-        return ""
+        return []
     base = (symbol or "").split("-")[0].strip().upper()
     if not base:
-        return ""
+        return []
     now = time.time()
     cached = _news_cache.get(base)
     if cached and now - cached[0] <= SIGNAL_NEWS_CACHE_SEC:
         return cached[1]
     try:
-        text = await asyncio.to_thread(_fetch_coin_news_sync, base)
+        items = await asyncio.to_thread(_fetch_coin_news_sync, base)
     except Exception as e:
         logger.warning("Haber taraması hata %s: %s", base, e)
-        text = ""
-    _news_cache[base] = (now, text)
+        items = []
+    _news_cache[base] = (now, items)
     if len(_news_cache) > 300:
         oldest = sorted(_news_cache.items(), key=lambda kv: kv[1][0])[:100]
         for k_, _ in oldest:
             _news_cache.pop(k_, None)
-    return text
+    return items
+
+
+def _v11_news_text(items: List[Dict[str, Any]]) -> str:
+    lines = []
+    for it in (items or [])[:SIGNAL_NEWS_MAX]:
+        title = it.get("title", "")
+        if len(title) > 95:
+            title = title[:92] + "..."
+        a = safe_float(it.get("age_h"), 0)
+        age_txt = f" ({int(a*60)}dk önce)" if a < 1 else f" ({a:.0f}sa önce)"
+        mark = "" if it.get("rel") == "coin" else " [piyasa]"
+        lines.append(f"• {title}{age_txt}{mark}")
+    return "\n".join(lines)
+
+
+async def fetch_coin_news(symbol: str) -> str:
+    """Geriye dönük uyumluluk: metin döner."""
+    return _v11_news_text(await fetch_coin_news_items(symbol))
 
 
 async def send_rich_signal(text: str, symbol: str, direction: str,
@@ -5136,17 +5258,32 @@ def build_status_report() -> str:
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
                   f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
                   f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}"]
-        if n:
+        # V11 DÜZELTME: TP sayaçları artık AÇIK pozisyonları da içeriyor.
+        # Eski rapor sadece kapananlara bakıyordu; KITE ve USELESS TP1'i
+        # görmüşken ekranda "TP1'e ulaşan: 0" yazıyordu.
+        lines.append(f"Red (V11): tekrar={int(stats.get('v11_red_tekrar',0))} | "
+                     f"araştırma={int(stats.get('v11_red_arastirma',0))} | "
+                     f"range={int(stats.get('v11_red_range',0))} | "
+                     f"choch={int(stats.get('v11_red_choch',0))} | "
+                     f"drift={int(stats.get('v11_red_drift',0))}")
+        if stats.get("v11_son_red"):
+            lines.append(f"Son araştırma reddi: {stats.get('v11_son_red')}")
+        tp1_open = sum(1 for r in vopen if r.get("hit1"))
+        tp2_open = sum(1 for r in vopen if r.get("hit2"))
+        if n or vopen:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
             tp3_n = sum(1 for r in vclosed if r.get("outcome") == "TP3")
-            tp1_n = sum(1 for r in vclosed if r.get("hit1", r.get("outcome") in ("TP3", "BE")))
-            tp2_n = sum(1 for r in vclosed if r.get("hit2", r.get("outcome") == "TP3"))
+            tp1_n = sum(1 for r in vclosed if r.get("hit1") or r.get("outcome") in ("TP3", "BE")) + tp1_open
+            tp2_n = sum(1 for r in vclosed if r.get("hit2") or r.get("outcome") == "TP3") + tp2_open
             tot_r = sum(safe_float(r.get("R")) for r in vclosed)
             win = sum(1 for r in vclosed if safe_float(r.get("R")) > 0)
-            lines += [f"TP1'e ulaşan: {tp1_n} | TP2'ye: {tp2_n} | TP3'e: {tp3_n}",
-                      f"STOP: {stop_n} | BE (TP1 sonrası girişe dönüş): {be_n}",
-                      f"Toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}"]
+            lines += [f"TP1'e ulaşan: {tp1_n} (açıkta {tp1_open}) | TP2'ye: {tp2_n} (açıkta {tp2_open}) | TP3'e: {tp3_n}",
+                      f"STOP: {stop_n} | BE (TP1 sonrası girişe dönüş): {be_n}"]
+            if n:
+                lines.append(f"Kapanan toplam: {tot_r:+.2f}R | Kazanma: %{win / n * 100:.0f}")
+            else:
+                lines.append("Henüz kapanan işlem yok — R hesabı kapanışla dolar.")
         else:
             lines.append("Kapanan işlem yok — TP/STOP sayıları kapanışla dolar.")
     except Exception as e:
@@ -5625,7 +5762,79 @@ V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
+
+# V11: RSI kapısı akıl sağlığı sınırı.
+# 27-28 Tem oturumu env'de LONG max 55 / SHORT min 45 ile çalıştı. Bu ayarla
+# SHORT'lar RSI 45-47 aralığında, yani ZATEN DÜŞMÜŞ coinlerde açıldı; 8 short
+# kapanışının 8'i stop oldu. "Güce sat / zayıflıktan al" mantığı için SHORT'un
+# yüksek, LONG'un düşük RSI'da açılması gerekir. Bu kapı gevşek env değerlerini
+# makul sınıra çeker ve BUNU LOGLAR (sessiz değiştirme yok).
+# VARSAYILAN false — 27-28 Tem defterinde bu kapı 16 sinyalin 13'ünü kesiyor ve
+# TP1 yapan iki kazananı (KITE, USELESS) da götürüyordu. Diğer kapılar açıkken
+# sonuç +1.0R/3 sinyal iken bu kapı eklenince 0 sinyale düşüyor. Daha çok veri
+# toplanınca V11_RSI_STRICT=true ile tekrar denenmeli.
+V11_RSI_STRICT       = os.getenv("V11_RSI_STRICT", "false").lower() == "true"
+V11_RSI_LONG_CAP     = float(os.getenv("V11_RSI_LONG_CAP", "45"))
+V11_RSI_SHORT_FLOOR  = float(os.getenv("V11_RSI_SHORT_FLOOR", "58"))
+_V11_RSI_NOTE = ""
+if V11_RSI_STRICT:
+    if V10_RSI_LONG_MAX > V11_RSI_LONG_CAP:
+        _V11_RSI_NOTE += f"LONG max {V10_RSI_LONG_MAX:.0f}→{V11_RSI_LONG_CAP:.0f} "
+        V10_RSI_LONG_MAX = V11_RSI_LONG_CAP
+    if V10_RSI_SHORT_MIN < V11_RSI_SHORT_FLOOR:
+        _V11_RSI_NOTE += f"SHORT min {V10_RSI_SHORT_MIN:.0f}→{V11_RSI_SHORT_FLOOR:.0f}"
+        V10_RSI_SHORT_MIN = V11_RSI_SHORT_FLOOR
+    if _V11_RSI_NOTE:
+        logger.warning("V11 RSI akıl sağlığı kapısı devrede: %s "
+                       "(kapatmak için V11_RSI_STRICT=false)", _V11_RSI_NOTE)
 V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
+
+
+# ============================================================================ #
+#  V11.0 — SABİT %TP + DERİN ARAŞTIRMA + TEKRAR KİLİDİ + HABER FİLTRESİ
+#  Hepsi Railway Variables'tan kapatılabilir. false yaparsan V10.5 davranışı.
+# ============================================================================ #
+
+# --- Sabit yüzde hedefler (Hasan mandatı): stop %2 | TP1 %4 | TP2 %7 | TP3 %9 ---
+V11_TARGET_MODE      = os.getenv("V11_TARGET_MODE", "yuzde").strip().lower()  # yuzde | fib | atr
+V11_STOP_PCT         = float(os.getenv("V11_STOP_PCT", "2.0"))
+V11_TP1_PCT          = float(os.getenv("V11_TP1_PCT", "4.0"))
+V11_TP2_PCT          = float(os.getenv("V11_TP2_PCT", "7.0"))
+V11_TP3_PCT          = float(os.getenv("V11_TP3_PCT", "9.0"))
+
+# --- Tekrar kilidi (TRUST x4 / VANA x2 faciasının ilacı) ---
+V11_BLOCK_IF_OPEN    = os.getenv("V11_BLOCK_IF_OPEN", "true").lower() == "true"
+V11_REENTRY_HOURS    = float(os.getenv("V11_REENTRY_HOURS", "6"))      # aynı coin tekrar sinyali için min saat
+V11_STOP_BOX_HOURS   = float(os.getenv("V11_STOP_BOX_HOURS", "24"))    # stop yiyen coin ceza kutusu
+V11_STOP_BOX_SAME_SIDE_HOURS = float(os.getenv("V11_STOP_BOX_SAME_SIDE_HOURS", "48"))
+V11_MAX_SIGNALS_PER_COIN_DAY = int(float(os.getenv("V11_MAX_SIGNALS_PER_COIN_DAY", "2")))
+V11_BLOCK_WHEN_BOOK_FULL = os.getenv("V11_BLOCK_WHEN_BOOK_FULL", "true").lower() == "true"
+
+# --- Yapı kapısı sertleştirme (10/10 stopun ana sebebi) ---
+V11_BLOCK_RANGE_BOS  = os.getenv("V11_BLOCK_RANGE_BOS", "true").lower() == "true"
+V11_CHOCH_NEEDS_CONFIRM = os.getenv("V11_CHOCH_NEEDS_CONFIRM", "true").lower() == "true"
+V11_REQUIRE_BTC_ALIGN = os.getenv("V11_REQUIRE_BTC_ALIGN", "true").lower() == "true"
+
+# --- Canlı giriş fiyatı (bayat mum kapanışı yerine) ---
+V11_LIVE_ENTRY       = os.getenv("V11_LIVE_ENTRY", "true").lower() == "true"
+V11_MAX_DRIFT_PCT    = float(os.getenv("V11_MAX_DRIFT_PCT", "0.8"))   # canlı fiyat yapı seviyesinden bu kadar uzaksa sinyal yok
+
+# --- Derin araştırma kapısı ---
+V11_RESEARCH_ENABLED = os.getenv("V11_RESEARCH_ENABLED", "true").lower() == "true"
+V11_RESEARCH_MIN     = float(os.getenv("V11_RESEARCH_MIN_SCORE", "60"))
+V11_LTF_INTERVAL     = os.getenv("V11_LTF_INTERVAL", "15m").strip()
+V11_MAX_SPREAD_BPS   = float(os.getenv("V11_MAX_SPREAD_BPS", "12"))   # 12 bps = %0.12
+V11_RANGE_EDGE_PCT   = float(os.getenv("V11_RANGE_EDGE_PCT", "1.2"))  # aralık tepesinde LONG / dibinde SHORT yasağı
+
+# --- Haber duyarlılığı ---
+V11_NEWS_FILTER      = os.getenv("V11_NEWS_FILTER", "true").lower() == "true"
+V11_NEWS_BLOCK_SCORE = float(os.getenv("V11_NEWS_BLOCK_SCORE", "2"))  # ters haber gücü >= bu ise sinyal iptal
+V11_NEWS_REVERSE     = os.getenv("V11_NEWS_REVERSE", "false").lower() == "true"  # ters haberde ters sinyal ARA (yapı da onaylarsa)
+V11_NEWS_REVERSE_MIN = float(os.getenv("V11_NEWS_REVERSE_MIN", "3"))
+
+# Ceza kutusu + günlük sayaç kalıcı hafızada tutulur
+def _v11_box():
+    return memory.setdefault("v11_guard", {"box": {}, "daily": {}, "last_signal": {}})
 
 
 def fib_leg_and_depth(side, lo_v, hi_v, cl_v):
@@ -5735,11 +5944,23 @@ def v10_market_structure(k):
     if res["hh"] and res["hl"]: res["trend"] = "UP"
     elif res["lh"] and res["ll"]: res["trend"] = "DOWN"
     lc = closes(k)[-1]
+    res["range_break"] = False
     if res["last_sh"] > 0 and lc > res["last_sh"]:
-        res["event"] = "CHoCH" if res["trend"] == "DOWN" else "BOS"
+        if res["trend"] == "DOWN":
+            res["event"] = "CHoCH"
+        elif res["trend"] == "UP":
+            res["event"] = "BOS"
+        else:
+            # V11: RANGE içinde tepe kırılımı "devam" DEĞİLDİR — sweep adayıdır.
+            res["event"] = "BOS"; res["range_break"] = True
         res["event_side"] = "UP"; res["event_level"] = res["last_sh"]; res["event_idx"] = res["last_sh_idx"]
     elif res["last_sl"] > 0 and lc < res["last_sl"]:
-        res["event"] = "CHoCH" if res["trend"] == "UP" else "BOS"
+        if res["trend"] == "UP":
+            res["event"] = "CHoCH"
+        elif res["trend"] == "DOWN":
+            res["event"] = "BOS"
+        else:
+            res["event"] = "BOS"; res["range_break"] = True
         res["event_side"] = "DOWN"; res["event_level"] = res["last_sl"]; res["event_idx"] = res["last_sl_idx"]
     return res
 
@@ -5871,9 +6092,30 @@ def v10_quality_score(side, k, ms, ext):
     vols = [safe_float(r[5]) for r in k[-21:-1]]; av = sum(vols)/len(vols) if vols else 0.0
     lv = safe_float(k[-1][5]); p["volume"] = 2.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
     r = rsi(closes(k))[-1]
-    if side == "LONG": p["rsi"] = 7.0*(1.0 if 45 <= r <= 65 else 0.5 if 35 <= r <= 75 else 0.1)
-    else: p["rsi"] = 7.0*(1.0 if 35 <= r <= 55 else 0.5 if 25 <= r <= 65 else 0.1)
-    oi = safe_float(ext.get("oi_change_pct")); p["oi"] = 9.0*(1.0 if oi > 0.5 else 0.5 if oi > 0 else 0.2)
+    # V11 DÜZELTME: eski kod SHORT'a en yüksek puanı RSI 35-55'te veriyordu
+    # (yani zaten düşmüş coini satmak), ama RSI KAPISI "SHORT ancak RSI >= 70"
+    # diyordu. Skor ile kapı birbirine zıttı. Artık ikisi de aynı felsefede:
+    # SHORT = güce sat (yüksek RSI), LONG = zayıflıktan al (düşük RSI).
+    if side == "LONG":
+        p["rsi"] = 7.0*(1.0 if r <= V10_RSI_LONG_MAX else 0.45 if r <= V10_RSI_LONG_MAX + 10 else 0.1)
+    else:
+        p["rsi"] = 7.0*(1.0 if r >= V10_RSI_SHORT_MIN else 0.45 if r >= V10_RSI_SHORT_MIN - 10 else 0.1)
+    # V11 DÜZELTME: OI puanı artık yön farkında.
+    # Eski kod her iki yöne de "OI artıyorsa 9 puan" veriyordu. SHORT'ta fiyat
+    # yukarı + OI yukarı = long birikimi = short'un düşmanı. VANA %+6.64 OI ile
+    # tam puan alıp iki kez stop oldu. Artık pozisyon yönüyle uyum aranıyor.
+    oi = safe_float(ext.get("oi_change_pct"))
+    pmove = safe_float(ext.get("price_move_pct"))
+    if side == "LONG":
+        if oi > 0.5 and pmove >= 0:   p["oi"] = 9.0      # yeni long parası geliyor
+        elif oi > 0.5 and pmove < 0:  p["oi"] = 3.6      # düşerken OI artışı = short birikimi
+        elif oi > 0:                  p["oi"] = 5.4
+        else:                         p["oi"] = 2.7      # OI kaçıyor
+    else:
+        if oi > 0.5 and pmove <= 0:   p["oi"] = 9.0      # düşüşe yeni short parası
+        elif oi > 0.5 and pmove > 0:  p["oi"] = 1.8      # yükselirken OI patlaması = SHORT'a karşı
+        elif oi > 0:                  p["oi"] = 5.4
+        else:                         p["oi"] = 4.5      # OI erimesi = long tasfiyesi, short'a iyi
     fr = safe_float(ext.get("funding"))
     if side == "LONG": p["funding"] = 7.0*(0.2 if fr > 0.0008 else 1.0 if fr < 0 else 0.7)
     else: p["funding"] = 7.0*(0.2 if fr < -0.0008 else 1.0 if fr > 0 else 0.7)
@@ -5906,6 +6148,26 @@ def v10_quality_score(side, k, ms, ext):
 
 
 def v10_targets(side, entry, a, fib=None):
+    """V11: varsayılan mod SABİT YÜZDE — stop %2, TP1 %4, TP2 %7, TP3 %9.
+    Eski FİB modu USELESS'te TP2'yi 12.4R (%25 düşüş), TP3'ü 17.9R (%36 düşüş)
+    yapmıştı; bunlar 1H swing işleminde ulaşılamaz hedeflerdir ve kısmi kâr
+    almayı imkânsız kılar. env: V11_TARGET_MODE=fib/atr ile eskiye dönülebilir."""
+    sgn = 1.0 if side == "LONG" else -1.0
+
+    if V11_TARGET_MODE == "yuzde":
+        dist = entry * (V11_STOP_PCT / 100.0)
+        stop = entry - sgn*dist
+        risk = abs(entry - stop)
+        tp1 = entry + sgn*entry*(V11_TP1_PCT/100.0)
+        tp2 = entry + sgn*entry*(V11_TP2_PCT/100.0)
+        tp3 = entry + sgn*entry*(V11_TP3_PCT/100.0)
+        return {"stop":stop,"stop_pct":round(V11_STOP_PCT,3),"risk":risk,
+                "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":"%SABİT",
+                "tp1_pct":V11_TP1_PCT,"tp2_pct":V11_TP2_PCT,"tp3_pct":V11_TP3_PCT,
+                "tp1_rr":round(abs(tp1-entry)/risk,2) if risk > 0 else 0,
+                "tp2_rr":round(abs(tp2-entry)/risk,2) if risk > 0 else 0,
+                "tp3_rr":round(abs(tp3-entry)/risk,2) if risk > 0 else 0}
+
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
@@ -5914,20 +6176,24 @@ def v10_targets(side, entry, a, fib=None):
     else:
         tp1, tp2, tp3 = entry-risk*V10_TP1_RR, entry-risk*V10_TP2_RR, entry-risk*V10_TP3_RR
     tp_kaynak = "ATR"
-    if fib:
+    if fib and V11_TARGET_MODE == "fib":
         def _rr(px):
             return (px - entry) / risk if side == "LONG" else (entry - px) / risk
         f2, f3 = fib.get("ext_1272"), fib.get("ext_1618")
-        if f2 and f3 and f2 > 0 and f3 > 0 and _rr(f2) >= 1.5 and _rr(f3) > _rr(f2):
+        if f2 and f3 and f2 > 0 and f3 > 0 and 1.5 <= _rr(f2) <= 6.0 and _rr(f2) < _rr(f3) <= 9.0:
             tp2, tp3 = f2, f3
             tp_kaynak = "FİB"
     return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
             "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
-            "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1)}
+            "tp1_rr":round(abs(tp1-entry)/risk,2),
+            "tp2_rr":round(abs(tp2-entry)/risk,2),"tp3_rr":round(abs(tp3-entry)/risk,2)}
 
 
 async def v10_fetch_orderbook(symbol):
-    blank = {"imbalance":0.0,"bid_wall":False,"ask_wall":False}
+    """V11: emir defteri artık CANLI fiyat ve spread de döner.
+    Tek istek ile hem imbalance/duvar hem de giriş fiyatı + likidite kalitesi."""
+    blank = {"imbalance":0.0,"bid_wall":False,"ask_wall":False,
+             "best_bid":0.0,"best_ask":0.0,"mid":0.0,"spread_bps":0.0,"ok":False}
     if not V10_USE_ORDERBOOK:
         return blank
     try:
@@ -5936,14 +6202,22 @@ async def v10_fetch_orderbook(symbol):
         if not data:
             return blank
         book = data[0]
-        bsz = [safe_float(x[1]) for x in book.get("bids", [])[:V10_OB_DEPTH]]
-        asz = [safe_float(x[1]) for x in book.get("asks", [])[:V10_OB_DEPTH]]
+        braw = book.get("bids", [])[:V10_OB_DEPTH]
+        araw = book.get("asks", [])[:V10_OB_DEPTH]
+        bsz = [safe_float(x[1]) for x in braw]
+        asz = [safe_float(x[1]) for x in araw]
         bids = sum(bsz); asks = sum(asz); tot = bids+asks
         imb = (bids-asks)/tot if tot > 0 else 0.0
         bmean = bids/len(bsz) if bsz else 0; amean = asks/len(asz) if asz else 0
+        bb = safe_float(braw[0][0]) if braw else 0.0
+        ba = safe_float(araw[0][0]) if araw else 0.0
+        mid = (bb+ba)/2 if (bb > 0 and ba > 0) else (bb or ba)
+        spread_bps = ((ba-bb)/mid*10000.0) if (mid > 0 and ba > bb) else 0.0
         return {"imbalance": imb,
                 "bid_wall": (max(bsz) > bmean*V10_OB_WALL_MULT) if bsz and bmean > 0 else False,
-                "ask_wall": (max(asz) > amean*V10_OB_WALL_MULT) if asz and amean > 0 else False}
+                "ask_wall": (max(asz) > amean*V10_OB_WALL_MULT) if asz and amean > 0 else False,
+                "best_bid": bb, "best_ask": ba, "mid": mid,
+                "spread_bps": round(spread_bps, 2), "ok": mid > 0}
     except Exception as e:
         logger.debug("V10 ob fail %s: %s", symbol, e)
         return blank
@@ -5964,12 +6238,214 @@ def v10_structure_gate(symbol, k1h, k4h):
         if V10_USE_4H_FILTER and trend4 != "FLAT":
             if side == "LONG" and trend4 != "UP": continue
             if side == "SHORT" and trend4 != "DOWN": continue
+
+        # --- V11 KAPI 1: RANGE içi kırılım yasağı -------------------------
+        # 27-28 Tem defteri: 1H:RANGE etiketli "BOS (devam)" sinyallerinin
+        # 6'sı stop oldu (TRUST x4, WOO, GPS). Yatay bir aralıkta tepenin
+        # kırılması "trend devamı" değil, klasik sahte kırılım/likidite
+        # avıdır. Sweep + geri alım kanıtı yoksa bu kırılıma girilmez.
+        if V11_BLOCK_RANGE_BOS and ms.get("range_break"):
+            if v10_detect_sweep(side, k, ms) < 1.0:
+                stats["v11_red_range"] = int(stats.get("v11_red_range", 0)) + 1
+                continue
+            why = why.replace("(devam)", "(range sweep+reclaim)")
+
+        # --- V11 KAPI 2: CHoCH teyit zorunluluğu --------------------------
+        # CHoCH = 1H trendine TERS giriş (düşen bıçağı yakalamak). Defterde
+        # 4 CHoCH sinyalinin 4'ü de stop oldu (MUBARAK, VANA x2, LDO).
+        # Artık likidite sweep'i olmadan ters yön açılmıyor.
+        if V11_CHOCH_NEEDS_CONFIRM and ms.get("event") == "CHoCH":
+            if v10_detect_sweep(side, k, ms) < 1.0:
+                stats["v11_red_choch"] = int(stats.get("v11_red_choch", 0)) + 1
+                continue
+            why = why + " +sweep"
+
         blk, mv = v10_fomo_block(side, k)
         if blk: continue
         pb, note = v10_pullback(side, k, ms)
         if not pb: continue
-        return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),"pullback":note,"k":k}
+        return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),
+                "pullback":note,"k":k,"range_break":bool(ms.get("range_break"))}
     return None
+
+
+
+# ============================================================================ #
+#  V11 DERİN ARAŞTIRMA KAPISI
+#  Yapı + skor kapısını geçen ADAY, gönderilmeden önce burada 7 bağımsız
+#  testten geçer. Amaç: "skor 92.4 ama yine stop" vakasını kesmek. Skor
+#  sadece 1H yapıya bakıyordu; burada alt zaman dilimi, likidite, aralık
+#  konumu, para akışı, haber ve BTC rejimi ayrı ayrı sorgulanır.
+#  Herhangi bir KIRMIZI → sinyal iptal (puanı ne olursa olsun).
+# ============================================================================ #
+async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[str, Any]:
+    out = {"score": 0.0, "notes": [], "red": [], "verdict": "ONAY",
+           "news": None, "reverse_hint": False}
+    if not V11_RESEARCH_ENABLED:
+        out["score"] = 100.0; out["notes"].append("araştırma kapalı")
+        return out
+
+    side = sig["direction"]; symbol = sig["symbol"]; entry = safe_float(sig["entry"])
+    up = (side == "LONG")
+    S = 0.0
+
+    # --- TEST 1/7: Alt zaman dilimi momentum uyumu (20 puan) ----------------
+    # 1H yapı "kırılım" derken 15m zaten ters dönmüşse, giriş anında karşı
+    # tarafa yürüyorsun demektir. Defterdeki hızlı stopların imzası budur.
+    try:
+        kl = await get_klines(symbol, V11_LTF_INTERVAL, 80)
+        kl = _s_closed(kl)
+        if len(kl) >= 30:
+            c = closes(kl)
+            e9 = s_ema(c, 9)[-1]; e21 = s_ema(c, 21)[-1]
+            slope = (c[-1] - c[-4]) / c[-4] * 100.0 if c[-4] > 0 else 0.0
+            agree = (e9 > e21) if up else (e9 < e21)
+            push = (slope > 0) if up else (slope < 0)
+            if agree and push:
+                S += 20; out["notes"].append(f"15m momentum uyumlu (eğim %{slope:+.2f})")
+            elif agree or push:
+                S += 10; out["notes"].append(f"15m kısmi uyum (eğim %{slope:+.2f})")
+            else:
+                out["red"].append(f"15m TERS yönde (eğim %{slope:+.2f})")
+        else:
+            S += 10; out["notes"].append("15m veri yetersiz — nötr")
+    except Exception as e:
+        S += 10; logger.debug("V11 ltf hata %s: %s", symbol, e)
+
+    # --- TEST 2/7: Spread + likidite kalitesi (12 puan) ---------------------
+    ob = sig.get("orderbook") or {}
+    sp = safe_float(ob.get("spread_bps"))
+    if ob.get("ok"):
+        if sp <= V11_MAX_SPREAD_BPS * 0.5:
+            S += 12; out["notes"].append(f"spread {sp:.1f}bps (temiz)")
+        elif sp <= V11_MAX_SPREAD_BPS:
+            S += 6; out["notes"].append(f"spread {sp:.1f}bps (kabul)")
+        else:
+            out["red"].append(f"spread {sp:.1f}bps > {V11_MAX_SPREAD_BPS:.0f} — kayma riski")
+    else:
+        S += 6; out["notes"].append("defter yok — spread nötr")
+
+    # --- TEST 3/7: Hacim teyidi (10 puan) -----------------------------------
+    try:
+        vols = [safe_float(r[5]) for r in k1h[-21:-1]]
+        av = sum(vols)/len(vols) if vols else 0.0
+        lv = safe_float(k1h[-1][5])
+        rat = (lv/av) if av > 0 else 1.0
+        if rat >= 1.3:
+            S += 10; out["notes"].append(f"hacim x{rat:.2f} (kırılımı besliyor)")
+        elif rat >= 0.8:
+            S += 6; out["notes"].append(f"hacim x{rat:.2f} (normal)")
+        else:
+            S += 1; out["notes"].append(f"hacim x{rat:.2f} ZAYIF — kırılım desteksiz")
+    except Exception:
+        S += 5
+
+    # --- TEST 4/7: Aralık kenarı riski (15 puan) ----------------------------
+    # 80 mumluk aralığın tepesinde LONG / dibinde SHORT açmak = likidite
+    # avcısına yem olmak. TRUST tam olarak aralık tepesinde 4 kez alındı.
+    #
+    # ÖNEMLİ: bu veto SADECE trendsiz (RANGE) piyasada geçerlidir. Onaylanmış
+    # bir düşüş trendinde fiyatın 80 mumluk dibe yakın olması ANORMAL DEĞİL,
+    # beklenen durumdur — orada short'u yasaklarsan tüm trend devamı
+    # işlemlerini keser, geriye sadece dip yakalama kalır. Duman testinde
+    # tam olarak bu ortaya çıktı: geçerli bir Ayı BOS "%3 dipte" diye
+    # reddediliyordu. Trend varsa veto düşer, sadece puanlama uygulanır.
+    try:
+        seg = k1h[-80:] if len(k1h) >= 80 else k1h
+        hi = max(highs(seg)); lo = min(lows(seg)); rng = hi - lo
+        t1h = str(sig.get("trend_1h", "RANGE")).upper()
+        trendli = (t1h == "UP" and up) or (t1h == "DOWN" and not up)
+        if rng > 0:
+            pos = (entry - lo) / rng * 100.0   # 0 = dip, 100 = tepe
+            uc_long  = up and pos >= 100 - V11_RANGE_EDGE_PCT * 8
+            uc_short = (not up) and pos <= V11_RANGE_EDGE_PCT * 8
+            if (uc_long or uc_short) and not trendli:
+                yer = "tepesinde" if up else "dibinde"
+                risk = "sahte kırılım" if up else "sıkışma"
+                out["red"].append(f"{side} trendsiz aralığın {yer} (%{pos:.0f}) — {risk} riski")
+            elif uc_long or uc_short:
+                S += 11
+                out["notes"].append(f"aralık konumu %{pos:.0f} — uçta ama 1H trend teyitli ({t1h})")
+            else:
+                ideal = (pos <= 55) if up else (pos >= 45)
+                S += 15 if ideal else 7
+                out["notes"].append(f"aralık konumu %{pos:.0f} ({'iyi' if ideal else 'geç'})")
+        else:
+            S += 7
+    except Exception:
+        S += 7
+
+    # --- TEST 5/7: Para akışı tutarlılığı — OI + funding (13 puan) ----------
+    oi = safe_float(sig.get("oi_change_pct")); fr = safe_float(sig.get("funding"))
+    mv = safe_float(sig.get("fomo_move_pct"))
+    flow = 0.0
+    if up:
+        if oi > 0 and mv >= 0: flow += 7
+        elif oi > 0 and mv < 0: flow += 2
+        else: flow += 3
+        if fr < 0: flow += 6
+        elif fr < 0.0005: flow += 4
+        else: flow += 1
+    else:
+        if oi > 0 and mv <= 0: flow += 7
+        elif oi > 0 and mv > 0: flow += 1
+        else: flow += 5
+        if fr > 0.0005: flow += 6
+        elif fr > 0: flow += 4
+        else: flow += 1
+    S += flow
+    out["notes"].append(f"akış OI%{oi:+.2f} fund%{fr*100:+.4f} → {flow:.0f}/13")
+
+    # --- TEST 6/7: Haber duyarlılığı (15 puan) ------------------------------
+    news_s = 0.0
+    if V11_NEWS_FILTER:
+        try:
+            base = symbol.split("-")[0]
+            items = await fetch_coin_news_items(symbol)
+            snt = v11_news_sentiment(base, items)
+            out["news"] = snt
+            news_s = snt["score"]
+            aligned = (news_s > 0) if up else (news_s < 0)
+            mag = abs(news_s)
+            if mag < 1:
+                S += 9; out["notes"].append(f"haber nötr ({snt['n']} başlık)")
+            elif aligned:
+                S += 15; out["notes"].append(f"haber DESTEKLİYOR: {snt['label']} ({news_s:+.1f})")
+            else:
+                if mag >= V11_NEWS_BLOCK_SCORE:
+                    out["red"].append(f"haber TERS: {snt['label']} ({news_s:+.1f}) {','.join(snt['bear'] if up else snt['bull'])}")
+                    if V11_NEWS_REVERSE and mag >= V11_NEWS_REVERSE_MIN:
+                        out["reverse_hint"] = True
+                else:
+                    S += 3; out["notes"].append(f"haber hafif ters ({news_s:+.1f})")
+        except Exception as e:
+            S += 9; logger.debug("V11 haber hata %s: %s", symbol, e)
+    else:
+        S += 9
+
+    # --- TEST 7/7: BTC rejim uyumu (15 puan) --------------------------------
+    b4 = str(sig.get("btc_4h", "FLAT")).upper(); b1 = str(sig.get("btc_1h", "FLAT")).upper()
+    if up:
+        full = (b4 == "UP" and b1 == "UP"); anti = (b4 == "DOWN" and b1 == "DOWN")
+    else:
+        full = (b4 == "DOWN" and b1 == "DOWN"); anti = (b4 == "UP" and b1 == "UP")
+    if full:
+        S += 15; out["notes"].append(f"BTC tam uyumlu (1H:{b1} 4H:{b4})")
+    elif anti:
+        if V11_REQUIRE_BTC_ALIGN:
+            out["red"].append(f"BTC tamamen ters (1H:{b1} 4H:{b4})")
+        else:
+            out["notes"].append(f"BTC ters (1H:{b1} 4H:{b4})")
+    else:
+        S += 8; out["notes"].append(f"BTC karışık (1H:{b1} 4H:{b4})")
+
+    out["score"] = round(S, 1)
+    if out["red"]:
+        out["verdict"] = "TERS" if out["reverse_hint"] else "RED"
+    elif S < V11_RESEARCH_MIN:
+        out["verdict"] = "RED"
+        out["red"].append(f"araştırma puanı {S:.0f} < {V11_RESEARCH_MIN:.0f}")
+    return out
 
 
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
@@ -5991,7 +6467,8 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     btc_1h = btc_bias.get("dir_1h", "FLAT")
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
-           "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob}
+           "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob,
+           "price_move_pct": gate["fomo"]}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
     fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k)) if V10_FIB_ENABLED else None
     if fib:
@@ -6008,8 +6485,24 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if score < V10_MIN_QUALITY:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
         return None
-    entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
+    # --- V11: CANLI GİRİŞ FİYATI -------------------------------------------
+    # Eski kod entry = son KAPANMIŞ 1H mumun kapanışıydı → 60 dakikaya kadar
+    # bayat. Bot 30 sn'de bir tarıyor, yani sinyal "1 saat önceki fiyattan"
+    # açılıyor, sonra CANLI fiyatla stop kontrol ediliyordu. Fiyat bu arada
+    # stopa doğru %1 gitmişse pozisyon daha doğarken yarı ölüydü.
+    closed_px = closes(k)[-1]
+    entry = closed_px
+    if V11_LIVE_ENTRY and safe_float(ob.get("mid")) > 0:
+        entry = safe_float(ob.get("mid"))
+        drift = abs(entry - closed_px) / closed_px * 100.0 if closed_px > 0 else 0.0
+        if drift > V11_MAX_DRIFT_PCT:
+            stats["v11_red_drift"] = int(stats.get("v11_red_drift", 0)) + 1
+            return None
+    a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
+            "closed_px":closed_px,"orderbook":ob,
+            "spread_bps":safe_float(ob.get("spread_bps")),
+            "range_break":bool(gate.get("range_break")),
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
             "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
@@ -6029,9 +6522,19 @@ def _v10_fmt(x):
     return f"{x:.6f}"
 
 
+# V11: confluence etiketi artık DÜRÜST. Eskiden puan > 0 ise ✅ basılıyordu;
+# VP ve CVD'nin taban puanı sıfırdan büyük olduğu için HER sinyalde "VP✅ CVD✅"
+# görünüyordu — 6 onaydan 4'ü sahteydi. Artık maksimumun %60'ı geçerse ✅.
+_V10_CONF_MAX = {"order_block":11.0,"fvg":8.0,"volume_profile":5.0,
+                 "cvd":5.0,"sweep":7.0,"orderbook":7.0}
+
+
 def build_v10_message(sig):
     p = sig["score_parts"]
-    tag = lambda key, lbl: f"{lbl}{'✅' if p.get(key,0) > 0 else '▫️'}"
+    def tag(key, lbl):
+        mx = _V10_CONF_MAX.get(key, 1.0); v = safe_float(p.get(key, 0))
+        m = "✅" if v >= mx*0.6 else ("➖" if v >= mx*0.25 else "▫️")
+        return f"{lbl}{m}"
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
                      tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
     fund = safe_float(sig.get("funding"))
@@ -6039,12 +6542,32 @@ def build_v10_message(sig):
     if sig.get("fib_zone"):
         fib_line = (f"Fib: derinlik %{round(safe_float(sig.get('fib_depth'))*100)} → "
                 f"{sig['fib_zone']} ({safe_float(sig.get('fib_bonus')):+.0f} puan)\n")
-    return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
+
+    tp_line = (f"TP1 {_v10_fmt(sig['tp1'])} (%{V11_TP1_PCT:g} · {sig.get('tp1_rr',0)}R · çık %50)\n"
+               f"TP2 {_v10_fmt(sig['tp2'])} (%{V11_TP2_PCT:g} · {sig.get('tp2_rr',0)}R · çık %30)\n"
+               f"TP3 {_v10_fmt(sig['tp3'])} (%{V11_TP3_PCT:g} · {sig.get('tp3_rr',0)}R · çık %20)\n"
+               if sig.get("tp_kaynak") == "%SABİT" else
+               f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr',1)}R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr',0)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr',0)}R %20) [{sig.get('tp_kaynak','ATR')}]\n")
+
+    rs = sig.get("research") or {}
+    res_line = ""
+    if rs:
+        notes = rs.get("notes", [])[:4]
+        res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 — ONAY\n"
+                    + "".join(f"   ✓ {n}\n" for n in notes))
+    news = (rs.get("news") or {}) if rs else {}
+    news_line = ""
+    if news and news.get("n"):
+        news_line = f"📰 Haber tonu: {news.get('label')} ({news.get('score'):+.1f}) — {news.get('n')} başlık\n"
+
+    return (f"🎯 {VERSION_NAME}\n🆕 V11 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
-            f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
-            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
+            f"{res_line}{news_line}"
+            f"Giriş: {_v10_fmt(sig['entry'])} (canlı) | spread {safe_float(sig.get('spread_bps')):.1f}bps\n"
+            f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
+            f"{tp_line}"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
@@ -6079,37 +6602,52 @@ def _v10_mem():
 
 
 def v10_open_paper(sig):
+    """V11 DÜZELTME: RR'ler artık sinyalden MİRAS ALINIYOR.
+    Eski kod sabit V10_TP1_RR/2/3 global değerlerini kopyalıyordu; FİB modunda
+    gerçek TP2 12.4R iken deftere 2.5R yazılıyordu → kazanç/kayıp muhasebesi
+    baştan yanlıştı."""
     mp = _v10_mem()
     mp["open"].append({
         "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
         "orig_stop":sig["stop"],"stop":sig["stop"],
         "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
-        "tp1_rr":V10_TP1_RR,"tp2_rr":V10_TP2_RR,"tp3_rr":V10_TP3_RR,
+        "tp1_rr":safe_float(sig.get("tp1_rr"), V10_TP1_RR),
+        "tp2_rr":safe_float(sig.get("tp2_rr"), V10_TP2_RR),
+        "tp3_rr":safe_float(sig.get("tp3_rr"), V10_TP3_RR),
         "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
         "score":sig["score"],"event":sig["event"],
+        "research":safe_float((sig.get("research") or {}).get("score")),
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
         "open_ts":time.time(),"candle_ts":sig["candle_ts"]})
 
 
-def v10_check_paper(pos, price):
+def v10_check_paper(pos, price, hi=None, lo=None):
+    """V11 DÜZELTME: dolumlar artık mumun FİTİLLERİNE bakıyor.
+    Eski kod sadece anlık kapanışa bakıyordu; mum içinde stopa değip dönen ya da
+    TP1'i teğet geçen hareketler defterde hiç görünmüyordu. Aynı mumda hem stop
+    hem TP1 dokunulmuşsa hangisinin önce olduğunu bilemeyiz → temkinli kural:
+    STOP önce sayılır. Defter böylece iyimser değil, gerçekçi olur."""
     side = pos["side"]; e = pos["entry"]; w = {"tp1":0.5,"tp2":0.3,"tp3":0.2}
+    hi = safe_float(hi) if hi else safe_float(price)
+    lo = safe_float(lo) if lo else safe_float(price)
+    hi = max(hi, safe_float(price)); lo = min(lo, safe_float(price))
     if side == "LONG":
-        if not pos["hit1"] and price <= pos["orig_stop"]: return -1.0, "STOP"
-        if pos["hit1"] and price <= e: return pos["realized"], "BE"
-        if not pos["hit1"] and price >= pos["tp1"]:
+        if not pos["hit1"] and lo <= pos["orig_stop"]: return -1.0, "STOP"
+        if pos["hit1"] and lo <= e: return pos["realized"], "BE"
+        if not pos["hit1"] and hi >= pos["tp1"]:
             pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
-        if pos["hit1"] and not pos["hit2"] and price >= pos["tp2"]:
+        if pos["hit1"] and not pos["hit2"] and hi >= pos["tp2"]:
             pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
-        if pos["hit2"] and not pos["hit3"] and price >= pos["tp3"]:
+        if pos["hit2"] and not pos["hit3"] and hi >= pos["tp3"]:
             pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
     else:
-        if not pos["hit1"] and price >= pos["orig_stop"]: return -1.0, "STOP"
-        if pos["hit1"] and price >= e: return pos["realized"], "BE"
-        if not pos["hit1"] and price <= pos["tp1"]:
+        if not pos["hit1"] and hi >= pos["orig_stop"]: return -1.0, "STOP"
+        if pos["hit1"] and hi >= e: return pos["realized"], "BE"
+        if not pos["hit1"] and lo <= pos["tp1"]:
             pos["hit1"]=True; pos["realized"]+=w["tp1"]*pos["tp1_rr"]; pos["stop"]=e
-        if pos["hit1"] and not pos["hit2"] and price <= pos["tp2"]:
+        if pos["hit1"] and not pos["hit2"] and lo <= pos["tp2"]:
             pos["hit2"]=True; pos["realized"]+=w["tp2"]*pos["tp2_rr"]
-        if pos["hit2"] and not pos["hit3"] and price <= pos["tp3"]:
+        if pos["hit2"] and not pos["hit3"] and lo <= pos["tp3"]:
             pos["hit3"]=True; pos["realized"]+=w["tp3"]*pos["tp3_rr"]; return pos["realized"], "TP3"
     return None, None
 
@@ -6153,15 +6691,110 @@ def v10_cooldown_ok(symbol):
     return time.time() - v10_last_alert.get(symbol, 0) >= V10_ALERT_COOLDOWN_MIN*60
 
 
+# ---------------------------------------------------------------------------
+#  V11 TEKRAR KİLİDİ
+#  27-28 Tem defteri: TRUST 4 kez, VANA 2 kez sinyal aldı; TRUST'ın 4'ü de
+#  aynı fikirden aynı stopa gitti (-4R). Tek bir yanlış fikir dört kez
+#  cezalandırdı. Aşağıdaki 5 kapı bunu kesin olarak bitirir.
+# ---------------------------------------------------------------------------
+def v11_register_stop(symbol: str, side: str) -> None:
+    g = _v11_box()
+    g["box"][symbol] = {"ts": time.time(), "side": side}
+
+
+def v11_repeat_block(symbol: str, side: str) -> Optional[str]:
+    g = _v11_box(); now = time.time()
+    mp = _v10_mem()
+
+    # 1) Aynı coinde açık pozisyon varsa asla ikinci kez girme
+    if V11_BLOCK_IF_OPEN:
+        for pos in mp.get("open", []):
+            if pos.get("symbol") == symbol:
+                return f"açık pozisyon var ({pos.get('side')})"
+
+    # 2) Ceza kutusu: stop yiyen coin bekler, aynı yön daha uzun bekler
+    box = (g.get("box") or {}).get(symbol)
+    if box:
+        age_h = (now - safe_float(box.get("ts"))) / 3600.0
+        limit = V11_STOP_BOX_SAME_SIDE_HOURS if box.get("side") == side else V11_STOP_BOX_HOURS
+        if age_h < limit:
+            return f"ceza kutusu ({age_h:.1f}/{limit:.0f}sa, son stop {box.get('side')})"
+
+    # 3) Günlük sinyal tavanı
+    day = tr_day_key()
+    dk = f"{day}:{symbol}"
+    cnt = int(safe_float((g.get("daily") or {}).get(dk, 0)))
+    if cnt >= V11_MAX_SIGNALS_PER_COIN_DAY:
+        return f"günlük tavan ({cnt}/{V11_MAX_SIGNALS_PER_COIN_DAY})"
+
+    # 4) Yeniden giriş bekleme süresi (saat bazlı, mum bazlı değil)
+    last = safe_float((g.get("last_signal") or {}).get(symbol, 0))
+    if last > 0 and (now - last) / 3600.0 < V11_REENTRY_HOURS:
+        return f"yeniden giriş beklemesi ({(now-last)/3600.0:.1f}/{V11_REENTRY_HOURS:.0f}sa)"
+
+    # 5) Defter doluysa sinyal gönderme (hayalet sinyal önleme):
+    #    aksi halde Telegram'a gider ama paper'a yazılmaz → tekrar koruması körleşir
+    if V11_BLOCK_WHEN_BOOK_FULL and len(mp.get("open", [])) >= V10_MAX_OPEN:
+        return f"defter dolu ({len(mp.get('open', []))}/{V10_MAX_OPEN})"
+    return None
+
+
+def v11_mark_sent(symbol: str) -> None:
+    g = _v11_box()
+    g.setdefault("last_signal", {})[symbol] = time.time()
+    dk = f"{tr_day_key()}:{symbol}"
+    d = g.setdefault("daily", {})
+    d[dk] = int(safe_float(d.get(dk, 0))) + 1
+    # eski günleri temizle
+    if len(d) > 400:
+        today = tr_day_key()
+        for k_ in [x for x in d if not x.startswith(today)]:
+            d.pop(k_, None)
+
+
 async def maybe_send_v10_signal(sig):
     if not sig:
         return
     symbol = sig["symbol"]; side = sig["direction"]
-    ckey = f"{symbol}:{side}"
-    if v10_sent_candle.get(ckey) == sig["candle_ts"]:
+    if v10_sent_candle.get(symbol) == sig["candle_ts"]:
+        return
+
+    # --- V11 tekrar kilidi ---
+    block = v11_repeat_block(symbol, side)
+    if block:
+        stats["v11_red_tekrar"] = int(stats.get("v11_red_tekrar", 0)) + 1
+        logger.info("V11 TEKRAR BLOK %s %s → %s", side, symbol, block)
         return
     if not v10_cooldown_ok(symbol):
         return
+
+    # --- V11 derin araştırma kapısı ---
+    try:
+        k1h_r = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
+        research = await v11_deep_research(sig, _s_closed(k1h_r))
+    except Exception as e:
+        logger.warning("V11 araştırma hata %s: %s", symbol, e)
+        research = {"score": 0, "notes": [], "red": [f"araştırma hatası: {e}"], "verdict": "RED"}
+
+    if research["verdict"] != "ONAY":
+        stats["v11_red_arastirma"] = int(stats.get("v11_red_arastirma", 0)) + 1
+        stats["v11_son_red"] = f"{side} {symbol}: " + "; ".join(research.get("red", [])[:2])
+        if research["verdict"] == "TERS":
+            stats["v11_ters_aday"] = int(stats.get("v11_ters_aday", 0)) + 1
+            await safe_send_telegram(
+                f"🔄 V11 TERS HABER UYARISI — {symbol}\n"
+                f"Planlanan yön: {side} (skor {sig['score']})\n"
+                f"Haber tonu bu yönün TAM TERSİ: "
+                f"{(research.get('news') or {}).get('label','?')} "
+                f"({(research.get('news') or {}).get('score',0):+.1f})\n"
+                f"→ {side} sinyali İPTAL edildi.\n"
+                f"Ters yön ({'SHORT' if side=='LONG' else 'LONG'}) ancak yapı da onaylarsa "
+                f"ayrı sinyal olarak gelir — haber tek başına yön değiştirmez.")
+        logger.info("V11 ARAŞTIRMA RED %s %s (%s) → %s", side, symbol,
+                    research.get("score"), "; ".join(research.get("red", [])[:2]))
+        return
+
+    sig["research"] = research
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
@@ -6171,15 +6804,15 @@ async def maybe_send_v10_signal(sig):
     )
     if ok:
         v10_last_alert[symbol] = time.time()
-        v10_sent_candle[ckey] = sig["candle_ts"]
-        mp = _v10_mem()
-        if len(mp["open"]) < V10_MAX_OPEN:
-            v10_open_paper(sig)
+        v10_sent_candle[symbol] = sig["candle_ts"]
+        v11_mark_sent(symbol)
+        v10_open_paper(sig)      # V11: defter dolu ise zaten yukarıda bloklandı
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
-        stats["last_signal"] = f"V10 {side} {symbol} skor {sig['score']}"
-        logger.info("V10 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
+        stats["last_signal"] = f"V11 {side} {symbol} skor {sig['score']} (arş {research['score']})"
+        logger.info("V11 SİNYAL GÖNDERİLDİ %s %s skor=%s arş=%s", side, symbol,
+                    sig["score"], research["score"])
     else:
-        logger.warning("V10 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
+        logger.warning("V11 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
 
 
 async def v10_scan_loop() -> None:
@@ -6226,7 +6859,9 @@ async def v10_paper_loop() -> None:
                 if not k:
                     still.append(pos); continue
                 was1, was2 = pos["hit1"], pos["hit2"]
-                R, oc = v10_check_paper(pos, closes(k)[-1])
+                last = k[-1]
+                R, oc = v10_check_paper(pos, closes(k)[-1],
+                                        safe_float(last[2]), safe_float(last[3]))
                 if not oc:
                     if pos["hit1"] and not was1:
                         await safe_send_telegram(
@@ -6240,6 +6875,8 @@ async def v10_paper_loop() -> None:
                     still.append(pos)
                     continue
                 v10_record_closed(pos, R, oc)
+                if oc == "STOP":
+                    v11_register_stop(pos["symbol"], pos["side"])   # V11 ceza kutusu
                 exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp3"] if oc == "TP3" else pos["entry"])
                 await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
                 logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
@@ -6263,8 +6900,32 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
         f"4H filtre: {V10_USE_4H_FILTER} | Orderbook: {V10_USE_ORDERBOOK} | Öğrenen: {V10_LEARN_AUTO_ADJUST}",
-        f"RSI filtre: LONG max {int(V10_RSI_LONG_MAX)} | SHORT min {int(V10_RSI_SHORT_MIN)}",
+        f"RSI filtre: LONG max {int(V10_RSI_LONG_MAX)} | SHORT min {int(V10_RSI_SHORT_MIN)}"
+        + (f"  ⚠️ V11 düzeltti: {_V11_RSI_NOTE}" if _V11_RSI_NOTE else ""),
+        "",
+        "— V11 kapıları —",
+        f"Hedef modu: {V11_TARGET_MODE} (stop %{V11_STOP_PCT:g} | TP1 %{V11_TP1_PCT:g} | TP2 %{V11_TP2_PCT:g} | TP3 %{V11_TP3_PCT:g})",
+        f"Araştırma: {'AÇIK' if V11_RESEARCH_ENABLED else 'KAPALI'} (min {int(V11_RESEARCH_MIN)}/100) | "
+        f"Haber filtresi: {'AÇIK' if V11_NEWS_FILTER else 'KAPALI'} | Ters sinyal: {'AÇIK' if V11_NEWS_REVERSE else 'KAPALI'}",
+        f"Tekrar kilidi: açıkta blok={V11_BLOCK_IF_OPEN} | yeniden giriş {V11_REENTRY_HOURS:g}sa | "
+        f"ceza kutusu {V11_STOP_BOX_HOURS:g}sa (aynı yön {V11_STOP_BOX_SAME_SIDE_HOURS:g}sa) | "
+        f"günlük tavan {V11_MAX_SIGNALS_PER_COIN_DAY}",
+        f"Yapı: RANGE kırılım bloğu={V11_BLOCK_RANGE_BOS} | CHoCH sweep şartı={V11_CHOCH_NEEDS_CONFIRM} | BTC uyum şartı={V11_REQUIRE_BTC_ALIGN}",
+        f"Red sayaçları: tekrar={int(stats.get('v11_red_tekrar',0))} araştırma={int(stats.get('v11_red_arastirma',0))} "
+        f"range={int(stats.get('v11_red_range',0))} choch={int(stats.get('v11_red_choch',0))} drift={int(stats.get('v11_red_drift',0))}",
     ]
+    if stats.get("v11_son_red"):
+        lines.append(f"Son red: {stats.get('v11_son_red')}")
+    box = (memory.get("v11_guard") or {}).get("box") or {}
+    if box:
+        aktif = []
+        for sym, b in list(box.items())[:8]:
+            age = (time.time() - safe_float(b.get("ts")))/3600.0
+            lim = V11_STOP_BOX_SAME_SIDE_HOURS if b.get("side") else V11_STOP_BOX_HOURS
+            if age < lim:
+                aktif.append(f"{sym}({b.get('side')} {age:.0f}/{lim:.0f}sa)")
+        if aktif:
+            lines.append("Ceza kutusu: " + ", ".join(aktif))
     rep = v10_learn_report()
     if rep:
         lines.append("— Setup EV —")
