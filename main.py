@@ -14,9 +14,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11.0 (SMC + Derin Araştırma + Sabit %TP + Haber Filtresi)"
+VERSION_NAME = "Balina Avcısı V12.0 (Canlı WS: Gerçek CVD + Spoofing + Balina Baskısı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V11.0")
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.0")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5634,6 +5634,13 @@ async def post_init(application) -> None:
     asyncio.create_task(save_loop())
     asyncio.create_task(v10_scan_loop())
     asyncio.create_task(v10_paper_loop())
+    if V12_WS_ENABLED:
+        asyncio.create_task(v12_ws_loop())
+        if not _V12_WS_OK:
+            await safe_send_telegram(
+                "⚠️ Canlı WS katmanı başlatılamadı: 'websockets' kütüphanesi yok.\n"
+                "requirements.txt'e 'websockets' ekleyip yeniden deploy et.\n"
+                "O zamana kadar CVD proxy ile çalışıyor — sinyal kaybı yok, /ws ile kontrol et.")
     logger.info("Arka plan döngüleri başlatıldı")
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5831,6 +5838,450 @@ V11_NEWS_FILTER      = os.getenv("V11_NEWS_FILTER", "true").lower() == "true"
 V11_NEWS_BLOCK_SCORE = float(os.getenv("V11_NEWS_BLOCK_SCORE", "2"))  # ters haber gücü >= bu ise sinyal iptal
 V11_NEWS_REVERSE     = os.getenv("V11_NEWS_REVERSE", "false").lower() == "true"  # ters haberde ters sinyal ARA (yapı da onaylarsa)
 V11_NEWS_REVERSE_MIN = float(os.getenv("V11_NEWS_REVERSE_MIN", "3"))
+
+# --- V11.1 ERKEN TETİK -----------------------------------------------------
+# Ölçüm: kod tetik mumunun TAM KAPANMASINI bekliyor. 1H'de bu, kırılım
+# hareketinin tamamı bittikten sonra sinyal demek. Sentetik testte kırılım
+# mumu %1.35 hareket etti ve sinyal ancak o mum kapanınca çıktı — %2 stop
+# bütçesinin üçte ikisi girmeden gitmişti. Erken tetik, seviyeyi KAPALI 1H
+# mumlarından alır ama tetiği OLUŞAN 1H mumu + kapalı 15m teyidiyle verir.
+V11_EARLY_TRIGGER    = os.getenv("V11_EARLY_TRIGGER", "true").lower() == "true"
+V11_LTF_CONFIRM_TF   = os.getenv("V11_LTF_CONFIRM_TF", "15m").strip()
+V11_LTF_CONFIRM_BARS = int(float(os.getenv("V11_LTF_CONFIRM_BARS", "2")))
+
+# --- V11.1 BALİNA GÖZÜ (V10/V11 motoruna bağlanıyor) -----------------------
+V11_WHALE_EYE        = os.getenv("V11_WHALE_EYE", "true").lower() == "true"
+V11_WHALE_VETO       = os.getenv("V11_WHALE_VETO", "true").lower() == "true"
+
+# --- V11.1 GRAFİK OKUYUCU --------------------------------------------------
+V11_CHART_READER     = os.getenv("V11_CHART_READER", "true").lower() == "true"
+V11_CHART_VETO       = os.getenv("V11_CHART_VETO", "true").lower() == "true"
+
+# ============================================================================ #
+#  V12.0 — CANLI WEBSOCKET KATMANI (OKX public /ws/v5/public)
+#
+#  NEDEN: V11'e kadar "CVD" mum yönü × hacim PROXY'siydi ve "spoofing" diye bir
+#  şey yoktu, sadece anlık emir defteri duvarı vardı. İkisi de REST ile
+#  ölçülemez. Gerçeği için tick verisi şart:
+#    • trades kanalı → her işlemin TAKER yönü → HAKİKİ CVD
+#    • books5 kanalı → 100ms defter fotoğrafı → duvarların ÖMRÜ → spoofing
+#
+#  TASARIM KURALI: WS bir EK'tir, bağımlılık değil. Bağlantı yoksa, kütüphane
+#  yoksa, sembol abone değilse — bot eski proxy ile çalışmaya devam eder.
+#  Hiçbir sinyal WS yüzünden kaybolmaz.
+#
+#  DOĞRULANMIŞ SPESİFİKASYON (OKX v5, Tem 2026):
+#    - URL: wss://ws.okx.com:8443/ws/v5/public — public kanallar login İSTEMEZ
+#    - trades: {instId, tradeId, px, sz, side, ts} — side = TAKER yönü
+#    - books5: top 5 seviye anlık fotoğraf, 100ms, checksum yok
+#    - books-l2-tbt/books50-l2-tbt VIP4-5 + login ister → BİZE KAPALI
+#    - 30 sn veri gelmezse bağlantı düşer → 'ping' gönder, 'pong' bekle
+#    - Bağlantı limiti 3/sn (IP) | abone/çıkış limiti 480/saat (bağlantı)
+# ============================================================================ #
+try:
+    import websockets as _ws_lib
+    _V12_WS_OK = True
+except ImportError:
+    _ws_lib = None
+    _V12_WS_OK = False
+
+V12_WS_ENABLED       = os.getenv("V12_WS_ENABLED", "true").lower() == "true"
+V12_WS_URL           = os.getenv("V12_WS_URL", "wss://ws.okx.com:8443/ws/v5/public").strip()
+V12_WS_MAX_SYMBOLS   = int(float(os.getenv("V12_WS_MAX_SYMBOLS", "40")))
+V12_WS_TRADES        = os.getenv("V12_WS_TRADES", "true").lower() == "true"
+V12_WS_BOOKS         = os.getenv("V12_WS_BOOKS", "true").lower() == "true"
+V12_WS_PING_SEC      = float(os.getenv("V12_WS_PING_SEC", "20"))
+V12_WS_STALE_SEC     = float(os.getenv("V12_WS_STALE_SEC", "45"))
+V12_WS_HOTLIST_SEC   = float(os.getenv("V12_WS_HOTLIST_SEC", "180"))
+
+# CVD pencereleri (saniye)
+V12_CVD_WINDOWS      = (300, 900, 3600)
+V12_TRADE_KEEP       = int(float(os.getenv("V12_TRADE_KEEP", "4000")))   # sembol başına tutulan işlem
+V12_WHALE_MULT       = float(os.getenv("V12_WHALE_MULT", "8"))           # medyan işlemin kaç katı = balina baskısı
+V12_MIN_TRADES       = int(float(os.getenv("V12_MIN_TRADES", "40")))     # bu sayının altında CVD'ye güvenme
+
+# Spoofing
+V12_WALL_MULT        = float(os.getenv("V12_WALL_MULT", "3.5"))          # seviye ortalamasının kaç katı = duvar
+V12_SPOOF_MAX_LIFE   = float(os.getenv("V12_SPOOF_MAX_LIFE_SEC", "90"))  # bu süreden kısa yaşayıp kaybolan duvar
+V12_SPOOF_WINDOW     = float(os.getenv("V12_SPOOF_WINDOW_SEC", "900"))   # spoof olaylarının sayıldığı pencere
+V12_SPOOF_MIN_N      = int(float(os.getenv("V12_SPOOF_MIN_N", "3")))     # anlamlı sayılacak min spoof adedi
+
+V12_SCORE_ENABLED    = os.getenv("V12_SCORE_ENABLED", "true").lower() == "true"
+
+from collections import deque as _deque
+
+_v12_state: Dict[str, Any] = {
+    "connected": False, "last_msg_ts": 0.0, "conn_ts": 0.0,
+    "reconnects": 0, "msgs": 0, "trades": 0, "books": 0, "errors": 0,
+    "subs": set(), "last_error": "", "sub_calls": 0,
+}
+_v12_flow: Dict[str, Any] = {}    # symbol -> {"tr": deque, "med": float}
+_v12_book: Dict[str, Any] = {}    # symbol -> {"walls": {}, "spoofs": deque, "bb":, "ba":}
+
+
+def _v12_ct_val(symbol: str) -> float:
+    """Kontrat çarpanı (varsa). Yoksa 1.0 — CVD oransal olduğu için kritik değil."""
+    try:
+        cached = instrument_cache.get("okx_instruments")
+        if cached:
+            row = (cached[1] or {}).get(normalize_symbol(symbol)) or {}
+            v = safe_float(row.get("ctVal"))
+            return v if v > 0 else 1.0
+    except Exception:
+        pass
+    return 1.0
+
+
+# --------------------------------------------------------------- TRADE AKIŞI
+def v12_on_trades(symbol: str, rows: List[Dict[str, Any]]) -> None:
+    """trades kanalı → hakiki alıcı/satıcı hacmi. side = TAKER yönü."""
+    f = _v12_flow.setdefault(symbol, {"tr": _deque(maxlen=V12_TRADE_KEEP), "med": 0.0})
+    ct = _v12_ct_val(symbol)
+    for r in rows:
+        px = safe_float(r.get("px")); sz = safe_float(r.get("sz"))
+        if px <= 0 or sz <= 0:
+            continue
+        ts = safe_float(r.get("ts")) / 1000.0 or time.time()
+        notional = px * sz * ct
+        buy = str(r.get("side", "")).lower() == "buy"
+        f["tr"].append((ts, notional, buy, px))
+        _v12_state["trades"] += 1
+    n = len(f["tr"])
+    if n >= 20:
+        vals = sorted(x[1] for x in f["tr"])
+        f["med"] = vals[n // 2]
+
+
+def v12_cvd(symbol: str, window_sec: float = 900) -> Optional[Dict[str, Any]]:
+    """HAKİKİ CVD: taker alım hacmi − taker satım hacmi.
+    Dönen None ise veri yok → çağıran taraf proxy'e düşer."""
+    f = _v12_flow.get(symbol)
+    if not f or not f["tr"]:
+        return None
+    kes = time.time() - window_sec
+    al = sat = 0.0; n = 0; buyn = 0
+    for ts, notional, buy, _px in f["tr"]:
+        if ts < kes:
+            continue
+        n += 1
+        if buy: al += notional; buyn += 1
+        else:   sat += notional
+    if n < V12_MIN_TRADES:
+        return None
+    tot = al + sat
+    return {"cvd": al - sat, "buy": al, "sell": sat, "n": n,
+            "oran": ((al - sat) / tot) if tot > 0 else 0.0,
+            "buy_pct": (buyn / n * 100.0) if n else 0.0, "window": window_sec}
+
+
+def v12_whale_prints(symbol: str, window_sec: float = 900) -> Optional[Dict[str, Any]]:
+    """Balina baskısı: medyanın V12_WHALE_MULT katından büyük TEK işlemler.
+    Bunlar kurumsal iz — mum grafiğinde asla görünmezler."""
+    f = _v12_flow.get(symbol)
+    if not f or not f["tr"] or f["med"] <= 0:
+        return None
+    esik = f["med"] * V12_WHALE_MULT
+    kes = time.time() - window_sec
+    al = sat = 0.0; na = ns = 0; enb = 0.0; enb_buy = None
+    for ts, notional, buy, _px in f["tr"]:
+        if ts < kes or notional < esik:
+            continue
+        if buy: al += notional; na += 1
+        else:   sat += notional; ns += 1
+        if notional > enb:
+            enb = notional; enb_buy = buy
+    if na + ns == 0:
+        return {"n": 0, "al": 0.0, "sat": 0.0, "baski": 0.0, "esik": esik, "en_buyuk": 0.0}
+    tot = al + sat
+    return {"n": na + ns, "na": na, "ns": ns, "al": al, "sat": sat,
+            "baski": ((al - sat) / tot) if tot > 0 else 0.0,
+            "esik": esik, "en_buyuk": enb, "en_buyuk_al": enb_buy}
+
+
+# --------------------------------------------------------- DEFTER / SPOOFING
+def v12_on_book(symbol: str, row: Dict[str, Any]) -> None:
+    """books5 fotoğrafı → duvarların doğuşu/ölümü izlenir.
+    SPOOF tanımı: büyük bir duvar belirir, fiyat ona HİÇ DEĞMEDEN kısa sürede
+    yok olur. Fiyat değip yok olduysa gerçekten yenmiştir — spoof değildir."""
+    b = _v12_book.setdefault(symbol, {"walls": {}, "spoofs": _deque(maxlen=200),
+                                      "bb": 0.0, "ba": 0.0, "snap": 0})
+    bids = row.get("bids") or []; asks = row.get("asks") or []
+    if not bids or not asks:
+        return
+    now = time.time(); b["snap"] += 1
+    try:
+        bb = safe_float(bids[0][0]); ba = safe_float(asks[0][0])
+    except (IndexError, TypeError):
+        return
+    if bb <= 0 or ba <= 0:
+        return
+    b["bb"] = bb; b["ba"] = ba
+
+    simdi = {}
+    for taraf, seviyeler in (("bid", bids), ("ask", asks)):
+        boy = [safe_float(x[1]) for x in seviyeler if len(x) >= 2]
+        if not boy:
+            continue
+        ort = sum(boy) / len(boy)
+        if ort <= 0:
+            continue
+        for lv in seviyeler:
+            if len(lv) < 2:
+                continue
+            px = safe_float(lv[0]); sz = safe_float(lv[1])
+            if px <= 0 or sz <= ort * V12_WALL_MULT:
+                continue
+            simdi[(taraf, f"{px:.10g}")] = (px, sz)
+
+    duvarlar = b["walls"]
+    # var olanları güncelle / yenileri kaydet
+    for key, (px, sz) in simdi.items():
+        w = duvarlar.get(key)
+        if w is None:
+            duvarlar[key] = {"px": px, "max_sz": sz, "ilk": now, "son": now, "degdi": False}
+        else:
+            w["son"] = now; w["max_sz"] = max(w["max_sz"], sz)
+    # fiyat duvara değdi mi? (bid duvarına en iyi alış inerse, ask duvarına en iyi satış çıkarsa)
+    for key, w in duvarlar.items():
+        taraf = key[0]
+        if taraf == "bid" and bb <= w["px"]:
+            w["degdi"] = True
+        elif taraf == "ask" and ba >= w["px"]:
+            w["degdi"] = True
+    # kaybolanları değerlendir
+    for key in [k for k in duvarlar if k not in simdi]:
+        w = duvarlar.pop(key)
+        omur = w["son"] - w["ilk"]
+        if (not w["degdi"]) and omur <= V12_SPOOF_MAX_LIFE:
+            b["spoofs"].append({"ts": now, "taraf": key[0], "px": w["px"],
+                                "sz": w["max_sz"], "omur": round(omur, 1)})
+    _v12_state["books"] += 1
+
+
+def v12_spoof(symbol: str) -> Optional[Dict[str, Any]]:
+    """Son pencerede kaç sahte duvar çekildi, hangi tarafta?
+    YORUM (belirsizliğiyle birlikte): ask tarafında sahte satış duvarları =
+    birileri fiyatı bastırıp ucuza topluyor olabilir (hafif boğa). Bid
+    tarafında sahte alış duvarları = talep şişirip dağıtıyor olabilir
+    (hafif ayı). Bu çıkarım kesin değildir; sadece bir ipucudur."""
+    b = _v12_book.get(symbol)
+    if not b or b.get("snap", 0) < 50:
+        return None
+    kes = time.time() - V12_SPOOF_WINDOW
+    bid_n = ask_n = 0
+    for s in b["spoofs"]:
+        if s["ts"] < kes:
+            continue
+        if s["taraf"] == "bid": bid_n += 1
+        else: ask_n += 1
+    tot = bid_n + ask_n
+    if tot < V12_SPOOF_MIN_N:
+        return {"bid": bid_n, "ask": ask_n, "n": tot, "egilim": "YOK", "not": ""}
+    if ask_n >= bid_n * 2:
+        eg, nt = "BOĞA İPUCU", f"{ask_n} sahte SATIŞ duvarı çekildi — fiyat baskılanıp toplanıyor olabilir"
+    elif bid_n >= ask_n * 2:
+        eg, nt = "AYI İPUCU", f"{bid_n} sahte ALIŞ duvarı çekildi — talep şişirilip dağıtılıyor olabilir"
+    else:
+        eg, nt = "KARIŞIK", f"iki tarafta da sahte duvar ({bid_n} alış / {ask_n} satış) — oyun var, yön belirsiz"
+    return {"bid": bid_n, "ask": ask_n, "n": tot, "egilim": eg, "not": nt}
+
+
+# ------------------------------------------------------- MESAJ İŞLEYİCİ (saf)
+def v12_handle_message(raw: str) -> str:
+    """Tek WS mesajını işler. SAF fonksiyon — testte gerçek OKX formatıyla
+    doğrulanabilsin diye ağdan ayrıldı. Dönen: işlenen kanal adı ya da ''."""
+    if not raw:
+        return ""
+    if raw == "pong":
+        _v12_state["last_msg_ts"] = time.time(); return "pong"
+    try:
+        m = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    _v12_state["last_msg_ts"] = time.time(); _v12_state["msgs"] += 1
+    if m.get("event"):
+        ev = m.get("event")
+        if ev == "error":
+            _v12_state["errors"] += 1
+            _v12_state["last_error"] = f"{m.get('code')}: {m.get('msg')}"
+            logger.warning("V12 WS hata: %s", _v12_state["last_error"])
+        elif ev == "subscribe":
+            arg = m.get("arg") or {}
+            _v12_state["subs"].add(f"{arg.get('channel')}:{arg.get('instId')}")
+        elif ev == "unsubscribe":
+            arg = m.get("arg") or {}
+            _v12_state["subs"].discard(f"{arg.get('channel')}:{arg.get('instId')}")
+        return f"event:{ev}"
+    arg = m.get("arg") or {}
+    ch = str(arg.get("channel", "")); inst = normalize_symbol(str(arg.get("instId", "")))
+    data = m.get("data") or []
+    if not ch or not inst or not data:
+        return ""
+    try:
+        if ch == "trades":
+            v12_on_trades(inst, data); return "trades"
+        if ch in ("books5", "bbo-tbt"):
+            v12_on_book(inst, data[0]); return "books5"
+    except Exception as e:
+        _v12_state["errors"] += 1
+        logger.debug("V12 mesaj işleme hata %s/%s: %s", ch, inst, e)
+    return ""
+
+
+def v12_hotlist() -> List[str]:
+    """Hangi coinlere abone olalım? Sıra: açık pozisyonlar → son adaylar →
+    hacimli coinler. 480 abone/saat limitine takılmamak için sınırlı ve stabil."""
+    out: List[str] = []
+    try:
+        for p in (_v10_mem().get("open") or []):
+            s = normalize_symbol(p.get("symbol", ""))
+            if s and s not in out: out.append(s)
+    except Exception:
+        pass
+    for s in list(_v12_son_adaylar):
+        s = normalize_symbol(s)
+        if s and s not in out: out.append(s)
+    for s in list(COINS):
+        if len(out) >= V12_WS_MAX_SYMBOLS: break
+        s = normalize_symbol(s)
+        if s and s not in out: out.append(s)
+    return out[:V12_WS_MAX_SYMBOLS]
+
+
+_v12_son_adaylar: Any = _deque(maxlen=25)
+
+
+def v12_health() -> Dict[str, Any]:
+    st = _v12_state
+    yas = time.time() - st["last_msg_ts"] if st["last_msg_ts"] else 9e9
+    canli = bool(st["connected"] and yas < V12_WS_STALE_SEC)
+    return {"ok": canli, "kutuphane": _V12_WS_OK, "acik": st["connected"],
+            "son_mesaj_sn": round(yas, 1) if yas < 9e8 else None,
+            "abone": len(st["subs"]), "mesaj": st["msgs"], "islem": st["trades"],
+            "defter": st["books"], "yeniden_baglanma": st["reconnects"],
+            "hata": st["errors"], "son_hata": st["last_error"],
+            "sembol_akis": len(_v12_flow), "sembol_defter": len(_v12_book)}
+
+
+async def v12_ws_loop() -> None:
+    """Bağlantı yöneticisi: bağlan → abone ol → dinle → kopunca geri gel."""
+    if not (V12_WS_ENABLED and V12_WS_TRADES or V12_WS_BOOKS):
+        return
+    if not V12_WS_ENABLED:
+        return
+    if not _V12_WS_OK:
+        logger.warning("V12: 'websockets' kütüphanesi yok — canlı katman KAPALI. "
+                       "requirements.txt'e 'websockets' ekle. Bot proxy ile çalışmaya devam ediyor.")
+        return
+    await asyncio.sleep(8)
+    bekle = 2.0
+    while True:
+        try:
+            async with _ws_lib.connect(V12_WS_URL, ping_interval=None,
+                                       max_size=4 * 1024 * 1024) as ws:
+                _v12_state["connected"] = True
+                _v12_state["conn_ts"] = time.time()
+                _v12_state["last_msg_ts"] = time.time()
+                _v12_state["subs"] = set()
+                bekle = 2.0
+                logger.info("V12 WS bağlandı: %s", V12_WS_URL)
+
+                async def _abone(semboller, op="subscribe"):
+                    args = []
+                    for s in semboller:
+                        if V12_WS_TRADES: args.append({"channel": "trades", "instId": s})
+                        if V12_WS_BOOKS:  args.append({"channel": "books5", "instId": s})
+                    for i in range(0, len(args), 40):        # tek mesajda 40 arg
+                        await ws.send(json.dumps({"op": op, "args": args[i:i+40]}))
+                        _v12_state["sub_calls"] += 1
+                        await asyncio.sleep(0.4)             # 3 istek/sn IP limiti
+
+                mevcut = set(v12_hotlist())
+                await _abone(mevcut)
+
+                async def _ping():
+                    while True:
+                        await asyncio.sleep(V12_WS_PING_SEC)
+                        try: await ws.send("ping")
+                        except Exception: return
+
+                async def _hotlist():
+                    nonlocal mevcut
+                    while True:
+                        await asyncio.sleep(V12_WS_HOTLIST_SEC)
+                        yeni = set(v12_hotlist())
+                        ekle = yeni - mevcut; cikar = mevcut - yeni
+                        try:
+                            if cikar: await _abone(sorted(cikar), "unsubscribe")
+                            if ekle:  await _abone(sorted(ekle))
+                        except Exception:
+                            return
+                        for s in cikar:
+                            _v12_flow.pop(s, None); _v12_book.pop(s, None)
+                        mevcut = yeni
+
+                t1 = asyncio.create_task(_ping()); t2 = asyncio.create_task(_hotlist())
+                try:
+                    async for msg in ws:
+                        v12_handle_message(msg if isinstance(msg, str) else msg.decode("utf-8", "ignore"))
+                finally:
+                    t1.cancel(); t2.cancel()
+        except Exception as e:
+            _v12_state["errors"] += 1
+            _v12_state["last_error"] = str(e)[:180]
+            logger.warning("V12 WS koptu (%s) — %.0f sn sonra tekrar", str(e)[:90], bekle)
+        _v12_state["connected"] = False
+        _v12_state["reconnects"] += 1
+        await asyncio.sleep(bekle)
+        bekle = min(bekle * 1.8, 60.0)
+
+
+def v12_akis_oku(side: str, symbol: str) -> Dict[str, Any]:
+    """CVD + balina baskısı + spoofing'i tek okumada birleştirir.
+    Dönen puan -15..+20; veri yoksa 0 ve 'aktif=False' (proxy'e düş)."""
+    out = {"puan": 0.0, "notlar": [], "aktif": False, "veto": None}
+    if not (V12_WS_ENABLED and V12_SCORE_ENABLED) or not v12_health()["ok"]:
+        return out
+    up = (side == "LONG"); ham = 0.0
+
+    c = v12_cvd(symbol, 900)
+    if c:
+        out["aktif"] = True
+        uyum = c["oran"] if up else -c["oran"]
+        yon = "ALICI" if c["oran"] > 0 else "SATICI"
+        if uyum >= 0.15:
+            ham += 12.0; out["notlar"].append(f"📊 GERÇEK CVD {yon} baskın (oran {c['oran']:+.2f}, {c['n']} işlem) — pozisyonla uyumlu")
+        elif uyum <= -0.15:
+            ham -= 12.0; out["notlar"].append(f"📊 GERÇEK CVD {yon} baskın (oran {c['oran']:+.2f}, {c['n']} işlem) — pozisyona TERS")
+        else:
+            ham += 2.0; out["notlar"].append(f"📊 GERÇEK CVD dengeli (oran {c['oran']:+.2f}, {c['n']} işlem)")
+
+    w = v12_whale_prints(symbol, 900)
+    if w and w["n"] > 0:
+        out["aktif"] = True
+        uyum = w["baski"] if up else -w["baski"]
+        if uyum >= 0.25:
+            ham += 8.0; out["notlar"].append(f"🐳 {w['n']} balina baskısı, yön uyumlu (baskı {w['baski']:+.2f})")
+        elif uyum <= -0.25:
+            ham -= 10.0; out["notlar"].append(f"🐳 {w['n']} balina baskısı TERS yönde (baskı {w['baski']:+.2f})")
+        else:
+            out["notlar"].append(f"🐳 {w['n']} balina baskısı, yön karışık")
+
+    s = v12_spoof(symbol)
+    if s and s["n"] >= V12_SPOOF_MIN_N:
+        out["aktif"] = True
+        if s["egilim"] == "BOĞA İPUCU":
+            ham += (6.0 if up else -6.0)
+        elif s["egilim"] == "AYI İPUCU":
+            ham += (-6.0 if up else 6.0)
+        else:
+            ham -= 3.0
+        out["notlar"].append(f"🎭 SPOOFING: {s['not']}")
+
+    if ham <= -20:
+        out["veto"] = f"canlı akış yönü reddediyor (ham {ham:+.0f})"
+    out["puan"] = round(max(-15.0, min(20.0, ham)), 1)
+    return out
 
 # Ceza kutusu + günlük sayaç kalıcı hafızada tutulur
 def _v11_box():
@@ -6141,10 +6592,24 @@ def v10_quality_score(side, k, ms, ext):
     p["order_block"] = 11.0*v10_detect_order_block(side, k)
     p["fvg"] = 8.0*v10_detect_fvg(side, k)
     p["volume_profile"] = 5.0*v10_vp_score(side, safe_float(k[-1][4]), v10_volume_profile(k))
-    cv = v10_cvd_proxy(k)
-    p["cvd"] = 5.0*(1.0 if (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT") else 0.2)
+    # V12: mümkünse HAKİKİ CVD (WS trades kanalı, taker yönü), yoksa mum-yönü proxy.
+    gercek = v12_cvd(str(ext.get("symbol", "")), 900) if V12_WS_ENABLED else None
+    if gercek:
+        oran = gercek["oran"]
+        uyum = oran if side == "LONG" else -oran
+        p["cvd"] = 5.0*(1.0 if uyum >= 0.15 else 0.55 if uyum > -0.05 else 0.1)
+        p["cvd_kaynak"] = "WS"
+    else:
+        cv = v10_cvd_proxy(k)
+        p["cvd"] = 5.0*(1.0 if (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT") else 0.2)
+        p["cvd_kaynak"] = "proxy"
     p["sweep"] = 7.0*v10_detect_sweep(side, k, ms)
-    return round(sum(p.values()), 1), {kk: round(vv, 1) for kk, vv in p.items()}, round(r, 1)
+    # V12: p sözlüğü artık sayısal olmayan meta anahtar da taşıyabiliyor
+    # (cvd_kaynak = "WS"/"proxy"). Toplam ve yuvarlama sayısal olanlarla sınırlı.
+    toplam = sum(v for v in p.values() if isinstance(v, (int, float)))
+    parcalar = {kk: (round(vv, 1) if isinstance(vv, (int, float)) else vv)
+                for kk, vv in p.items()}
+    return round(toplam, 1), parcalar, round(r, 1)
 
 
 def v10_targets(side, entry, a, fib=None):
@@ -6223,8 +6688,12 @@ async def v10_fetch_orderbook(symbol):
         return blank
 
 
-def v10_structure_gate(symbol, k1h, k4h):
-    k = _s_closed(k1h)
+def v10_structure_gate(symbol, k1h, k4h, erken=False):
+    """erken=False → sadece KAPALI 1H mumları (klasik, 1 mum gecikmeli).
+    erken=True  → OLUŞAN 1H mumu da serinin içinde; tetik anında görülür.
+    Oluşan mum swing olamaz (find_swings son 2 barı zaten taramaz), yani
+    seviye yine kapalı yapıdan gelir; sadece KIRILIM/RETEST canlı okunur."""
+    k = k1h if erken else _s_closed(k1h)
     if len(k) < 40:
         return None
     ms = v10_market_structure(k)
@@ -6265,7 +6734,8 @@ def v10_structure_gate(symbol, k1h, k4h):
         pb, note = v10_pullback(side, k, ms)
         if not pb: continue
         return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),
-                "pullback":note,"k":k,"range_break":bool(ms.get("range_break"))}
+                "pullback":note,"k":k,"range_break":bool(ms.get("range_break")),
+                "erken":bool(erken),"lvl":safe_float(ms.get("event_level"))}
     return None
 
 
@@ -6439,6 +6909,36 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
     else:
         S += 8; out["notes"].append(f"BTC karışık (1H:{b1} 4H:{b4})")
 
+    # --- TEST 8/9: GRAFİK OKUYUCU (-15 .. +20) ------------------------------
+    grafik = v11_grafik_oku(side, k1h, sig.get("kirilan_seviye"))
+    out["grafik"] = grafik
+    S += grafik["puan"]
+    for n in grafik["notlar"]:
+        out["notes"].append(f"📈 {n}")
+    if grafik.get("veto"):
+        out["red"].append(grafik["veto"])
+
+    # --- TEST 9/9: BALİNA GÖZÜ (-15 .. +20) ---------------------------------
+    whale = v11_whale_eye(side, sig.get("oi_change_pct"), sig.get("fomo_move_pct"),
+                          sig.get("funding"), sig.get("orderbook"))
+    out["whale"] = whale
+    S += whale["puan"]
+    for n in whale["notlar"]:
+        out["notes"].append(n)
+    if whale.get("veto"):
+        out["red"].append(whale["veto"])
+
+    # --- EK TEST: CANLI AKIŞ (WS) — gerçek CVD + balina baskısı + spoofing ---
+    akis = v12_akis_oku(side, symbol)
+    out["akis"] = akis
+    if akis.get("aktif"):
+        S += akis["puan"]
+        for n in akis["notlar"]:
+            out["notes"].append(n)
+        if akis.get("veto"):
+            out["red"].append(akis["veto"])
+
+    S = max(0.0, min(100.0, S))
     out["score"] = round(S, 1)
     if out["red"]:
         out["verdict"] = "TERS" if out["reverse_hint"] else "RED"
@@ -6448,6 +6948,238 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
     return out
 
 
+
+# ============================================================================ #
+#  V11.1 GRAFİK OKUYUCU — "grafiği insan gibi gör"
+#  Bir trader grafiğe baktığında sayı değil ŞEKİL görür: seviyede çekiç mi
+#  var, yutan mum mu, fitiller nereye basıyor, RSI fiyatı doğruluyor mu,
+#  bu seviye kaç kez test edilmiş, hacim doruk yapmış mı.
+#  Buradaki fonksiyonlar tam olarak bunları okur ve TÜRKÇE cümleyle anlatır.
+# ============================================================================ #
+def _v11_mum(r):
+    o=safe_float(r[1]); h=safe_float(r[2]); l=safe_float(r[3]); c=safe_float(r[4])
+    govde=abs(c-o); menzil=max(h-l, 1e-12)
+    return {"o":o,"h":h,"l":l,"c":c,"govde":govde,"menzil":menzil,
+            "ust_fitil":h-max(o,c), "alt_fitil":min(o,c)-l,
+            "yesil":c>=o, "govde_oran":govde/menzil}
+
+
+def v11_mum_formasyonu(side, k):
+    """Son 2 mumdan insan gözüyle formasyon okur."""
+    if len(k) < 3: return 0.0, []
+    a=_v11_mum(k[-2]); b=_v11_mum(k[-1])
+    up=(side=="LONG"); puan=0.0; notlar=[]
+
+    # Çekiç / Ters çekiç (pin bar) — reddedilen seviye
+    if up and b["alt_fitil"] > b["govde"]*1.8 and b["alt_fitil"] > b["menzil"]*0.45:
+        puan += 8; notlar.append("aşağı uzun fitilli ÇEKİÇ — dip savunuluyor")
+    elif (not up) and b["ust_fitil"] > b["govde"]*1.8 and b["ust_fitil"] > b["menzil"]*0.45:
+        puan += 8; notlar.append("yukarı uzun fitilli TERS ÇEKİÇ — tepe satılıyor")
+
+    # Yutan mum (engulfing)
+    yutan = b["govde"] > a["govde"]*1.15 and max(b["o"],b["c"]) >= max(a["o"],a["c"]) \
+            and min(b["o"],b["c"]) <= min(a["o"],a["c"])
+    if yutan and b["yesil"] == up:
+        puan += 7; notlar.append(f"{'boğa' if up else 'ayı'} YUTAN MUM — yön devri net")
+    elif yutan and b["yesil"] != up:
+        puan -= 9; notlar.append(f"TERS yutan mum — {'alıcı' if not up else 'satıcı'} karşı atakta")
+
+    # Kararsızlık (doji) — seviyede istemeyiz
+    if b["govde_oran"] < 0.12:
+        puan -= 5; notlar.append("DOJİ — piyasa kararsız, yön teyidi yok")
+
+    # Momentum mumu: büyük gövde, doğru renk
+    if b["govde_oran"] > 0.65 and b["yesil"] == up:
+        puan += 6; notlar.append("geniş gövdeli momentum mumu — talep/arz tek taraflı")
+    elif b["govde_oran"] > 0.65 and b["yesil"] != up:
+        puan -= 8; notlar.append("geniş gövdeli TERS mum — pozisyona karşı baskı")
+    return puan, notlar
+
+
+def v11_fitil_baskisi(side, k, n=5):
+    """Son n mumun fitil dengesi: kim savunuyor, kim satıyor?"""
+    if len(k) < n+1: return 0.0, []
+    ust=alt=0.0
+    for r in k[-n:]:
+        m=_v11_mum(r); ust+=m["ust_fitil"]; alt+=m["alt_fitil"]
+    tot=ust+alt
+    if tot <= 0: return 0.0, []
+    oran=(alt-ust)/tot          # +1 = tamamen alt fitil (alıcı), -1 = üst (satıcı)
+    up=(side=="LONG")
+    uyum = oran if up else -oran
+    if uyum > 0.35:
+        return 6.0, [f"fitiller {'alıcıyı' if up else 'satıcıyı'} gösteriyor (denge {oran:+.2f})"]
+    if uyum < -0.35:
+        return -7.0, [f"fitiller TERS tarafa basıyor (denge {oran:+.2f})"]
+    return 0.0, [f"fitil dengesi nötr ({oran:+.2f})"]
+
+
+def v11_rsi_uyumsuzluk(side, k, bak=70):
+    """Klasik RSI diverjansı — GERÇEK pivotlardan okunur.
+    İlk sürüm pencereyi ikiye bölüp her yarının ucunu alıyordu; iki bacağı
+    30 mumdan uzun olan diverjanslar kaçıyordu. İnsan grafiğe bakarken de
+    yarım pencere değil, GÖRÜNEN İKİ DİP/TEPE'yi karşılaştırır — kod artık
+    öyle yapıyor: son iki swing pivotunda fiyat ile RSI'yi yan yana koyar."""
+    c = closes(k)
+    if len(c) < 40:
+        return 0.0, []
+    r = rsi(c)
+    seg = k[-bak:] if len(k) > bak else k
+    off = len(k) - len(seg)
+    sw = v10_find_swings(seg, 2, 2)
+    pts = [x for x in sw if x.kind == ("L" if side == "LONG" else "H")]
+    if len(pts) < 2:
+        return 0.0, []
+    # Son pivot ile karşılaştırılacak referans: art arda iki pivot DEĞİL —
+    # trader "bu dip, ÖNCEKİ ÖNEMLİ dibe göre nasıl?" diye bakar. Bu yüzden
+    # son pivottan en az 5 bar geride kalan pivotlar arasından EN UÇ olanı
+    # referans alıyoruz; yoksa düşen bir bacakta iki komşu dip hep alçalır ve
+    # hiçbir uyumsuzluk görünmez.
+    b = pts[-1]
+    onceki = [x for x in pts[:-1] if b.idx - x.idx >= 5]
+    if not onceki:
+        return 0.0, []
+    a = (min(onceki, key=lambda x: x.price) if side == "LONG"
+         else max(onceki, key=lambda x: x.price))
+    ia, ib = off + a.idx, off + b.idx
+    if ia >= len(r) or ib >= len(r):
+        return 0.0, []
+    if side == "LONG" and b.price < a.price and r[ib] > r[ia] + 2:
+        return 10.0, [f"BOĞA UYUMSUZLUĞU — fiyat daha dip ({a.price:.6g}→{b.price:.6g}) "
+                      f"ama RSI daha yüksek ({r[ia]:.0f}→{r[ib]:.0f}): satıcı gücü tükeniyor"]
+    if side == "SHORT" and b.price > a.price and r[ib] < r[ia] - 2:
+        return 10.0, [f"AYI UYUMSUZLUĞU — fiyat daha tepe ({a.price:.6g}→{b.price:.6g}) "
+                      f"ama RSI daha zayıf ({r[ia]:.0f}→{r[ib]:.0f}): alıcı gücü tükeniyor"]
+    return 0.0, []
+
+
+def v11_seviye_gucu(k, lvl, tol_pct=0.35):
+    """Bu seviye kaç kez test edilmiş? Çok test edilen seviyenin kırılması
+    daha anlamlıdır (arkasında birikmiş stop vardır)."""
+    if not lvl or lvl <= 0: return 0.0, []
+    tol=lvl*tol_pct/100.0; dokunus=0
+    for r in k[-80:]:
+        if safe_float(r[3]) - tol <= lvl <= safe_float(r[2]) + tol:
+            dokunus += 1
+    if dokunus >= 6: return 8.0, [f"seviye {dokunus} kez test edilmiş — arkasında yoğun stop birikimi"]
+    if dokunus >= 3: return 5.0, [f"seviye {dokunus} kez test edilmiş — anlamlı"]
+    if dokunus <= 1: return -4.0, [f"seviye sadece {dokunus} kez dokunulmuş — zayıf referans"]
+    return 2.0, [f"seviye {dokunus} kez test edilmiş"]
+
+
+def v11_hacim_doruk(side, k):
+    """Hacim doruğu: kırılımı besleyen mi, yoksa tükeniş mi?"""
+    if len(k) < 51: return 0.0, []
+    v=[safe_float(r[5]) for r in k[-51:-1]]
+    son=safe_float(k[-1][5]); ort=sum(v)/len(v) if v else 0
+    if ort <= 0: return 0.0, []
+    kat=son/ort
+    m=_v11_mum(k[-1]); up=(side=="LONG")
+    if kat >= 2.5 and m["govde_oran"] < 0.3:
+        return -6.0, [f"hacim x{kat:.1f} ama gövde küçük — TÜKENİŞ/absorbe riski"]
+    if kat >= 1.8 and m["yesil"] == up:
+        return 9.0, [f"hacim x{kat:.1f} ve mum doğru yönde — kırılım gerçek para ile"]
+    if kat < 0.6:
+        return -5.0, [f"hacim x{kat:.1f} — kırılım desteksiz, sahte olabilir"]
+    return 3.0, [f"hacim x{kat:.1f} normal"]
+
+
+def v11_grafik_oku(side, k, lvl=None):
+    """Tüm okumaları birleştirir. Dönen 'puan' -15..+20 aralığına sıkıştırılır."""
+    if not V11_CHART_READER or len(k) < 35:
+        return {"puan":0.0,"notlar":[],"veto":None,"ham":0.0}
+    ham=0.0; notlar=[]
+    for fn, arg in ((v11_mum_formasyonu,(side,k)), (v11_fitil_baskisi,(side,k)),
+                    (v11_rsi_uyumsuzluk,(side,k)), (v11_hacim_doruk,(side,k))):
+        p,n = fn(*arg); ham += p; notlar += n
+    p,n = v11_seviye_gucu(k, lvl); ham += p; notlar += n
+
+    veto=None
+    if V11_CHART_VETO and ham <= -15:
+        veto = f"grafik okuması yönü reddediyor (ham {ham:+.0f})"
+    puan = max(-15.0, min(20.0, ham))
+    return {"puan":round(puan,1),"notlar":notlar,"veto":veto,"ham":round(ham,1)}
+
+
+# ============================================================================ #
+#  V11.1 BALİNA GÖZÜ — artık V11 motoruna BAĞLI
+#  Bu fonksiyonlar dosyada zaten vardı (detect_whale_divergence /
+#  detect_funding_signal) ama SADECE eski hibrit/MA motorlarında ve /whale
+#  komutunda çağrılıyordu. V10/V11 sinyal motoru bunları hiç görmüyordu;
+#  sadece ham OI% ve funding sayısını puanlıyordu. Şimdi bağlandı.
+# ============================================================================ #
+def v11_whale_eye(side, oi_change_pct, price_move_pct, funding, ob=None):
+    out={"puan":0.0,"notlar":[],"veto":None,"tip":"YOK"}
+    if not V11_WHALE_EYE:
+        return out
+    up=(side=="LONG"); oi=safe_float(oi_change_pct); pm=safe_float(price_move_pct)
+    fr=safe_float(funding); ham=0.0
+
+    # 1) Balina diverjansı — dosyadaki eşiklerle aynı mantık
+    if pm >= WHALE_PRICE_FLAT_UP_MIN_PCT and oi <= WHALE_OI_BEARISH_DROP_PCT:
+        out["tip"]="AYI DİVERJANSI"
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} ama OI %{oi:+.2f} eriyor — long'lar kaçıyor")
+        ham += (-12.0 if up else 14.0)
+    elif pm <= WHALE_PRICE_FLAT_DOWN_MAX_PCT and oi >= WHALE_OI_BULLISH_RISE_PCT:
+        out["tip"]="BOĞA DİVERJANSI"
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} ama OI %{oi:+.2f} artıyor — sessiz birikim")
+        ham += (14.0 if up else -12.0)
+    elif (pm > 0 and oi > 0) or (pm < 0 and oi < 0):
+        out["tip"]="UYUMLU"
+        yon_ok = (pm > 0) == up
+        out["notlar"].append(f"🐋 fiyat ve OI aynı yönde (%{pm:+.2f}/%{oi:+.2f}) — "
+                             f"{'pozisyonla uyumlu' if yon_ok else 'pozisyona TERS trend'}")
+        ham += (8.0 if yon_ok else -10.0)
+    else:
+        out["tip"]="SESSİZ"; out["notlar"].append(f"🐋 balina hareketi yok (OI %{oi:+.2f})")
+
+    # 2) Funding ekstremi — kalabalığın tersi
+    if fr > FUNDING_BEARISH_THRESHOLD:
+        out["notlar"].append(f"💰 funding %{fr*100:+.4f}/8sa — long kalabalığı fazla ödüyor")
+        ham += (-8.0 if up else 9.0)
+    elif fr < FUNDING_BULLISH_THRESHOLD:
+        out["notlar"].append(f"💰 funding %{fr*100:+.4f}/8sa — short kalabalığı fazla ödüyor")
+        ham += (9.0 if up else -8.0)
+
+    # 3) Emir defteri duvarı (spoofing yerine gerçek duvar tespiti)
+    ob=ob or {}
+    if up and ob.get("ask_wall"):
+        out["notlar"].append("🧱 üstte satış duvarı — yol kapalı"); ham -= 6.0
+    elif (not up) and ob.get("bid_wall"):
+        out["notlar"].append("🧱 altta alış duvarı — düşüş frenli"); ham -= 6.0
+    elif up and ob.get("bid_wall"):
+        out["notlar"].append("🧱 altta alış duvarı — zemin destekli"); ham += 5.0
+    elif (not up) and ob.get("ask_wall"):
+        out["notlar"].append("🧱 üstte satış duvarı — tavan baskılı"); ham += 5.0
+
+    if V11_WHALE_VETO and ham <= -18:
+        out["veto"] = f"balina gözü yönü reddediyor (ham {ham:+.0f})"
+    out["puan"] = round(max(-15.0, min(20.0, ham)), 1)
+    return out
+
+
+# ============================================================================ #
+#  V11.1 ERKEN TETİK — 15m kapalı mum teyidi
+# ============================================================================ #
+def v11_ltf_teyit(side, k_ltf, lvl):
+    """Oluşan 1H mumuna güvenmek yerine, KAPALI 15m mumu seviyeyi doğruluyor mu?
+    LONG: son kapalı 15m mumu seviyenin ÜSTÜNDE kapanmış olmalı. SHORT: altında."""
+    if not k_ltf or lvl is None or lvl <= 0:
+        return False, "15m verisi yok"
+    kk = _s_closed(k_ltf)
+    if len(kk) < V11_LTF_CONFIRM_BARS + 1:
+        return False, "15m veri yetersiz"
+    son = kk[-V11_LTF_CONFIRM_BARS:]
+    if side == "LONG":
+        ok = all(safe_float(r[4]) > lvl for r in son)
+    else:
+        ok = all(safe_float(r[4]) < lvl for r in son)
+    kap = safe_float(kk[-1][4])
+    return ok, (f"{V11_LTF_CONFIRM_BARS}x15m kapanış {'üstte' if side=='LONG' else 'altta'} "
+                f"({kap:.6g} vs {lvl:.6g})" if ok else
+                f"15m henüz teyit etmedi ({kap:.6g} vs {lvl:.6g})")
+
+
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
@@ -6455,7 +7187,23 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
         return None
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
+
+    # --- V11.1 ERKEN TETİK -------------------------------------------------
+    # Önce klasik yol (kapalı mum). Ateşlemezse, oluşan mumla tekrar dene ve
+    # KAPALI 15m mumundan teyit iste. Böylece 1H kapanışını beklemeden,
+    # ama fitil yalanına da kanmadan girilir.
     gate = v10_structure_gate(symbol, k1h, k4h)
+    tetik = "1H kapanış"; ltf_note = ""
+    if not gate and V11_EARLY_TRIGGER:
+        gate_e = v10_structure_gate(symbol, k1h, k4h, erken=True)
+        if gate_e:
+            k_ltf = await get_klines(symbol, V11_LTF_CONFIRM_TF, 60)
+            ok, ltf_note = v11_ltf_teyit(gate_e["side"], k_ltf, gate_e.get("lvl"))
+            if ok:
+                gate = gate_e; tetik = f"ERKEN ({V11_LTF_CONFIRM_TF} teyitli)"
+                stats["v11_erken_tetik"] = int(stats.get("v11_erken_tetik", 0)) + 1
+            else:
+                stats["v11_red_ltf"] = int(stats.get("v11_red_ltf", 0)) + 1
     if not gate:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
@@ -6468,7 +7216,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
            "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob,
-           "price_move_pct": gate["fomo"]}
+           "price_move_pct": gate["fomo"], "symbol": symbol}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
     fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k)) if V10_FIB_ENABLED else None
     if fib:
@@ -6498,11 +7246,14 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         if drift > V11_MAX_DRIFT_PCT:
             stats["v11_red_drift"] = int(stats.get("v11_red_drift", 0)) + 1
             return None
+    if V12_WS_ENABLED and symbol not in _v12_son_adaylar:
+        _v12_son_adaylar.append(symbol)      # bir sonraki hotlist turunda abone olunur
     a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
             "closed_px":closed_px,"orderbook":ob,
             "spread_bps":safe_float(ob.get("spread_bps")),
             "range_break":bool(gate.get("range_break")),
+            "tetik":tetik,"ltf_note":ltf_note,"kirilan_seviye":gate.get("lvl"),
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
             "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
@@ -6533,6 +7284,7 @@ def build_v10_message(sig):
     p = sig["score_parts"]
     def tag(key, lbl):
         mx = _V10_CONF_MAX.get(key, 1.0); v = safe_float(p.get(key, 0))
+        if key == "cvd" and p.get("cvd_kaynak") == "WS": lbl = "CVD⚡"
         m = "✅" if v >= mx*0.6 else ("➖" if v >= mx*0.25 else "▫️")
         return f"{lbl}{m}"
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
@@ -6552,9 +7304,18 @@ def build_v10_message(sig):
     rs = sig.get("research") or {}
     res_line = ""
     if rs:
-        notes = rs.get("notes", [])[:4]
+        notes = rs.get("notes", [])[:7]
         res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 — ONAY\n"
                     + "".join(f"   ✓ {n}\n" for n in notes))
+    gr = (rs.get("grafik") or {}) if rs else {}
+    wh = (rs.get("whale") or {}) if rs else {}
+    if gr and gr.get("notlar"):
+        res_line += f"👁 Grafik okuması ({gr.get('puan',0):+.0f}): " + " · ".join(gr["notlar"][:3]) + "\n"
+    if wh and wh.get("tip") not in (None, "YOK"):
+        res_line += f"🐋 Balina Gözü ({wh.get('puan',0):+.0f}): {wh.get('tip')}\n"
+    ak = (rs.get("akis") or {}) if rs else {}
+    if ak.get("aktif"):
+        res_line += f"⚡ Canlı akış ({ak.get('puan',0):+.0f}): " + " · ".join(ak.get("notlar", [])[:3]) + "\n"
     news = (rs.get("news") or {}) if rs else {}
     news_line = ""
     if news and news.get("n"):
@@ -6565,6 +7326,8 @@ def build_v10_message(sig):
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"{res_line}{news_line}"
+            f"⚡ Tetik: {sig.get('tetik','1H kapanış')}"
+            + (f" — {sig['ltf_note']}" if sig.get("ltf_note") else "") + "\n"
             f"Giriş: {_v10_fmt(sig['entry'])} (canlı) | spread {safe_float(sig.get('spread_bps')):.1f}bps\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
             f"{tp_line}"
@@ -6889,6 +7652,46 @@ async def v10_paper_loop() -> None:
         await asyncio.sleep(max(60, int(MA_SCAN_INTERVAL_SEC)))
 
 
+async def cmd_ws(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Canlı WS katmanının teşhisi — veri gerçekten akıyor mu?"""
+    h = v12_health()
+    lines = ["⚡ CANLI WEBSOCKET KATMANI (V12)"]
+    if not h["kutuphane"]:
+        lines.append("❌ 'websockets' kütüphanesi KURULU DEĞİL")
+        lines.append("   requirements.txt'e şu satırı ekle:  websockets")
+        lines.append("   Kurulana kadar bot proxy CVD ile çalışır (sinyal kaybı yok).")
+        await update.message.reply_text("\n".join(lines)); return
+    if not V12_WS_ENABLED:
+        lines.append("Katman KAPALI (V12_WS_ENABLED=false)")
+        await update.message.reply_text("\n".join(lines)); return
+
+    lines += [
+        f"Durum: {'🟢 AKIYOR' if h['ok'] else '🔴 VERİ YOK'} | bağlantı: {'açık' if h['acik'] else 'kapalı'}",
+        f"Son mesaj: {h['son_mesaj_sn']} sn önce | yeniden bağlanma: {h['yeniden_baglanma']}",
+        f"Abone kanal: {h['abone']} | hedef sembol: {V12_WS_MAX_SYMBOLS}",
+        f"Gelen: {h['mesaj']:,} mesaj | {h['islem']:,} işlem | {h['defter']:,} defter fotoğrafı",
+        f"Veri tutulan sembol: akış={h['sembol_akis']} defter={h['sembol_defter']}",
+    ]
+    if h["hata"]:
+        lines.append(f"Hata: {h['hata']} | son: {h['son_hata']}")
+
+    # canlı örnekler
+    ornek = 0
+    for sym in list(_v12_flow.keys())[:6]:
+        c = v12_cvd(sym, 900); w = v12_whale_prints(sym, 900); s = v12_spoof(sym)
+        if not c: continue
+        ornek += 1
+        if ornek == 1: lines.append("\n— Canlı okuma (son 15dk) —")
+        par = [f"CVD {c['oran']:+.2f} ({c['n']} işlem, alış %{c['buy_pct']:.0f})"]
+        if w and w["n"]: par.append(f"balina {w['n']} baskı {w['baski']:+.2f}")
+        if s and s["n"]: par.append(f"spoof {s['bid']}alış/{s['ask']}satış → {s['egilim']}")
+        lines.append(f"{sym.split('-')[0]}: " + " | ".join(par))
+    if not ornek and h["ok"]:
+        lines.append("\nHenüz yeterli işlem birikmedi — CVD için sembol başına "
+                     f"{V12_MIN_TRADES} işlem gerekiyor. Birkaç dakika bekle.")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mp = _v10_mem()
     cl = mp["closed"]; n = len(cl)
@@ -6911,6 +7714,12 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"ceza kutusu {V11_STOP_BOX_HOURS:g}sa (aynı yön {V11_STOP_BOX_SAME_SIDE_HOURS:g}sa) | "
         f"günlük tavan {V11_MAX_SIGNALS_PER_COIN_DAY}",
         f"Yapı: RANGE kırılım bloğu={V11_BLOCK_RANGE_BOS} | CHoCH sweep şartı={V11_CHOCH_NEEDS_CONFIRM} | BTC uyum şartı={V11_REQUIRE_BTC_ALIGN}",
+        f"Erken tetik: {'AÇIK' if V11_EARLY_TRIGGER else 'KAPALI'} ({V11_LTF_CONFIRM_TF} x{V11_LTF_CONFIRM_BARS} teyit) | "
+        f"kullanıldı={int(stats.get('v11_erken_tetik',0))} | 15m teyit vermedi={int(stats.get('v11_red_ltf',0))}",
+        f"Grafik Okuyucu: {'AÇIK' if V11_CHART_READER else 'KAPALI'} (veto={V11_CHART_VETO}) | "
+        f"Balina Gözü: {'AÇIK' if V11_WHALE_EYE else 'KAPALI'} (veto={V11_WHALE_VETO})",
+        f"Canlı WS: {'🟢 akıyor' if v12_health()['ok'] else ('🔴 veri yok' if _V12_WS_OK else '⛔ kütüphane yok')}"
+        f" — detay için /ws",
         f"Red sayaçları: tekrar={int(stats.get('v11_red_tekrar',0))} araştırma={int(stats.get('v11_red_arastirma',0))} "
         f"range={int(stats.get('v11_red_range',0))} choch={int(stats.get('v11_red_choch',0))} drift={int(stats.get('v11_red_drift',0))}",
     ]
@@ -6963,6 +7772,7 @@ def build_app():
     application.add_handler(CommandHandler("version", cmd_version))
     application.add_handler(CommandHandler("funding", cmd_funding))
     application.add_handler(CommandHandler("v10", cmd_v10))
+    application.add_handler(CommandHandler("ws", cmd_ws))
     return application
 
 def main() -> None:
