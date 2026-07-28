@@ -6177,7 +6177,15 @@ async def v12_ws_loop() -> None:
     bekle = 2.0
     while True:
         try:
+            # websockets>=15: websockets.connect artık YENİ asyncio implementasyonu.
+            # ping_interval=None → protokol ping'ini kapatıyoruz çünkü OKX
+            # uygulama seviyesinde düz "ping" string'i bekliyor.
+            # max_queue: yeni sürümde varsayılan 16. books5 x40 sembol saniyede
+            # ~400 mesaj üretebilir; kuyruk dolarsa kütüphane soketten okumayı
+            # keser (backpressure) ve OKX bağlantıyı düşürür.
             async with _ws_lib.connect(V12_WS_URL, ping_interval=None,
+                                       open_timeout=15, close_timeout=5,
+                                       max_queue=1024,
                                        max_size=4 * 1024 * 1024) as ws:
                 _v12_state["connected"] = True
                 _v12_state["conn_ts"] = time.time()
@@ -6200,8 +6208,20 @@ async def v12_ws_loop() -> None:
                 await _abone(mevcut)
 
                 async def _ping():
+                    """Uygulama seviyesi ping + YARI-AÇIK SOKET BEKÇİSİ.
+                    OKX 30 sn sessizlikte düşürür. Ama asıl tehlike soketin
+                    sessizce ölmesi: paket akmaz, hata da gelmez, 'async for'
+                    sonsuza kadar bekler. Bu yüzden son mesaj yaşını izliyoruz;
+                    eşiği aşarsa bağlantıyı ZORLA kapatıp yeniden kuruyoruz."""
                     while True:
                         await asyncio.sleep(V12_WS_PING_SEC)
+                        yas = time.time() - safe_float(_v12_state.get("last_msg_ts"))
+                        if yas > V12_WS_STALE_SEC:
+                            logger.warning("V12 WS sessiz (%.0f sn) — bağlantı "
+                                           "zorla kapatılıyor, yeniden kurulacak", yas)
+                            try: await ws.close()
+                            except Exception: pass
+                            return
                         try: await ws.send("ping")
                         except Exception: return
 
