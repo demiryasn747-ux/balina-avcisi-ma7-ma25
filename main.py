@@ -14,9 +14,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V12.5 (Kırılım + Süpürme Dönüşü)"
+VERSION_NAME = "Balina Avcısı V12.6 (Retest Bekleme + Sweep + Fakeout Kalkanı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.6")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5992,6 +5992,39 @@ V125_RECLAIM_BARS     = int(float(os.getenv("V125_RECLAIM_BARS", "2")))  # kaç 
 V125_IGNORE_4H        = os.getenv("V125_IGNORE_4H", "true").lower() == "true"
 V125_CVD_MIN_ALIGN    = float(os.getenv("V125_CVD_MIN_ALIGN", "0.20"))   # normalde 0.10
 
+# ============================================================================ #
+#  V12.6 — RETEST BEKLEME MEKANİZMASI
+#
+#  BULUNAN KUSUR: v10_pullback() retest'i BEKLEMİYORDU, anlık kontrol
+#  yapıyordu. Şu dal kırılım mumunun KENDİSİNİ retest sayıyor:
+#      (lc > lvl and ll <= lvl*(1+tol))
+#  Kırılım mumunun dibi genelde seviyeye yakındır → koşul kırılım anında
+#  sağlanıyor → bot kırılımda giriyor. "Retest bekliyor" görüntüsü vardı,
+#  gerçekte yoktu.
+#
+#  YENİ MİMARİ — üç aşamalı durum makinesi:
+#     1) KURULDU  : kırılım görüldü, sinyal ÜRETİLMEZ, seviye hafızaya alınır
+#     2) BEKLİYOR : fiyatın seviyeye geri dönmesi beklenir (her taramada kontrol)
+#     3) ONAY     : seviyeye dokunuldu + doğru tarafta kapanış → SİNYAL ÜRETİLİR
+#  İptal yolları:
+#     FAKEOUT   : kapanış seviyenin ters tarafına belirgin geçerse → kurulum İPTAL
+#     SÜRE DOLDU: N mum içinde retest gelmezse → kurulum düşer
+#
+#  Durum kalıcı hafızada tutulur (deploy'a dayanıklı).
+# ============================================================================ #
+V126_WAIT_RETEST      = os.getenv("V126_WAIT_RETEST", "true").lower() == "true"
+V126_RETEST_MAX_BARS  = int(float(os.getenv("V126_RETEST_MAX_BARS", "12")))
+V126_RETEST_TOL_ATR   = float(os.getenv("V126_RETEST_TOL_ATR", "0.35"))
+V126_RETEST_HOLD_BARS = int(float(os.getenv("V126_RETEST_HOLD_BARS", "1")))
+V126_FAKEOUT_ATR      = float(os.getenv("V126_FAKEOUT_ATR", "0.50"))
+# Likidite süpürmesi ARTIK ZORUNLU (eskiden sadece 7 puanlık skor bileşeniydi)
+V126_REQUIRE_SWEEP    = os.getenv("V126_REQUIRE_SWEEP", "true").lower() == "true"
+V126_NOTIFY_ARMED     = os.getenv("V126_NOTIFY_ARMED", "false").lower() == "true"
+
+
+def _v126_kurulumlar():
+    return memory.setdefault("v126_armed", {})
+
 # WS abonelik ayrımı: CVD sadece trades ister (ucuz), spoofing books5 ister
 # (100ms, pahalı). CVD sert şart olduğu için trades'i GENİŞ, books5'i dar
 # tutuyoruz; yoksa 40 sembol dışındaki hiçbir coin sinyal üretemezdi.
@@ -6983,6 +7016,85 @@ def v10_sweep_reversal(k, ms):
     return None
 
 
+def v126_retest_durumu(side, lvl, k, arm):
+    """Kurulan bir seviyenin retest durumunu değerlendirir.
+    Döner: (durum, açıklama) — durum ∈ BEKLIYOR | ONAY | FAKEOUT | SURE_DOLDU"""
+    try:
+        a = atr(k, V10_ATR_PERIOD)[-1]
+    except Exception:
+        return "BEKLIYOR", "ATR okunamadı"
+    if a <= 0 or lvl <= 0:
+        return "BEKLIYOR", "veri yok"
+    up = (side == "LONG")
+    tol = a * V126_RETEST_TOL_ATR
+    fake = a * V126_FAKEOUT_ATR
+    bas_ts = safe_float(arm.get("bar_ts"))
+    sonra = [r for r in k if safe_float(r[0]) > bas_ts]
+
+    # 1) FAKEOUT — kırılım yönünün TERSİNE belirgin kapanış = kurulum ölür
+    for r in sonra:
+        c = safe_float(r[4])
+        if up and c < lvl - fake:
+            return "FAKEOUT", (f"kapanış seviyenin {(lvl-c)/a:.2f} ATR ALTINA düştü "
+                               f"— kırılım sahteydi")
+        if (not up) and c > lvl + fake:
+            return "FAKEOUT", (f"kapanış seviyenin {(c-lvl)/a:.2f} ATR ÜSTÜNE çıktı "
+                               f"— kırılım sahteydi")
+
+    # 2) SÜRE — retest gelmezse kurulum bayatlar
+    if len(sonra) > V126_RETEST_MAX_BARS:
+        return "SURE_DOLDU", f"{V126_RETEST_MAX_BARS} mumda retest gelmedi"
+
+    # 3) DOKUNUŞ — fiyat seviyeye geri döndü mü? (bir kez olur, hafızada kalır)
+    dokundu = bool(arm.get("dokundu"))
+    for r in sonra:
+        if up and safe_float(r[3]) <= lvl + tol: dokundu = True
+        if (not up) and safe_float(r[2]) >= lvl - tol: dokundu = True
+    arm["dokundu"] = dokundu
+    if not dokundu:
+        uzak = abs(safe_float(k[-1][4]) - lvl) / a
+        return "BEKLIYOR", (f"retest bölgesine dönmedi ({lvl:.6g} ±{tol:.6g}, "
+                            f"şu an {uzak:.2f} ATR uzakta) — {len(sonra)}/{V126_RETEST_MAX_BARS} mum")
+
+    # 4) TUTMA — dokunduktan sonra doğru tarafta kapanış şartı
+    son = k[-V126_RETEST_HOLD_BARS:] if V126_RETEST_HOLD_BARS > 0 else k[-1:]
+    if up and all(safe_float(r[4]) > lvl for r in son):
+        return "ONAY", f"retest TUTTU @ {lvl:.6g} ({V126_RETEST_HOLD_BARS}x kapanış üstte)"
+    if (not up) and all(safe_float(r[4]) < lvl for r in son):
+        return "ONAY", f"retest TUTTU @ {lvl:.6g} ({V126_RETEST_HOLD_BARS}x kapanış altta)"
+    return "BEKLIYOR", f"seviyeye dokunuldu, kapanış teyidi bekleniyor @ {lvl:.6g}"
+
+
+def v126_kur_veya_kontrol(symbol, side, lvl, k, setup):
+    """Kurulum kaydı yoksa KURAR (sinyal yok), varsa DURUMUNU döndürür.
+    Döner: (durum, açıklama, kurulum_kaydı)"""
+    reg = _v126_kurulumlar()
+    arm = reg.get(symbol)
+    bar_ts = safe_float(k[-1][0])
+
+    # Mevcut kayıt farklı bir kuruluma aitse (yön/seviye değişti) → yenile
+    if arm and (arm.get("side") != side or
+                abs(safe_float(arm.get("lvl")) - lvl) > lvl * 0.002):
+        arm = None
+
+    if not arm:
+        reg[symbol] = {"side": side, "lvl": lvl, "bar_ts": bar_ts,
+                       "kuruldu": time.time(), "dokundu": False, "setup": setup}
+        stats["v126_kuruldu"] = int(stats.get("v126_kuruldu", 0)) + 1
+        return "KURULDU", f"kırılım görüldü @ {lvl:.6g} — retest bekleniyor", reg[symbol]
+
+    durum, aciklama = v126_retest_durumu(side, lvl, k, arm)
+    if durum in ("FAKEOUT", "SURE_DOLDU"):
+        reg.pop(symbol, None)
+        stats["v126_" + ("fakeout" if durum == "FAKEOUT" else "sure")] = \
+            int(stats.get("v126_" + ("fakeout" if durum == "FAKEOUT" else "sure"), 0)) + 1
+        stats["v126_son_iptal"] = f"{side} {symbol}: {aciklama}"
+    elif durum == "ONAY":
+        arm["onay_ts"] = time.time()
+        stats["v126_onay"] = int(stats.get("v126_onay", 0)) + 1
+    return durum, aciklama, arm
+
+
 def v10_structure_gate(symbol, k1h, k4h, erken=False):
     """erken=False → sadece KAPALI 1H mumları (klasik, 1 mum gecikmeli).
     erken=True  → OLUŞAN 1H mumu da serinin içinde; tetik anında görülür.
@@ -7026,8 +7138,22 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
 
         blk, mv = v10_fomo_block(side, k)
         if blk: continue
-        pb, note = v10_pullback(side, k, ms)
-        if not pb: continue
+
+        # V12.6 ŞART: likidite süpürmesi ZORUNLU. Eskiden sadece 7 puanlık
+        # skor bileşeniydi; süpürülmemiş bir seviyenin kırılması "stop avı
+        # yapılmadan gelen kırılım"dır ve sahte çıkma oranı yüksektir.
+        if V126_REQUIRE_SWEEP and v10_detect_sweep(side, k, ms) < 1.0:
+            stats["v126_red_sweep"] = int(stats.get("v126_red_sweep", 0)) + 1
+            continue
+
+        # V12.6: retest artık AYRI durum makinesinde bekleniyor (aşağıda,
+        # analyze içinde). Buradaki anlık pullback kontrolü kırılım mumunun
+        # kendisini retest sayıyordu — devre dışı.
+        if V126_WAIT_RETEST:
+            note = "retest bekleniyor"
+        else:
+            pb, note = v10_pullback(side, k, ms)
+            if not pb: continue
         return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),
                 "pullback":note,"k":k,"range_break":bool(ms.get("range_break")),
                 "erken":bool(erken),"lvl":safe_float(ms.get("event_level"))}
@@ -7579,6 +7705,25 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     tetik = (f"{V122_STRUCT_TF} SÜPÜRME DÖNÜŞÜ" if reversal
              else f"{V122_STRUCT_TF} kapanış ({gate['ms'].get('event')})")
 
+    # ============ V12.6: RETEST BEKLEME ============
+    # Kırılım görüldüğünde SİNYAL ÜRETİLMEZ. Seviye hafızaya alınır ve
+    # fiyatın geri dönüp o seviyeyi TEYİT etmesi beklenir. Bu arada ters
+    # tarafa belirgin kapanış olursa kurulum sahte kırılım sayılıp iptal edilir.
+    retest_not = ""
+    if V126_WAIT_RETEST:
+        lvl_r = safe_float(gate.get("lvl"))
+        if lvl_r > 0:
+            durum, acik, arm = v126_kur_veya_kontrol(
+                symbol, side, lvl_r, k, "DONUS" if reversal else "KIRILIM")
+            if durum != "ONAY":
+                stats["v126_bekleyen"] = len(_v126_kurulumlar())
+                if durum == "FAKEOUT":
+                    logger.info("V126 FAKEOUT %s %s → %s", side, symbol, acik)
+                return None
+            retest_not = acik
+            bekleme = (time.time() - safe_float(arm.get("kuruldu"))) / 60.0
+            tetik += f" + RETEST ({bekleme:.0f}dk beklendi)"
+
     # ŞARTLAR 2 / 3 / 7 — canlı akış sert kapısı (bedava, WS belleğinden)
     akis_ok, akis_red, akis_bilgi = v122_akis_kapisi(
         side, symbol, cvd_min=(V125_CVD_MIN_ALIGN if reversal else None))
@@ -7666,6 +7811,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "tetik":tetik,"ltf_note":ltf_note,"kirilan_seviye":gate.get("lvl"),
             "h1_teyit":h1_teyit,"struct_tf":V122_STRUCT_TF,"akis":akis_bilgi,
             "setup":("SÜPÜRME DÖNÜŞÜ" if reversal else "KIRILIM"),"reversal":reversal,
+            "retest_not":retest_not,
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_struct":gate["ms"]["trend"],"trend_1h":trend_1h_ger,
             "trend_4h":gate["trend4"],
@@ -7761,7 +7907,8 @@ def build_v10_message(sig):
             f"Giriş: {_v10_fmt(sig['entry'])} (canlı) | spread {safe_float(sig.get('spread_bps')):.1f}bps\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
             f"{tp_line}"
-            f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
+            + (f"🔁 Retest: {sig['retest_not']}\n" if sig.get("retest_not") else "")
+            + f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
@@ -7999,6 +8146,7 @@ async def maybe_send_v10_signal(sig):
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[symbol] = sig["candle_ts"]
         v11_mark_sent(symbol)
+        _v126_kurulumlar().pop(symbol, None)   # kurulum tüketildi
         v10_open_paper(sig)      # V11: defter dolu ise zaten yukarıda bloklandı
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
         stats["last_signal"] = f"V11 {side} {symbol} skor {sig['score']} (arş {research['score']})"
@@ -8156,6 +8304,14 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🔄 Süpürme Dönüşü: {'AÇIK' if V125_SWEEP_REVERSAL else 'KAPALI'} | "
         f"tetiklenen={int(stats.get('v125_donus',0))} | eleme={int(stats.get('v125_red',0))} | "
         f"4H yoksay={V125_IGNORE_4H} | dönüşte CVD eşiği {V125_CVD_MIN_ALIGN:.2f}",
+        f"🔁 RETEST BEKLEME: {'AÇIK' if V126_WAIT_RETEST else 'KAPALI'} | "
+        f"bekleyen kurulum={len(_v126_kurulumlar())} | kuruldu={int(stats.get('v126_kuruldu',0))} | "
+        f"onay={int(stats.get('v126_onay',0))} | FAKEOUT iptal={int(stats.get('v126_fakeout',0))} | "
+        f"süre doldu={int(stats.get('v126_sure',0))}",
+        f"Sweep ZORUNLU={V126_REQUIRE_SWEEP} (sweep'siz red={int(stats.get('v126_red_sweep',0))}) | "
+        f"retest penceresi {V126_RETEST_MAX_BARS} mum | tolerans {V126_RETEST_TOL_ATR:g} ATR | "
+        f"fakeout eşiği {V126_FAKEOUT_ATR:g} ATR",
+        (f"Son iptal: {stats.get('v126_son_iptal')}" if stats.get("v126_son_iptal") else ""),
         f"Akış kapısı reddi: {int(stats.get('v122_red_akis',0))}"
         + (f" | son: {stats.get('v122_son_akis_red')}" if stats.get('v122_son_akis_red') else ""),
         f"Grafik Okuyucu: {'AÇIK' if V11_CHART_READER else 'KAPALI'} (veto={V11_CHART_VETO}) | "
