@@ -14,9 +14,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V12.2 (15m Tetik + Canlı Akış Kapısı)"
+VERSION_NAME = "Balina Avcısı V12.5 (Kırılım + Süpürme Dönüşü)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.2")
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.5")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -762,7 +762,10 @@ if not _MPL_OK:
         pass
 
 SIGNAL_CHART_ENABLED = os.getenv("SIGNAL_CHART_ENABLED", "true").lower() == "true"
-SIGNAL_CHART_TF = os.getenv("SIGNAL_CHART_TF", "1H").strip()
+# V12.3: grafik artık KARARIN VERİLDİĞİ zaman diliminde çizilir.
+# Tetik 15m iken grafiğin "TF 1H" demesi, gördüğün şeyle botun baktığı
+# şeyin farklı olması demekti.
+SIGNAL_CHART_TF      = os.getenv("SIGNAL_CHART_TF", os.getenv("V122_STRUCT_TF", "15m")).strip()
 SIGNAL_CHART_CANDLES = int(float(os.getenv("SIGNAL_CHART_CANDLES", "72")))
 SIGNAL_CHART_FIB = os.getenv("SIGNAL_CHART_FIB", "true").lower() == "true"
 SIGNAL_NEWS_ENABLED = os.getenv("SIGNAL_NEWS_ENABLED", "true").lower() == "true"
@@ -5941,6 +5944,54 @@ V122_CVD_MIN_ALIGN    = float(os.getenv("V122_CVD_MIN_ALIGN", "0.10"))
 V122_WHALE_MAX_OPPOSE = float(os.getenv("V122_WHALE_MAX_OPPOSE", "0.25"))
 V122_BLOCK_ON_SPOOF   = os.getenv("V122_BLOCK_ON_SPOOF", "true").lower() == "true"
 
+# V12.3 — ŞART 6 GERÇEKTEN SERT OLDU.
+# APT SHORT (30.07 07:30) hacim x0.36 ile açıldı; hem araştırma hem grafik
+# okuyucu "kırılım desteksiz" dedi ama bu sadece 9 puana mal oldu ve sinyal
+# 79.2 skorla geçti. Stop yedi. Hasan "hacim filtresi geçerli kalsın" dedi;
+# ben onu skor bileşeni olarak bırakmışım — kapı değildi. Artık kapı.
+V123_MIN_VOL_RATIO    = float(os.getenv("V123_MIN_VOL_RATIO", "0.8"))
+V123_VOL_HARD_GATE    = os.getenv("V123_VOL_HARD_GATE", "true").lower() == "true"
+
+# ============================================================================ #
+#  V12.4 — PİVOT ÖNEMİ (yön hatasının kökü)
+#  v10_find_swings pivotları BÜYÜKLÜĞÜNE göre ayırmıyordu: %13.7'lik bir
+#  çakılmanın dibi ile %0.1'lik bir titreşim aynı ağırlıktaydı. event_side
+#  tek değer olduğu için, en SON oluşan mikro pivot işlemin yönünü belirliyordu
+#  ve diğer yön hiç değerlendirilmiyordu.
+#  APT (30.07 07:30): gerçek yapısal dip 0.5503 (süpürülüp geri alınmış =
+#  boğa tablosu) iken bot 0.5690'daki 0.25 ATR'lik kıpırdanmayı "kırılan
+#  seviye" sayıp SHORT açtı ve stop yedi.
+#  Artık bir pivot, kendinden önceki ters pivottan en az X ATR uzakta
+#  değilse YAPI SAYILMAZ — zigzag/prominence mantığı.
+# ============================================================================ #
+V124_SWING_MIN_ATR    = float(os.getenv("V124_SWING_MIN_ATR", "1.0"))
+V124_SWING_FILTER     = os.getenv("V124_SWING_FILTER", "true").lower() == "true"
+
+# ============================================================================ #
+#  V12.5 — SÜPÜRME DÖNÜŞÜ (ikinci tetik tipi)
+#  V12.4 yanlış yönü kesti ama doğru yönü yakalamıyordu: APT'de yapısal dip
+#  süpürülüp geri alınmıştı (klasik boğa dönüşü) ve bot hiç sinyal üretmedi.
+#  Sebebi basit — botun tek tetiği KIRILIM (BOS/CHoCH) idi. Kırılım "seviye
+#  yenildi, devam" der; süpürme dönüşü ise "seviye denendi, REDDEDİLDİ" der.
+#  İkisi zıt kurulumlardır ve ayrı ayrı aranmaları gerekir.
+#
+#  Yön mantığı KIRILIMIN TERSİDİR ve bu kasıtlıdır:
+#     dip süpürüldü + geri alındı  → LONG   (satıcılar tuzağa düştü)
+#     tepe süpürüldü + geri alındı → SHORT  (alıcılar tuzağa düştü)
+#
+#  Mevcut hiçbir kapı, skor, TP/SL veya tekrar kilidi değişmedi; bu sadece
+#  kırılım tetiği ateşlemediğinde denenen ALTERNATİF bir giriştir.
+# ============================================================================ #
+V125_SWEEP_REVERSAL   = os.getenv("V125_SWEEP_REVERSAL", "true").lower() == "true"
+V125_SWEEP_LOOKBACK   = int(float(os.getenv("V125_SWEEP_LOOKBACK", "12")))
+V125_MIN_PIERCE_ATR   = float(os.getenv("V125_MIN_PIERCE_ATR", "0.25"))  # seviyeyi bu kadar delmeli
+V125_MIN_WICK_RATIO   = float(os.getenv("V125_MIN_WICK_RATIO", "1.2"))   # fitil/gövde
+V125_RECLAIM_BARS     = int(float(os.getenv("V125_RECLAIM_BARS", "2")))  # kaç kapanış geri alındı
+# Dönüş kurulumu tanımı gereği üst zaman dilimine TERS olabilir. 4H filtresini
+# burada gevşetiyoruz ama karşılığında canlı akış teyidini SERTLEŞTİRİYORUZ.
+V125_IGNORE_4H        = os.getenv("V125_IGNORE_4H", "true").lower() == "true"
+V125_CVD_MIN_ALIGN    = float(os.getenv("V125_CVD_MIN_ALIGN", "0.20"))   # normalde 0.10
+
 # WS abonelik ayrımı: CVD sadece trades ister (ucuz), spoofing books5 ister
 # (100ms, pahalı). CVD sert şart olduğu için trades'i GENİŞ, books5'i dar
 # tutuyoruz; yoksa 40 sembol dışındaki hiçbir coin sinyal üretemezdi.
@@ -6505,8 +6556,38 @@ def v10_find_swings(k, left, right):
     return sw
 
 
+def v10_anlamli_pivotlar(sw, atr_deger, min_atr):
+    """Gürültü pivotlarını eler (zigzag/prominence).
+    Kural 1: arka arkaya aynı türden pivot varsa sadece EN UÇ olanı kalır.
+    Kural 2: bir pivot, kendinden önceki KORUNAN ters pivottan en az
+             min_atr × ATR uzakta değilse yapı sayılmaz."""
+    if not V124_SWING_FILTER or atr_deger <= 0 or min_atr <= 0 or not sw:
+        return sw
+    esik = atr_deger * min_atr
+    out = []
+    for x in sw:
+        if not out:
+            out.append(x); continue
+        son = out[-1]
+        if x.kind == son.kind:
+            daha_uc = (x.price > son.price) if x.kind == "H" else (x.price < son.price)
+            if daha_uc: out[-1] = x
+            continue
+        if abs(x.price - son.price) < esik:
+            continue                      # yeterince belirgin değil → gürültü
+        out.append(x)
+    return out
+
+
 def v10_market_structure(k):
     sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT)
+    # V12.4: gürültü pivotlarını ele. Bu satır olmadan en son oluşan mikro
+    # kıpırdanma event_side'ı belirliyor ve işlemin yönünü tek başına çeviriyor.
+    try:
+        _a = atr(k, V10_ATR_PERIOD)[-1]
+        sw = v10_anlamli_pivotlar(sw, _a, V124_SWING_MIN_ATR)
+    except Exception:
+        pass
     res = {"trend":"RANGE","hh":False,"hl":False,"lh":False,"ll":False,
            "last_sh":0.0,"last_sh_idx":-1,"last_sl":0.0,"last_sl_idx":-1,
            "event":None,"event_side":None,"event_level":0.0,"event_idx":-1}
@@ -6664,7 +6745,18 @@ def v10_quality_score(side, k, ms, ext):
     ok, _ = v10_structure_allows(side, ms)
     s = 18.0 if ok else 0.0
     if ok and ms.get("event") == "CHoCH": s *= 0.85
-    p["structure"] = s
+    # V12.5: süpürme dönüşünde event_side kurulumun TERSİDİR (dip kırılmış
+    # görünür ama biz reddedilmeyi alıyoruz), o yüzden structure_allows False
+    # döner. Yapı puanı süpürmenin KALİTESİNDEN hesaplanır. Bu dal SADECE
+    # yeni kurulum tipinde çalışır; kırılım sinyallerinin skoru değişmedi.
+    rev = ext.get("reversal")
+    if rev:
+        derin = min(1.0, safe_float(rev.get("derinlik")) / 1.0)
+        fit   = min(1.0, safe_float(rev.get("fitil")) / 3.0)
+        s = 18.0 * (0.5 + 0.3*derin + 0.2*fit)
+        p["structure"] = s
+    else:
+        p["structure"] = s
     vols = [safe_float(r[5]) for r in k[-21:-1]]; av = sum(vols)/len(vols) if vols else 0.0
     lv = safe_float(k[-1][5]); p["volume"] = 2.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
     r = rsi(closes(k))[-1]
@@ -6813,6 +6905,84 @@ async def v10_fetch_orderbook(symbol):
         return blank
 
 
+def v10_sweep_reversal(k, ms):
+    """Yapısal bir dip/tepe süpürülüp geri alındı mı?
+    Döner: {side, lvl, derinlik(ATR), fitil, yas(mum)} ya da None.
+
+    ÖNEMLİ TASARIM NOTU: süpürülen seviye, süpürme mumundan ÖNCE oluşmuş
+    olmalıdır. İlk sürümde ms['last_sl'] kullanmıştım — ama süpürme mumunun
+    kendi dibi anında yeni 'son pivot' oluyordu, dolayısıyla delinecek eski
+    seviye hiç kalmıyordu ve fonksiyon her zaman None dönüyordu. Artık
+    aday seviyeler pivot listesinden, süpürme mumundan ESKİ olanlar arasından
+    seçiliyor."""
+    if not V125_SWEEP_REVERSAL or len(k) < 35:
+        return None
+    try:
+        a = atr(k, V10_ATR_PERIOD)[-1]
+    except Exception:
+        return None
+    if a <= 0:
+        return None
+
+    sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT)
+    if not sw:
+        return None
+
+    n = len(k)
+    look = min(V125_SWEEP_LOOKBACK, n - 1)
+    bas = n - look                      # lookback'in mutlak başlangıcı
+    son = k[-V125_RECLAIM_BARS:] if V125_RECLAIM_BARS > 0 else k[-1:]
+
+    def _ara(up):
+        kind = "L" if up else "H"
+        # ADAY SEVİYE: lookback'ten ÖNCE oluşmuş pivotların EN UCU.
+        # "Stopların biriktiği bariz seviye" tam olarak budur. Anlamlı-pivot
+        # filtresini burada uygulamıyoruz; o filtre süpürme mumunun kendi
+        # dibini daha uç görüp eski seviyenin yerine koyuyor ve süpürülecek
+        # seviye ortadan kalkıyordu.
+        eski = [x for x in sw if x.kind == kind and x.idx <= bas]
+        if not eski:
+            return None
+        piv = min(eski, key=lambda x: x.price) if up else max(eski, key=lambda x: x.price)
+        adaylar = [piv]
+        best = None
+        for piv in adaylar:
+            lvl = piv.price
+            if lvl <= 0:
+                continue
+            # GERİ ALIM: son N kapanış seviyenin doğru tarafında olmalı
+            if up and not all(safe_float(r[4]) > lvl for r in son):
+                continue
+            if (not up) and not all(safe_float(r[4]) < lvl for r in son):
+                continue
+            for idx in range(max(bas, piv.idx + 1), n):
+                r = k[idx]
+                o = safe_float(r[1]); h = safe_float(r[2])
+                l = safe_float(r[3]); c = safe_float(r[4])
+                govde = abs(c - o) + 1e-12
+                if up:
+                    if l >= lvl: continue
+                    derinlik = (lvl - l) / a
+                    fitil = (min(o, c) - l) / govde
+                else:
+                    if h <= lvl: continue
+                    derinlik = (h - lvl) / a
+                    fitil = (h - max(o, c)) / govde
+                if derinlik < V125_MIN_PIERCE_ATR or fitil < V125_MIN_WICK_RATIO:
+                    continue
+                if best is None or derinlik > best["derinlik"]:
+                    best = {"lvl": lvl, "derinlik": round(derinlik, 2),
+                            "fitil": round(fitil, 2), "yas": n - 1 - idx}
+        return best
+
+    for up, side in ((True, "LONG"), (False, "SHORT")):
+        r = _ara(up)
+        if r:
+            r["side"] = side
+            return r
+    return None
+
+
 def v10_structure_gate(symbol, k1h, k4h, erken=False):
     """erken=False → sadece KAPALI 1H mumları (klasik, 1 mum gecikmeli).
     erken=True  → OLUŞAN 1H mumu da serinin içinde; tetik anında görülür.
@@ -6930,6 +7100,8 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
             S += 10; out["notes"].append(f"hacim x{rat:.2f} (kırılımı besliyor)")
         elif rat >= 0.8:
             S += 6; out["notes"].append(f"hacim x{rat:.2f} (normal)")
+        elif V123_VOL_HARD_GATE and rat < V123_MIN_VOL_RATIO:
+            out["red"].append(f"hacim x{rat:.2f} < {V123_MIN_VOL_RATIO:.2f} — kırılımın arkasında para yok")
         else:
             S += 1; out["notes"].append(f"hacim x{rat:.2f} ZAYIF — kırılım desteksiz")
     except Exception:
@@ -7305,7 +7477,8 @@ def v11_ltf_teyit(side, k_ltf, lvl):
                 f"15m henüz teyit etmedi ({kap:.6g} vs {lvl:.6g})")
 
 
-def v122_akis_kapisi(side: str, symbol: str) -> Tuple[bool, str, Dict[str, Any]]:
+def v122_akis_kapisi(side: str, symbol: str,
+                     cvd_min: Optional[float] = None) -> Tuple[bool, str, Dict[str, Any]]:
     """V12.2 SERT ŞARTLAR — 2) gerçek CVD yönü destekler
                             3) balina baskısı ters DEĞİL
                             7) spoof riski yüksek değil
@@ -7322,10 +7495,11 @@ def v122_akis_kapisi(side: str, symbol: str) -> Tuple[bool, str, Dict[str, Any]]
             return False, "canlı akış yok (WS kapalı/ölü) — CVD sert şart", bilgi
         if not c:
             return False, f"CVD verisi yetersiz (min {V12_MIN_TRADES} işlem)", bilgi
+        esik = V122_CVD_MIN_ALIGN if cvd_min is None else cvd_min
         uyum = c["oran"] if up else -c["oran"]
-        if uyum < V122_CVD_MIN_ALIGN:
+        if uyum < esik:
             return False, (f"CVD yönü desteklemiyor (oran {c['oran']:+.2f}, "
-                           f"uyum {uyum:+.2f} < {V122_CVD_MIN_ALIGN:.2f})"), bilgi
+                           f"uyum {uyum:+.2f} < {esik:.2f})"), bilgi
 
     # --- ŞART 3: BALİNA BASKISI ters olmasın ---
     w = v12_whale_prints(symbol, 900) if V12_WS_ENABLED else None
@@ -7364,14 +7538,50 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
 
     gate = v10_structure_gate(symbol, kS, k4h)
+    reversal = None
+
+    # --- V12.5: KIRILIM ateşlemezse SÜPÜRME DÖNÜŞÜ dene ---
+    if not gate and V125_SWEEP_REVERSAL:
+        kc = _s_closed(kS)
+        if len(kc) >= 40:
+            ms_r = v10_market_structure(kc)
+            rev = v10_sweep_reversal(kc, ms_r)
+            if rev:
+                rside = rev["side"]
+                trend4 = "FLAT"
+                if V10_USE_4H_FILTER and k4h and len(k4h) >= 52:
+                    c4 = closes(_s_closed(k4h)); e4 = ema(c4, min(50, len(c4)-1))
+                    trend4 = "UP" if c4[-1] > e4[-1] else "DOWN"
+                # Dönüş kurulumu üst TF'ye ters olabilir; V125_IGNORE_4H=false
+                # yaparsan klasik 4H şartı burada da uygulanır.
+                dur = False
+                if V10_USE_4H_FILTER and not V125_IGNORE_4H and trend4 != "FLAT":
+                    if rside == "LONG" and trend4 != "UP": dur = True
+                    if rside == "SHORT" and trend4 != "DOWN": dur = True
+                blk, mv = v10_fomo_block(rside, kc)
+                if not dur and not blk:
+                    reversal = rev
+                    gate = {"side": rside, "ms": ms_r, "trend4": trend4,
+                            "fomo": round(mv, 2), "k": kc, "range_break": False,
+                            "lvl": rev["lvl"], "erken": False,
+                            "why": f"Süpürme Dönüşü ({'DİP' if rside=='LONG' else 'TEPE'} "
+                                   f"reddedildi, {rev['derinlik']:.2f} ATR delinme, "
+                                   f"fitil/gövde {rev['fitil']:.1f})",
+                            "pullback": f"{V125_RECLAIM_BARS}x kapanış geri alındı @ {rev['lvl']:.6g}"}
+                    stats["v125_donus"] = int(stats.get("v125_donus", 0)) + 1
+                else:
+                    stats["v125_red"] = int(stats.get("v125_red", 0)) + 1
+
     if not gate:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
     side = gate["side"]; k = gate["k"]
-    tetik = f"{V122_STRUCT_TF} kapanış ({gate['ms'].get('event')})"
+    tetik = (f"{V122_STRUCT_TF} SÜPÜRME DÖNÜŞÜ" if reversal
+             else f"{V122_STRUCT_TF} kapanış ({gate['ms'].get('event')})")
 
     # ŞARTLAR 2 / 3 / 7 — canlı akış sert kapısı (bedava, WS belleğinden)
-    akis_ok, akis_red, akis_bilgi = v122_akis_kapisi(side, symbol)
+    akis_ok, akis_red, akis_bilgi = v122_akis_kapisi(
+        side, symbol, cvd_min=(V125_CVD_MIN_ALIGN if reversal else None))
     if not akis_ok:
         stats["v122_red_akis"] = int(stats.get("v122_red_akis", 0)) + 1
         stats["v122_son_akis_red"] = f"{side} {symbol}: {akis_red}"
@@ -7402,7 +7612,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
            "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob,
-           "price_move_pct": gate["fomo"], "symbol": symbol}
+           "price_move_pct": gate["fomo"], "symbol": symbol, "reversal": reversal}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
     # RSI KAPISI 1H'de kalıyor: V10_RSI_LONG_MAX / SHORT_MIN eşikleri 1H
     # üzerinde kalibre edilmişti. 15m RSI çok daha oynak; aynı sayı orada
@@ -7455,6 +7665,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "range_break":bool(gate.get("range_break")),
             "tetik":tetik,"ltf_note":ltf_note,"kirilan_seviye":gate.get("lvl"),
             "h1_teyit":h1_teyit,"struct_tf":V122_STRUCT_TF,"akis":akis_bilgi,
+            "setup":("SÜPÜRME DÖNÜŞÜ" if reversal else "KIRILIM"),"reversal":reversal,
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_struct":gate["ms"]["trend"],"trend_1h":trend_1h_ger,
             "trend_4h":gate["trend4"],
@@ -7480,6 +7691,21 @@ def _v10_fmt(x):
 # görünüyordu — 6 onaydan 4'ü sahteydi. Artık maksimumun %60'ı geçerse ✅.
 _V10_CONF_MAX = {"order_block":11.0,"fvg":8.0,"volume_profile":5.0,
                  "cvd":5.0,"sweep":7.0,"orderbook":7.0}
+
+
+# V12.3: araştırma notları eskiden HEPSİ "✓" ile basılıyordu. APT sinyalinde
+# "✓ hacim x0.36 ZAYIF — kırılım desteksiz" yazıyordu; onay işareti bir
+# UYARIYI teyit gibi gösteriyordu. Artık bulgunun tonuna göre işaret veriliyor.
+_V123_UYARI = ("zayıf", "desteksiz", "ters", "karışık", "kısmi", "uçta",
+               "geç)", "yetersiz", "riski", "hatası")
+_V123_NOTR  = ("nötr", "normal", "yok", "dengeli")
+
+
+def _v123_isaret(n: str) -> str:
+    t = _v11_lower(n)
+    if any(k in t for k in _V123_UYARI): return "⚠"
+    if any(k in t for k in _V123_NOTR):  return "•"
+    return "✓"
 
 
 def build_v10_message(sig):
@@ -7508,7 +7734,7 @@ def build_v10_message(sig):
     if rs:
         notes = rs.get("notes", [])[:7]
         res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 — ONAY\n"
-                    + "".join(f"   ✓ {n}\n" for n in notes))
+                    + "".join(f"   {_v123_isaret(n)} {n}\n" for n in notes))
     gr = (rs.get("grafik") or {}) if rs else {}
     wh = (rs.get("whale") or {}) if rs else {}
     if gr and gr.get("notlar"):
@@ -7523,7 +7749,8 @@ def build_v10_message(sig):
     if news and news.get("n"):
         news_line = f"📰 Haber tonu: {news.get('label')} ({news.get('score'):+.1f}) — {news.get('n')} başlık\n"
 
-    return (f"🎯 {VERSION_NAME}\n🆕 V11 SMC | {sig['direction']} | {sig['symbol']}\n"
+    return (f"🎯 {VERSION_NAME}\n"
+            f"🆕 {sig.get('setup','KIRILIM')} | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | {sig.get('struct_tf','15m')}:{sig.get('trend_struct','-')}"
             f" 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
@@ -7926,6 +8153,9 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Sert akış şartları: CVD={'ZORUNLU' if V122_REQUIRE_CVD else 'opsiyonel'} "
         f"(min uyum {V122_CVD_MIN_ALIGN:.2f}) | balina ters limiti {V122_WHALE_MAX_OPPOSE:.2f} | "
         f"spoof bloğu={V122_BLOCK_ON_SPOOF} | RSI kapısı TF={V122_RSI_TF.upper()}",
+        f"🔄 Süpürme Dönüşü: {'AÇIK' if V125_SWEEP_REVERSAL else 'KAPALI'} | "
+        f"tetiklenen={int(stats.get('v125_donus',0))} | eleme={int(stats.get('v125_red',0))} | "
+        f"4H yoksay={V125_IGNORE_4H} | dönüşte CVD eşiği {V125_CVD_MIN_ALIGN:.2f}",
         f"Akış kapısı reddi: {int(stats.get('v122_red_akis',0))}"
         + (f" | son: {stats.get('v122_son_akis_red')}" if stats.get('v122_son_akis_red') else ""),
         f"Grafik Okuyucu: {'AÇIK' if V11_CHART_READER else 'KAPALI'} (veto={V11_CHART_VETO}) | "
