@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import sqlite3
 import time
 import copy
 import asyncio
@@ -14,9 +15,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V12.6 (Retest Bekleme + Sweep + Fakeout Kalkanı)"
+VERSION_NAME = "Balina Avcısı V13.0 (SQLite Defter + 1D Rejim + Volatilite Kalkanı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.6")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.0")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -1283,13 +1284,33 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
+            # V13: endpoint devre kesici — art arda 429 alan uç nokta dinlendirilir
+            rl = _v130_rl.setdefault(path, {"streak": 0, "until": 0.0})
+            if rl["until"] > time.time():
+                raise RuntimeError(f"rate-limit soğuma ({(rl['until']-time.time()):.0f}sn) {path}")
             resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HTTP {resp.status_code}")
+                if resp.status_code == 429:
+                    rl["streak"] += 1
+                    if rl["streak"] >= V130_RL_MAX_STREAK:
+                        rl["until"] = time.time() + V130_RL_COOLDOWN_SEC
+                        rl["streak"] = 0
+                        logger.warning("V13 rate-limit: %s art arda 429 → %s %.0f sn dinlendiriliyor",
+                                       V130_RL_MAX_STREAK, path, V130_RL_COOLDOWN_SEC)
+                        raise last_err
+                    # V13: sunucunun söylediği süre kadar bekle (sabit 0.5sn yerine)
+                    ra = resp.headers.get("Retry-After")
+                    bekle = safe_float(ra) if ra else 0.0
+                    if bekle <= 0:
+                        bekle = min(8.0, 0.5 * (2 ** attempt))   # üstel geri çekilme
+                    time.sleep(min(bekle, 30.0))
+                    if attempt < max_retries: continue
                 if attempt < max_retries:
                     time.sleep(0.5 + attempt * 0.5)
                     continue
                 resp.raise_for_status()
+            rl["streak"] = 0
             resp.raise_for_status()
             data = resp.json()
             if str(data.get("code", "1")) != "0":
@@ -6021,6 +6042,174 @@ V126_FAKEOUT_ATR      = float(os.getenv("V126_FAKEOUT_ATR", "0.50"))
 V126_REQUIRE_SWEEP    = os.getenv("V126_REQUIRE_SWEEP", "true").lower() == "true"
 V126_NOTIFY_ARMED     = os.getenv("V126_NOTIFY_ARMED", "false").lower() == "true"
 
+# ============================================================================ #
+#  V13.0 — KALICI DEFTER (SQLite)
+#  memory.json her sinyalin sadece özetini tutuyordu ve sorgulanamıyordu.
+#  "Hangi kapı işe yarıyor, hangi setup kazanıyor" sorusunu defalarca
+#  soramadık çünkü veri yoktu. Artık her sinyal ve her kapanış, o anki
+#  piyasa koşullarıyla birlikte SQLite'a yazılıyor ve /history ile
+#  sorgulanabiliyor. Yazma hatası ASLA botu durdurmaz (best-effort).
+# ============================================================================ #
+V130_DB_ENABLED       = os.getenv("V130_DB_ENABLED", "true").lower() == "true"
+V130_DB_PATH          = os.getenv("V130_DB_PATH", "/data/balina.db").strip()
+
+# --- 1D REJİM FİLTRESİ ---
+# Günlük EMA200 üstü/altı, büyük resmin yönü. Rejime ters işlem yasaklanmaz
+# (varsayılan), ama skor cezası alır; V130_DAILY_HARD=true ile kapı olur.
+V130_DAILY_REGIME     = os.getenv("V130_DAILY_REGIME", "true").lower() == "true"
+V130_DAILY_HARD       = os.getenv("V130_DAILY_HARD", "false").lower() == "true"
+V130_DAILY_EMA        = int(float(os.getenv("V130_DAILY_EMA", "200")))
+V130_DAILY_PENALTY    = float(os.getenv("V130_DAILY_PENALTY", "8"))
+
+# --- VOLATİLİTE KALKANI ---
+# Ani sıçrama (tweet, haber, likidasyon kaskadı) sırasında girilen işlem
+# rastgele sonuç verir. Son mumun gerçek aralığı, önceki 10 mumun
+# ortalamasının N katını aşarsa o coin geçici olarak bloklanır.
+V130_VOL_SHIELD       = os.getenv("V130_VOL_SHIELD", "true").lower() == "true"
+V130_VOL_SPIKE_MULT   = float(os.getenv("V130_VOL_SPIKE_MULT", "3.0"))
+V130_VOL_BLOCK_MIN    = float(os.getenv("V130_VOL_BLOCK_MIN", "15"))
+
+# --- RATE LIMIT ---
+V130_RL_MAX_STREAK    = int(float(os.getenv("V130_RL_MAX_STREAK", "5")))
+V130_RL_COOLDOWN_SEC  = float(os.getenv("V130_RL_COOLDOWN_SEC", "300"))
+
+_v130_db = None
+_v130_rl: Dict[str, Any] = {}      # endpoint -> {"streak":int,"until":float}
+_v130_vol: Dict[str, float] = {}   # symbol -> blok bitiş zamanı
+
+
+def v130_db():
+    """Bağlantıyı tembel açar. Hata olursa None döner ve bot normal çalışır."""
+    global _v130_db
+    if not V130_DB_ENABLED:
+        return None
+    if _v130_db is not None:
+        return _v130_db
+    try:
+        yol = V130_DB_PATH
+        d = os.path.dirname(yol)
+        if d and not os.path.isdir(d):
+            try: os.makedirs(d, exist_ok=True)
+            except Exception: yol = "balina.db"      # /data yoksa çalışma dizinine
+        con = sqlite3.connect(yol, check_same_thread=False)
+        con.execute("""CREATE TABLE IF NOT EXISTS islemler(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            acilis_ts REAL, kapanis_ts REAL, sembol TEXT, yon TEXT,
+            setup TEXT, tetik TEXT, giris REAL, stop REAL,
+            tp1 REAL, tp2 REAL, tp3 REAL,
+            skor REAL, arastirma REAL, rsi REAL,
+            yapi TEXT, trend_struct TEXT, trend_1h TEXT, trend_4h TEXT,
+            btc_1h TEXT, btc_4h TEXT, gunluk_rejim TEXT,
+            oi REAL, funding REAL, spread REAL, hacim_orani REAL,
+            cvd REAL, cvd_kaynak TEXT, balina REAL, spoof TEXT,
+            haber REAL, retest_dk REAL,
+            sonuc TEXT, r REAL, hit1 INT, hit2 INT, hit3 INT,
+            skor_detay TEXT)""")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_sembol ON islemler(sembol)")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_sonuc ON islemler(sonuc)")
+        con.commit()
+        _v130_db = con
+        logger.info("V13 SQLite defteri açıldı: %s", yol)
+    except Exception as e:
+        logger.warning("V13 SQLite açılamadı (%s) — bot memory.json ile devam ediyor", e)
+        _v130_db = None
+    return _v130_db
+
+
+def v130_kaydet_acilis(sig) -> Optional[int]:
+    con = v130_db()
+    if not con: return None
+    try:
+        rs = sig.get("research") or {}
+        ak = (rs.get("akis") or {}); c = (ak.get("cvd") or {}) if isinstance(ak, dict) else {}
+        akb = sig.get("akis") or {}
+        cvd_d = (akb.get("cvd") or {}); wh_d = (akb.get("whale") or {}); sp_d = (akb.get("spoof") or {})
+        p = sig.get("score_parts") or {}
+        cur = con.execute("""INSERT INTO islemler(
+            acilis_ts,sembol,yon,setup,tetik,giris,stop,tp1,tp2,tp3,skor,arastirma,rsi,
+            yapi,trend_struct,trend_1h,trend_4h,btc_1h,btc_4h,gunluk_rejim,
+            oi,funding,spread,cvd,cvd_kaynak,balina,spoof,haber,sonuc,skor_detay)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (time.time(), sig.get("symbol"), sig.get("direction"), sig.get("setup"),
+             sig.get("tetik"), safe_float(sig.get("entry")), safe_float(sig.get("stop")),
+             safe_float(sig.get("tp1")), safe_float(sig.get("tp2")), safe_float(sig.get("tp3")),
+             safe_float(sig.get("score")), safe_float(rs.get("score")), safe_float(sig.get("rsi")),
+             str(sig.get("structure"))[:120], sig.get("trend_struct"), sig.get("trend_1h"),
+             sig.get("trend_4h"), sig.get("btc_1h"), sig.get("btc_4h"),
+             str(sig.get("gunluk_rejim") or "-"),
+             safe_float(sig.get("oi_change_pct")), safe_float(sig.get("funding")),
+             safe_float(sig.get("spread_bps")), safe_float(cvd_d.get("oran")),
+             str(p.get("cvd_kaynak") or "-"), safe_float(wh_d.get("baski")),
+             str(sp_d.get("egilim") or "-"),
+             safe_float(((rs.get("news") or {}).get("score"))), "ACIK",
+             json.dumps({k_: v_ for k_, v_ in p.items()}, ensure_ascii=False)[:900]))
+        con.commit()
+        return cur.lastrowid
+    except Exception as e:
+        logger.debug("V13 kayıt hatası: %s", e); return None
+
+
+def v130_kaydet_kapanis(pos, R, outcome):
+    con = v130_db()
+    if not con: return
+    try:
+        rid = pos.get("db_id")
+        if rid:
+            con.execute("""UPDATE islemler SET kapanis_ts=?,sonuc=?,r=?,hit1=?,hit2=?,hit3=?
+                           WHERE id=?""",
+                        (time.time(), outcome, round(R,3), int(bool(pos.get("hit1"))),
+                         int(bool(pos.get("hit2"))), int(bool(pos.get("hit3"))), rid))
+        else:
+            con.execute("""UPDATE islemler SET kapanis_ts=?,sonuc=?,r=?,hit1=?,hit2=?,hit3=?
+                           WHERE sembol=? AND sonuc='ACIK'""",
+                        (time.time(), outcome, round(R,3), int(bool(pos.get("hit1"))),
+                         int(bool(pos.get("hit2"))), int(bool(pos.get("hit3"))), pos.get("symbol")))
+        con.commit()
+    except Exception as e:
+        logger.debug("V13 kapanış kaydı hatası: %s", e)
+
+
+async def v130_gunluk_rejim(symbol):
+    """1D EMA(N) rejimi: fiyat üstünde mi altında mı?
+    Döner: ('UP'|'DOWN'|'-', mesafe_yuzde)"""
+    if not V130_DAILY_REGIME:
+        return "-", 0.0
+    try:
+        kd = await get_klines(symbol, "1D", V130_DAILY_EMA + 30)
+        kd = _s_closed(kd)
+        if len(kd) < 30:
+            return "-", 0.0
+        c = closes(kd)
+        per = min(V130_DAILY_EMA, len(c) - 1)
+        e = ema(c, per)[-1]
+        if e <= 0: return "-", 0.0
+        mes = (c[-1] - e) / e * 100.0
+        return ("UP" if c[-1] > e else "DOWN"), round(mes, 2)
+    except Exception as e:
+        logger.debug("V13 1D rejim hata %s: %s", symbol, e)
+        return "-", 0.0
+
+
+def v130_vol_sok(symbol, k):
+    """Son mumda anormal volatilite sıçraması var mı? Varsa coini geçici blokla."""
+    if not V130_VOL_SHIELD or len(k) < 12:
+        return False, ""
+    bit = safe_float(_v130_vol.get(symbol))
+    if bit > time.time():
+        return True, f"volatilite bloğu ({(bit-time.time())/60:.0f}dk kaldı)"
+    try:
+        tr = [safe_float(r[2]) - safe_float(r[3]) for r in k[-11:-1]]
+        ort = sum(tr)/len(tr) if tr else 0.0
+        son = safe_float(k[-1][2]) - safe_float(k[-1][3])
+        if ort > 0 and son > ort * V130_VOL_SPIKE_MULT:
+            _v130_vol[symbol] = time.time() + V130_VOL_BLOCK_MIN*60
+            stats["v130_vol_blok"] = int(stats.get("v130_vol_blok", 0)) + 1
+            return True, (f"VOLATİLİTE ŞOKU: son mum aralığı ortalamanın "
+                          f"{son/ort:.1f} katı → {V130_VOL_BLOCK_MIN:.0f}dk blok")
+    except Exception:
+        pass
+    return False, ""
+
 
 def _v126_kurulumlar():
     return memory.setdefault("v126_armed", {})
@@ -7724,6 +7913,12 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             bekleme = (time.time() - safe_float(arm.get("kuruldu"))) / 60.0
             tetik += f" + RETEST ({bekleme:.0f}dk beklendi)"
 
+    # --- V13: VOLATİLİTE KALKANI ---
+    sok, sok_not = v130_vol_sok(symbol, k)
+    if sok:
+        stats["v130_son_vol"] = f"{symbol}: {sok_not}"
+        return None
+
     # ŞARTLAR 2 / 3 / 7 — canlı akış sert kapısı (bedava, WS belleğinden)
     akis_ok, akis_red, akis_bilgi = v122_akis_kapisi(
         side, symbol, cvd_min=(V125_CVD_MIN_ALIGN if reversal else None))
@@ -7749,6 +7944,18 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         else:
             h1_teyit = False
             ltf_note = f"1H teyit yok ({ms1.get('event') or 'olay yok'}) → bonus yok, ceza yok"
+    # --- V13: 1D REJİM ---
+    gunluk, gunluk_mes = await v130_gunluk_rejim(symbol)
+    gunluk_ceza = 0.0
+    if gunluk in ("UP", "DOWN"):
+        ters = (side == "LONG" and gunluk == "DOWN") or (side == "SHORT" and gunluk == "UP")
+        if ters:
+            if V130_DAILY_HARD:
+                stats["v130_red_gunluk"] = int(stats.get("v130_red_gunluk", 0)) + 1
+                return None
+            gunluk_ceza = V130_DAILY_PENALTY
+            stats["v130_gunluk_ceza"] = int(stats.get("v130_gunluk_ceza", 0)) + 1
+
     oi = await fetch_okx_oi_change(symbol, V10_OI_LOOKBACK_PER)
     funding = await fetch_okx_funding_rate(symbol)
     btc_bias = await get_btc_trend_bias()
@@ -7768,6 +7975,9 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if h1_bonus:
         score = round(score + h1_bonus, 1)
         parts["h1_teyit"] = h1_bonus
+    if gunluk_ceza:
+        score = round(score - gunluk_ceza, 1)
+        parts["gunluk_rejim"] = -gunluk_ceza
     fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k)) if V10_FIB_ENABLED else None
     if fib:
         score = round(score + fib["bonus"], 1)
@@ -7812,6 +8022,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "h1_teyit":h1_teyit,"struct_tf":V122_STRUCT_TF,"akis":akis_bilgi,
             "setup":("SÜPÜRME DÖNÜŞÜ" if reversal else "KIRILIM"),"reversal":reversal,
             "retest_not":retest_not,
+            "gunluk_rejim":gunluk,"gunluk_mesafe":gunluk_mes,
             "event":gate["ms"]["event"],"structure":gate["why"],
             "trend_struct":gate["ms"]["trend"],"trend_1h":trend_1h_ger,
             "trend_4h":gate["trend4"],
@@ -7907,6 +8118,9 @@ def build_v10_message(sig):
             f"Giriş: {_v10_fmt(sig['entry'])} (canlı) | spread {safe_float(sig.get('spread_bps')):.1f}bps\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
             f"{tp_line}"
+            + (f"📅 1D rejim: {sig.get('gunluk_rejim')} (EMA{V130_DAILY_EMA}'e %{sig.get('gunluk_mesafe',0):+.1f})"
+               + (" ⚠️ yöne TERS" if sig.get("score_parts",{}).get("gunluk_rejim") else "") + "\n"
+               if sig.get("gunluk_rejim") in ("UP","DOWN") else "")
             + (f"🔁 Retest: {sig['retest_not']}\n" if sig.get("retest_not") else "")
             + f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
@@ -7958,6 +8172,7 @@ def v10_open_paper(sig):
         "score":sig["score"],"event":sig["event"],
         "research":safe_float((sig.get("research") or {}).get("score")),
         "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
+        "db_id":sig.get("db_id"),
         "open_ts":time.time(),"candle_ts":sig["candle_ts"]})
 
 
@@ -8147,6 +8362,7 @@ async def maybe_send_v10_signal(sig):
         v10_sent_candle[symbol] = sig["candle_ts"]
         v11_mark_sent(symbol)
         _v126_kurulumlar().pop(symbol, None)   # kurulum tüketildi
+        sig["db_id"] = v130_kaydet_acilis(sig)
         v10_open_paper(sig)      # V11: defter dolu ise zaten yukarıda bloklandı
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
         stats["last_signal"] = f"V11 {side} {symbol} skor {sig['score']} (arş {research['score']})"
@@ -8216,6 +8432,7 @@ async def v10_paper_loop() -> None:
                     still.append(pos)
                     continue
                 v10_record_closed(pos, R, oc)
+                v130_kaydet_kapanis(pos, R, oc)
                 if oc == "STOP":
                     v11_register_stop(pos["symbol"], pos["side"])   # V11 ceza kutusu
                 exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp3"] if oc == "TP3" else pos["entry"])
@@ -8274,6 +8491,87 @@ async def cmd_ws(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """SQLite defterinden kırılımlı performans raporu.
+    /history            → genel + setup + yön kırılımı
+    /history KAPI       → hangi kapı/koşul kazanıyor
+    /history <COIN>     → o coinin geçmişi"""
+    con = v130_db()
+    if not con:
+        await update.message.reply_text(
+            "🗄 SQLite defteri KAPALI ya da açılamadı.\n"
+            "V130_DB_ENABLED=true olmalı ve V130_DB_PATH yazılabilir olmalı.\n"
+            "Railway'de kalıcı olması için Volume bağla (örn /data)."); return
+    arg = (context.args[0].upper() if context.args else "")
+    L = ["🗄 SQLite DEFTER"]
+    try:
+        tot = con.execute("SELECT COUNT(*) FROM islemler").fetchone()[0]
+        acik = con.execute("SELECT COUNT(*) FROM islemler WHERE sonuc='ACIK'").fetchone()[0]
+        L.append(f"Kayıt: {tot} | açık: {acik} | kapanan: {tot-acik}")
+        if tot == 0:
+            L.append("\nHenüz kayıt yok — ilk sinyalden sonra dolmaya başlar.")
+            await update.message.reply_text("\n".join(L)); return
+
+        def blok(baslik, sql, params=()):
+            rows = con.execute(sql, params).fetchall()
+            if not rows: return
+            L.append(f"\n— {baslik} —")
+            for r in rows:
+                ad, n, wr, ev = r[0], r[1], r[2], r[3]
+                L.append(f"{str(ad or '-'):<22} n={n:<3} WR%{(wr or 0):.0f} EV={(ev or 0):+.3f}R")
+
+        KAP = ("SELECT {g}, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+               "FROM islemler WHERE sonuc!='ACIK' GROUP BY {g} HAVING COUNT(*)>=1 "
+               "ORDER BY AVG(r) DESC")
+        if arg == "KAPI":
+            blok("1D REJİM UYUMU",
+                 "SELECT CASE WHEN (yon='LONG' AND gunluk_rejim='UP') OR "
+                 "(yon='SHORT' AND gunluk_rejim='DOWN') THEN 'rejim UYUMLU' "
+                 "WHEN gunluk_rejim='-' THEN 'rejim bilinmiyor' ELSE 'rejim TERS' END, "
+                 "COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                 "FROM islemler WHERE sonuc!='ACIK' GROUP BY 1 ORDER BY 4 DESC")
+            blok("CVD KAYNAĞI", KAP.format(g="cvd_kaynak"))
+            blok("SPOOF EĞİLİMİ", KAP.format(g="spoof"))
+            blok("BTC 1H", KAP.format(g="btc_1h"))
+            blok("YAPI TRENDİ", KAP.format(g="trend_struct"))
+        elif arg:
+            rows = con.execute(
+                "SELECT sembol,yon,setup,skor,sonuc,r,acilis_ts FROM islemler "
+                "WHERE sembol LIKE ? ORDER BY id DESC LIMIT 12", (f"%{arg}%",)).fetchall()
+            if not rows:
+                L.append(f"\n{arg} için kayıt yok.")
+            else:
+                L.append(f"\n— {arg} son işlemler —")
+                for x in rows:
+                    t = datetime.fromtimestamp(safe_float(x[6]), TR_TZ).strftime("%d.%m %H:%M") if x[6] else "-"
+                    L.append(f"{t} {x[1]} {str(x[2])[:10]} skor{safe_float(x[3]):.0f} → "
+                             f"{x[4]} {(safe_float(x[5]) if x[5] is not None else 0):+.2f}R")
+        else:
+            row = con.execute("SELECT COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), "
+                              "AVG(r), SUM(r) FROM islemler WHERE sonuc!='ACIK'").fetchone()
+            if row and row[0]:
+                L.append(f"Genel: n={row[0]} WR%{(row[1] or 0):.1f} "
+                         f"EV={(row[2] or 0):+.3f}R toplam={(row[3] or 0):+.2f}R")
+            blok("SETUP", KAP.format(g="setup"))
+            blok("YÖN", KAP.format(g="yon"))
+            blok("SONUÇ DAĞILIMI",
+                 "SELECT sonuc, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                 "FROM islemler WHERE sonuc!='ACIK' GROUP BY sonuc ORDER BY 2 DESC")
+            en = con.execute("SELECT sembol,yon,r FROM islemler WHERE sonuc!='ACIK' "
+                             "ORDER BY r DESC LIMIT 3").fetchall()
+            ko = con.execute("SELECT sembol,yon,r FROM islemler WHERE sonuc!='ACIK' "
+                             "ORDER BY r ASC LIMIT 3").fetchall()
+            if en:
+                L.append("\n— En iyi / en kötü —")
+                for x in en: L.append(f"  ✅ {x[0]} {x[1]} {safe_float(x[2]):+.2f}R")
+                for x in ko: L.append(f"  ❌ {x[0]} {x[1]} {safe_float(x[2]):+.2f}R")
+            L.append("\n/history KAPI → kapı bazlı kırılım | /history BTC → coin geçmişi")
+        L.append("\n⚠️ n<30 olan satırlar istatistiksel değil, sadece gözlem.")
+    except Exception as e:
+        L.append(f"Sorgu hatası: {e}")
+    await update.message.reply_text("\n".join(L)[:4000])
+
+
 async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mp = _v10_mem()
     cl = mp["closed"]; n = len(cl)
@@ -8312,6 +8610,13 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"retest penceresi {V126_RETEST_MAX_BARS} mum | tolerans {V126_RETEST_TOL_ATR:g} ATR | "
         f"fakeout eşiği {V126_FAKEOUT_ATR:g} ATR",
         (f"Son iptal: {stats.get('v126_son_iptal')}" if stats.get("v126_son_iptal") else ""),
+        f"📅 1D rejim: {'AÇIK' if V130_DAILY_REGIME else 'KAPALI'} (EMA{V130_DAILY_EMA}, "
+        f"{'SERT KAPI' if V130_DAILY_HARD else f'ceza -{V130_DAILY_PENALTY:g}'}) | "
+        f"ters rejim={int(stats.get('v130_gunluk_ceza',0))} red={int(stats.get('v130_red_gunluk',0))}",
+        f"🌊 Volatilite kalkanı: {'AÇIK' if V130_VOL_SHIELD else 'KAPALI'} "
+        f"({V130_VOL_SPIKE_MULT:g}x → {V130_VOL_BLOCK_MIN:g}dk) | blok={int(stats.get('v130_vol_blok',0))}"
+        + (f" | son: {stats.get('v130_son_vol')}" if stats.get('v130_son_vol') else ""),
+        f"🗄 SQLite: {'AÇIK' if v130_db() else 'KAPALI'} — detay için /history",
         f"Akış kapısı reddi: {int(stats.get('v122_red_akis',0))}"
         + (f" | son: {stats.get('v122_son_akis_red')}" if stats.get('v122_son_akis_red') else ""),
         f"Grafik Okuyucu: {'AÇIK' if V11_CHART_READER else 'KAPALI'} (veto={V11_CHART_VETO}) | "
@@ -8371,6 +8676,7 @@ def build_app():
     application.add_handler(CommandHandler("funding", cmd_funding))
     application.add_handler(CommandHandler("v10", cmd_v10))
     application.add_handler(CommandHandler("ws", cmd_ws))
+    application.add_handler(CommandHandler("history", cmd_history))
     return application
 
 def main() -> None:
