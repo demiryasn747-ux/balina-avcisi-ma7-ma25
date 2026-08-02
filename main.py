@@ -2,6 +2,7 @@ import os
 import re
 import json
 import sqlite3
+import threading
 import time
 import copy
 import asyncio
@@ -15,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.1 (Huni Teşhisi + Kapı Gevşetme)"
+VERSION_NAME = "Balina Avcısı V13.2 (Veri Akışı Onarımı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.1")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.2")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -1284,22 +1285,21 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
     last_err: Optional[Exception] = None
     for attempt in range(max_retries + 1):
         try:
-            # V13: endpoint devre kesici — art arda 429 alan uç nokta dinlendirilir
-            rl = _v130_rl.setdefault(path, {"streak": 0, "until": 0.0})
-            if rl["until"] > time.time():
-                raise RuntimeError(f"rate-limit soğuma ({(rl['until']-time.time()):.0f}sn) {path}")
+            # V13.2 DÜZELTME: V13.0'daki devre kesici KALDIRILDI.
+            # Hata şuydu: anahtar path bazlıydı ('/api/v5/market/candles'), yani
+            # herhangi 5 istek 429 alınca TÜM COİNLER için o endpoint 300 saniye
+            # kapanıyordu. get_klines boş liste dönüyor, analyze "veri yetersiz"
+            # deyip çıkıyordu. Huni %99.56 ile tam bunu gösterdi. 2 gün sıfır
+            # sinyalin sebebi kapı sertliği değil, benim eklediğim bu kesiciydi.
+            # Yerine: istek hızını KAYNAĞINDA sınırlıyoruz (aşağıdaki token bucket).
+            _v132_bekle()
             resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HTTP {resp.status_code}")
                 if resp.status_code == 429:
-                    rl["streak"] += 1
-                    if rl["streak"] >= V130_RL_MAX_STREAK:
-                        rl["until"] = time.time() + V130_RL_COOLDOWN_SEC
-                        rl["streak"] = 0
-                        logger.warning("V13 rate-limit: %s art arda 429 → %s %.0f sn dinlendiriliyor",
-                                       V130_RL_MAX_STREAK, path, V130_RL_COOLDOWN_SEC)
-                        raise last_err
-                    # V13: sunucunun söylediği süre kadar bekle (sabit 0.5sn yerine)
+                    stats["v132_429"] = int(stats.get("v132_429", 0)) + 1
+                    _v132_yavasla()      # hız limitini otomatik düşür
+                    # sunucunun söylediği süre kadar bekle (sabit 0.5sn yerine)
                     ra = resp.headers.get("Retry-After")
                     bekle = safe_float(ra) if ra else 0.0
                     if bekle <= 0:
@@ -1310,7 +1310,7 @@ def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: in
                     time.sleep(0.5 + attempt * 0.5)
                     continue
                 resp.raise_for_status()
-            rl["streak"] = 0
+            _v132_hizlan()   # başarılı istek → hız kademeli geri açılır
             resp.raise_for_status()
             data = resp.json()
             if str(data.get("code", "1")) != "0":
@@ -6116,8 +6116,57 @@ def v131_say(ad: str, n: int = 1) -> None:
     h[ad] = int(safe_float(h.get(ad))) + n
 
 _v130_db = None
-_v130_rl: Dict[str, Any] = {}      # endpoint -> {"streak":int,"until":float}
+_v130_rl: Dict[str, Any] = {}      # (kullanılmıyor, V13.2'de devre dışı)
+
+# ============================================================================ #
+#  V13.2 — İSTEK HIZI YÖNETİMİ (token bucket)
+#  Sorunun kökü: 200 coin × 7 istek = tarama başına 1400 istek. OKX candles
+#  limiti 20 istek/sn. Yani istekler yetişmiyordu, 429 yağıyordu.
+#  Çözüm: isteği ATIP hata yemek yerine, GÖNDERMEDEN ÖNCE sıraya girmek.
+#  429 gelirse hız otomatik düşer, temiz giderse kademeli geri açılır.
+# ============================================================================ #
+V132_RPS              = float(os.getenv("V132_RPS", "14"))       # OKX limiti 20; pay bırakıyoruz
+# Kova kapasitesi: patlama (burst) toleransı. Testte kova dolu başlayınca ilk
+# 14 istek anında geçip anlık 26/sn ölçüldü — OKX'in 20/sn limitini aşıyordu.
+# Kapasiteyi küçültüp kovayı boş başlatıyoruz; ortalama hız aynı kalıyor,
+# ani patlama sönüyor.
+V132_BURST            = float(os.getenv("V132_BURST", "3"))
+V132_RPS_MIN          = float(os.getenv("V132_RPS_MIN", "4"))
+_v132_lock = threading.Lock()
+_v132_state = {"rps": V132_RPS, "son": time.time(), "jeton": 0.0}
+
+
+def _v132_bekle() -> None:
+    """Token bucket: hız aşılıyorsa isteği GÖNDERMEDEN önce bekletir."""
+    with _v132_lock:
+        now = time.time()
+        gecen = now - safe_float(_v132_state["son"])
+        rps = max(V132_RPS_MIN, safe_float(_v132_state["rps"]))
+        kap = min(V132_BURST, rps)
+        _v132_state["jeton"] = min(kap, safe_float(_v132_state["jeton"]) + gecen * rps)
+        _v132_state["son"] = now
+        if _v132_state["jeton"] < 1.0:
+            uyku = (1.0 - _v132_state["jeton"]) / rps
+        else:
+            uyku = 0.0
+        _v132_state["jeton"] -= 1.0
+    if uyku > 0:
+        time.sleep(min(uyku, 2.0))
+
+
+def _v132_yavasla() -> None:
+    with _v132_lock:
+        _v132_state["rps"] = max(V132_RPS_MIN, safe_float(_v132_state["rps"]) * 0.7)
+    logger.warning("V13.2: 429 alındı → istek hızı %.1f/sn'ye düşürüldü", _v132_state["rps"])
+
+
+def _v132_hizlan() -> None:
+    with _v132_lock:
+        r = safe_float(_v132_state["rps"])
+        if r < V132_RPS:
+            _v132_state["rps"] = min(V132_RPS, r + 0.02)
 _v130_vol: Dict[str, float] = {}   # symbol -> blok bitiş zamanı
+_v132_gunluk_cache: Dict[str, Any] = {}   # symbol -> (ts, rejim, mesafe)
 
 
 def v130_db():
@@ -6216,6 +6265,11 @@ async def v130_gunluk_rejim(symbol):
     Döner: ('UP'|'DOWN'|'-', mesafe_yuzde)"""
     if not V130_DAILY_REGIME:
         return "-", 0.0
+    # V13.2: 1D mumu günde bir değişir; her taramada çekmek israftı.
+    # V13.0'da eklediğim bu istek, tarama yükünü %17 artırıp 429'a katkı yaptı.
+    ck = _v132_gunluk_cache.get(symbol)
+    if ck and time.time() - ck[0] < 3600:
+        return ck[1], ck[2]
     try:
         kd = await get_klines(symbol, "1D", V130_DAILY_EMA + 30)
         kd = _s_closed(kd)
@@ -6226,7 +6280,9 @@ async def v130_gunluk_rejim(symbol):
         e = ema(c, per)[-1]
         if e <= 0: return "-", 0.0
         mes = (c[-1] - e) / e * 100.0
-        return ("UP" if c[-1] > e else "DOWN"), round(mes, 2)
+        sonuc = ("UP" if c[-1] > e else "DOWN"), round(mes, 2)
+        _v132_gunluk_cache[symbol] = (time.time(), sonuc[0], sonuc[1])
+        return sonuc
     except Exception as e:
         logger.debug("V13 1D rejim hata %s: %s", symbol, e)
         return "-", 0.0
@@ -7895,7 +7951,10 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     kS = await get_klines(symbol, V122_STRUCT_TF, V122_STRUCT_LIMIT)
     if len(kS) < 45:
         stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
-        v131_say("veri")
+        # V13.2: "veri yetersiz" tek kova değil — nedeni ayrıştırıyoruz ki
+        # bir daha aynı körlüğü yaşamayalım.
+        v131_say("veri_bos" if not kS else "veri_kisa")
+        stats["v132_son_veri"] = f"{symbol}: {len(kS)} mum ({V122_STRUCT_TF})"
         return None
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
 
@@ -8558,7 +8617,10 @@ async def cmd_huni(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if tar == 0:
         L.append("\nHenüz tarama yok — bot yeni başlamış olabilir.")
         await update.message.reply_text("\n".join(L)); return
-    isim = {"veri":"Veri yetersiz","yapi":"15m yapı (BOS/CHoCH) yok",
+    isim = {"veri":"Veri yetersiz (eski)",
+            "veri_bos":"Veri BOŞ geldi (API/limit/sembol)",
+            "veri_kisa":"Veri KISA geldi (yeni coin?)",
+            "yapi":"15m yapı (BOS/CHoCH) yok",
             "range":"RANGE kırılım bloğu","choch":"CHoCH sweep şartı",
             "sweep":"Sweep ZORUNLU","retest_bekle":"Retest bekleniyor",
             "retest_fakeout":"FAKEOUT iptali","retest_sure":"Retest süresi doldu",
@@ -8576,6 +8638,10 @@ async def cmd_huni(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         L.append(f"\n🎯 EN DAR NOKTA: {isim.get(top[0],top[0])} — "
                  f"adayların %{top[1]/tar*100:.1f}'ini kesiyor.")
         L.append("Gevşetmek istersen ilgili env'i değiştir, sonra /huni ile tekrar bak.")
+    L.append(f"\n📡 İstek hızı: {safe_float(_v132_state['rps']):.1f}/sn (tavan {V132_RPS:g}) | "
+             f"429 sayısı: {int(safe_float(stats.get('v132_429')))}")
+    if stats.get("v132_son_veri"):
+        L.append(f"Son veri reddi: {stats.get('v132_son_veri')}")
     L.append(f"\nGevşek profil: {'AÇIK' if V131_GEVSEK else 'KAPALI'} "
              f"(sweep zorunlu={V126_REQUIRE_SWEEP}, CVD eşiği {V122_CVD_MIN_ALIGN:.2f}, "
              f"hacim {V123_MIN_VOL_RATIO:.2f}x, araştırma {V11_RESEARCH_MIN:.0f})")
