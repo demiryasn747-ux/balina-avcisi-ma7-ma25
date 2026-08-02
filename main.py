@@ -15,9 +15,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.0 (SQLite Defter + 1D Rejim + Volatilite Kalkanı)"
+VERSION_NAME = "Balina Avcısı V13.1 (Huni Teşhisi + Kapı Gevşetme)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.0")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.1")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6073,6 +6073,48 @@ V130_VOL_BLOCK_MIN    = float(os.getenv("V130_VOL_BLOCK_MIN", "15"))
 V130_RL_MAX_STREAK    = int(float(os.getenv("V130_RL_MAX_STREAK", "5")))
 V130_RL_COOLDOWN_SEC  = float(os.getenv("V130_RL_COOLDOWN_SEC", "300"))
 
+# ============================================================================ #
+#  V13.1 — HUNİ TEŞHİSİ ve KAPI GEVŞETME
+#
+#  SORUN: V10'dan V13'e kadar her sorun için ayrı bir SERT KAPI ekledim.
+#  Tek tek hepsi savunulabilir, ama ÇARPIMLARINI hiç hesaplamadım.
+#  Kabaca 20 kapı × ortalama %60 geçiş = milyonda birkaç. 2 gün sıfır sinyal
+#  bunun sonucu. Bu bir kod hatası değil, TASARIM hatası — benim hatam.
+#
+#  ÇÖZÜM İKİ PARÇALI:
+#   1) /huni komutu: hangi kapının kaç aday elediğini SAYAR. Artık hangi
+#      kapıyı gevşeteceğimizi tahminle değil, veriyle seçeriz.
+#   2) V131_GEVSEK profili: en çok kesen 4 kapıyı makul seviyeye çeker.
+#      Varsayılan AÇIK — çünkü hiç sinyal üretmeyen bot ölçülemez de.
+# ============================================================================ #
+V131_GEVSEK           = os.getenv("V131_GEVSEK", "true").lower() == "true"
+
+if V131_GEVSEK:
+    # (a) Sweep: ZORUNLU kapı olmaktan çıkıp güçlü skor bileşenine döner.
+    #     Süpürülmemiş kırılım daha zayıftır ama imkânsız değildir.
+    V126_REQUIRE_SWEEP = os.getenv("V126_REQUIRE_SWEEP", "false").lower() == "true"
+    # (b) Retest penceresi ve toleransı genişler; tutma şartı esner.
+    V126_RETEST_MAX_BARS = int(float(os.getenv("V126_RETEST_MAX_BARS", "20")))
+    V126_RETEST_TOL_ATR = float(os.getenv("V126_RETEST_TOL_ATR", "0.60"))
+    # (c) CVD uyum eşiği düşer: yön "ters olmasın" yeter, "güçlü destek" şart değil.
+    V122_CVD_MIN_ALIGN = float(os.getenv("V122_CVD_MIN_ALIGN", "0.02"))
+    V125_CVD_MIN_ALIGN = float(os.getenv("V125_CVD_MIN_ALIGN", "0.10"))
+    # (d) Hacim kapısı: 0.8 fazla sertti (ortalamanın altındaki her mumu kesiyor).
+    V123_MIN_VOL_RATIO = float(os.getenv("V123_MIN_VOL_RATIO", "0.55"))
+    # (e) Araştırma eşiği biraz iner.
+    V11_RESEARCH_MIN = float(os.getenv("V11_RESEARCH_MIN_SCORE", "52"))
+
+# Huni sayaçları — her kapı kaç aday eledi?
+_V131_HUNI = ["tarandi","veri","yapi","pivot","range","choch","sweep","fomo",
+              "retest_bekle","retest_fakeout","retest_sure","volsok","cvd",
+              "balina","spoof","rsi","skor","drift","hacim","spread","btc",
+              "arastirma","haber","tekrar","GONDERILDI"]
+
+
+def v131_say(ad: str, n: int = 1) -> None:
+    h = stats.setdefault("v131_huni", {})
+    h[ad] = int(safe_float(h.get(ad))) + n
+
 _v130_db = None
 _v130_rl: Dict[str, Any] = {}      # endpoint -> {"streak":int,"until":float}
 _v130_vol: Dict[str, float] = {}   # symbol -> blok bitiş zamanı
@@ -7312,6 +7354,7 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
         if V11_BLOCK_RANGE_BOS and ms.get("range_break"):
             if v10_detect_sweep(side, k, ms) < 1.0:
                 stats["v11_red_range"] = int(stats.get("v11_red_range", 0)) + 1
+                v131_say("range")
                 continue
             why = why.replace("(devam)", "(range sweep+reclaim)")
 
@@ -7322,6 +7365,7 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
         if V11_CHOCH_NEEDS_CONFIRM and ms.get("event") == "CHoCH":
             if v10_detect_sweep(side, k, ms) < 1.0:
                 stats["v11_red_choch"] = int(stats.get("v11_red_choch", 0)) + 1
+                v131_say("choch")
                 continue
             why = why + " +sweep"
 
@@ -7333,6 +7377,7 @@ def v10_structure_gate(symbol, k1h, k4h, erken=False):
         # yapılmadan gelen kırılım"dır ve sahte çıkma oranı yüksektir.
         if V126_REQUIRE_SWEEP and v10_detect_sweep(side, k, ms) < 1.0:
             stats["v126_red_sweep"] = int(stats.get("v126_red_sweep", 0)) + 1
+            v131_say("sweep")
             continue
 
         # V12.6: retest artık AYRI durum makinesinde bekleniyor (aşağıda,
@@ -7842,6 +7887,7 @@ def v122_akis_kapisi(side: str, symbol: str,
 
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
+    v131_say("tarandi")
 
     # ===================== V12.2: TETİK 15m KAPANIŞINDA =====================
     # ŞART 1 — yapı (BOS/CHoCH) + pullback artık 15m KAPALI mumlarından
@@ -7849,6 +7895,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     kS = await get_klines(symbol, V122_STRUCT_TF, V122_STRUCT_LIMIT)
     if len(kS) < 45:
         stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
+        v131_say("veri")
         return None
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
 
@@ -7889,6 +7936,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     if not gate:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
+        v131_say("yapi")
         return None
     side = gate["side"]; k = gate["k"]
     tetik = (f"{V122_STRUCT_TF} SÜPÜRME DÖNÜŞÜ" if reversal
@@ -7906,6 +7954,8 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                 symbol, side, lvl_r, k, "DONUS" if reversal else "KIRILIM")
             if durum != "ONAY":
                 stats["v126_bekleyen"] = len(_v126_kurulumlar())
+                v131_say("retest_" + ("fakeout" if durum == "FAKEOUT"
+                                      else "sure" if durum == "SURE_DOLDU" else "bekle"))
                 if durum == "FAKEOUT":
                     logger.info("V126 FAKEOUT %s %s → %s", side, symbol, acik)
                 return None
@@ -7917,6 +7967,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     sok, sok_not = v130_vol_sok(symbol, k)
     if sok:
         stats["v130_son_vol"] = f"{symbol}: {sok_not}"
+        v131_say("volsok")
         return None
 
     # ŞARTLAR 2 / 3 / 7 — canlı akış sert kapısı (bedava, WS belleğinden)
@@ -7924,6 +7975,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         side, symbol, cvd_min=(V125_CVD_MIN_ALIGN if reversal else None))
     if not akis_ok:
         stats["v122_red_akis"] = int(stats.get("v122_red_akis", 0)) + 1
+        v131_say("cvd")
         stats["v122_son_akis_red"] = f"{side} {symbol}: {akis_red}"
         return None
 
@@ -7989,9 +8041,11 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_best_score"] = round(score, 1)
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
         stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
+        v131_say("rsi")
         return None
     if score < V10_MIN_QUALITY:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
+        v131_say("skor")
         return None
     # --- V11: CANLI GİRİŞ FİYATI -------------------------------------------
     # Eski kod entry = son KAPANMIŞ 1H mumun kapanışıydı → 60 dakikaya kadar
@@ -8005,6 +8059,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         drift = abs(entry - closed_px) / closed_px * 100.0 if closed_px > 0 else 0.0
         if drift > V11_MAX_DRIFT_PCT:
             stats["v11_red_drift"] = int(stats.get("v11_red_drift", 0)) + 1
+            v131_say("drift")
             return None
     if V12_WS_ENABLED and symbol not in _v12_son_adaylar:
         _v12_son_adaylar.append(symbol)      # bir sonraki hotlist turunda abone olunur
@@ -8318,6 +8373,7 @@ async def maybe_send_v10_signal(sig):
     block = v11_repeat_block(symbol, side)
     if block:
         stats["v11_red_tekrar"] = int(stats.get("v11_red_tekrar", 0)) + 1
+        v131_say("tekrar")
         logger.info("V11 TEKRAR BLOK %s %s → %s", side, symbol, block)
         return
     if not v10_cooldown_ok(symbol):
@@ -8333,6 +8389,7 @@ async def maybe_send_v10_signal(sig):
 
     if research["verdict"] != "ONAY":
         stats["v11_red_arastirma"] = int(stats.get("v11_red_arastirma", 0)) + 1
+        v131_say("arastirma")
         stats["v11_son_red"] = f"{side} {symbol}: " + "; ".join(research.get("red", [])[:2])
         if research["verdict"] == "TERS":
             stats["v11_ters_aday"] = int(stats.get("v11_ters_aday", 0)) + 1
@@ -8365,6 +8422,7 @@ async def maybe_send_v10_signal(sig):
         sig["db_id"] = v130_kaydet_acilis(sig)
         v10_open_paper(sig)      # V11: defter dolu ise zaten yukarıda bloklandı
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
+        v131_say("GONDERILDI")
         stats["last_signal"] = f"V11 {side} {symbol} skor {sig['score']} (arş {research['score']})"
         logger.info("V11 SİNYAL GÖNDERİLDİ %s %s skor=%s arş=%s", side, symbol,
                     sig["score"], research["score"])
@@ -8489,6 +8547,43 @@ async def cmd_ws(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("\nHenüz yeterli işlem birikmedi — CVD için sembol başına "
                      f"{V12_MIN_TRADES} işlem gerekiyor. Birkaç dakika bekle.")
     await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_huni(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hangi kapı kaç aday eliyor? Sinyal gelmiyorsa İLK bakılacak yer."""
+    h = stats.get("v131_huni") or {}
+    tar = int(safe_float(h.get("tarandi")))
+    L = ["🔻 SİNYAL HUNİSİ — hangi kapı ne kadar eliyor",
+         f"Taranan aday: {tar:,} | çıkan sinyal: {int(safe_float(h.get('GONDERILDI')))}"]
+    if tar == 0:
+        L.append("\nHenüz tarama yok — bot yeni başlamış olabilir.")
+        await update.message.reply_text("\n".join(L)); return
+    isim = {"veri":"Veri yetersiz","yapi":"15m yapı (BOS/CHoCH) yok",
+            "range":"RANGE kırılım bloğu","choch":"CHoCH sweep şartı",
+            "sweep":"Sweep ZORUNLU","retest_bekle":"Retest bekleniyor",
+            "retest_fakeout":"FAKEOUT iptali","retest_sure":"Retest süresi doldu",
+            "volsok":"Volatilite şoku","cvd":"Canlı akış (CVD/balina/spoof)",
+            "rsi":"RSI kapısı","skor":"Skor eşiği","drift":"Fiyat kayması",
+            "arastirma":"Derin araştırma","tekrar":"Tekrar kilidi"}
+    sirali = sorted(((k_, int(safe_float(v_))) for k_, v_ in h.items()
+                     if k_ not in ("tarandi","GONDERILDI") and safe_float(v_) > 0),
+                    key=lambda x: -x[1])
+    L.append("\n— En çok eleyenden aza —")
+    for k_, v_ in sirali:
+        L.append(f"{isim.get(k_,k_):<26} {v_:>7,}  (%{v_/tar*100:.2f})")
+    if sirali:
+        top = sirali[0]
+        L.append(f"\n🎯 EN DAR NOKTA: {isim.get(top[0],top[0])} — "
+                 f"adayların %{top[1]/tar*100:.1f}'ini kesiyor.")
+        L.append("Gevşetmek istersen ilgili env'i değiştir, sonra /huni ile tekrar bak.")
+    L.append(f"\nGevşek profil: {'AÇIK' if V131_GEVSEK else 'KAPALI'} "
+             f"(sweep zorunlu={V126_REQUIRE_SWEEP}, CVD eşiği {V122_CVD_MIN_ALIGN:.2f}, "
+             f"hacim {V123_MIN_VOL_RATIO:.2f}x, araştırma {V11_RESEARCH_MIN:.0f})")
+    L.append("Sıfırlamak için: /huni sifirla")
+    if context.args and context.args[0].lower().startswith("sif"):
+        stats["v131_huni"] = {}
+        L = ["🔻 Huni sayaçları sıfırlandı."]
+    await update.message.reply_text("\n".join(L)[:4000])
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8677,6 +8772,7 @@ def build_app():
     application.add_handler(CommandHandler("v10", cmd_v10))
     application.add_handler(CommandHandler("ws", cmd_ws))
     application.add_handler(CommandHandler("history", cmd_history))
+    application.add_handler(CommandHandler("huni", cmd_huni))
     return application
 
 def main() -> None:
