@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.2 (Veri Akışı Onarımı)"
+VERSION_NAME = "Balina Avcısı V13.3 (Sweep Onarımı + Skor Ayrıştırma)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.2")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.3")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5852,7 +5852,10 @@ V11_MAX_DRIFT_PCT    = float(os.getenv("V11_MAX_DRIFT_PCT", "0.8"))   # canlı f
 
 # --- Derin araştırma kapısı ---
 V11_RESEARCH_ENABLED = os.getenv("V11_RESEARCH_ENABLED", "true").lower() == "true"
-V11_RESEARCH_MIN     = float(os.getenv("V11_RESEARCH_MIN_SCORE", "60"))
+# V13.3: skor artık gerçek tavana normalize (bkz. v11_deep_research).
+# Eski 60 eşiği "100'e kırpılmış" ölçekteydi; yeni ölçekte tipik değerler
+# %50-85 bandına oturuyor. Varsayılan buna göre ayarlandı.
+V11_RESEARCH_MIN     = float(os.getenv("V11_RESEARCH_MIN_SCORE", "45"))
 V11_LTF_INTERVAL     = os.getenv("V11_LTF_INTERVAL", "15m").strip()
 V11_MAX_SPREAD_BPS   = float(os.getenv("V11_MAX_SPREAD_BPS", "12"))   # 12 bps = %0.12
 V11_RANGE_EDGE_PCT   = float(os.getenv("V11_RANGE_EDGE_PCT", "1.2"))  # aralık tepesinde LONG / dibinde SHORT yasağı
@@ -5930,7 +5933,8 @@ V12_TRADE_KEEP       = int(float(os.getenv("V12_TRADE_KEEP", "4000")))   # sembo
 # sıradan bir emirle bile aşılır. Artık p90 (90. yüzdelik) taban alınıyor:
 # bir işlem, tipik BÜYÜK işlemin de birkaç katıysa balina sayılır.
 V12_WHALE_MULT       = float(os.getenv("V12_WHALE_MULT", "4"))           # p90'ın kaç katı = balina baskısı
-V12_WHALE_MAX_PCT    = float(os.getenv("V12_WHALE_MAX_PCT", "3"))        # işlemlerin %3'ünden fazlası balina ise eşik güvenilmez
+V12_WHALE_TOP_PCT    = float(os.getenv("V12_WHALE_TOP_PCT", "1"))       # üst %1 = balina
+V12_WHALE_MAX_PCT    = float(os.getenv("V12_WHALE_MAX_PCT", "4"))        # işlemlerin %3'ünden fazlası balina ise eşik güvenilmez
 V12_MIN_TRADES       = int(float(os.getenv("V12_MIN_TRADES", "60")))     # bu sayının altında CVD'ye güvenme
 
 # Spoofing
@@ -6102,7 +6106,7 @@ if V131_GEVSEK:
     # (d) Hacim kapısı: 0.8 fazla sertti (ortalamanın altındaki her mumu kesiyor).
     V123_MIN_VOL_RATIO = float(os.getenv("V123_MIN_VOL_RATIO", "0.55"))
     # (e) Araştırma eşiği biraz iner.
-    V11_RESEARCH_MIN = float(os.getenv("V11_RESEARCH_MIN_SCORE", "52"))
+    V11_RESEARCH_MIN = float(os.getenv("V11_RESEARCH_MIN_SCORE", "40"))
 
 # Huni sayaçları — her kapı kaç aday eledi?
 _V131_HUNI = ["tarandi","veri","yapi","pivot","range","choch","sweep","fomo",
@@ -6360,6 +6364,8 @@ def v12_on_trades(symbol: str, rows: List[Dict[str, Any]]) -> None:
         vals = sorted(x[1] for x in f["tr"])
         f["med"] = vals[n // 2]
         f["p90"] = vals[min(n - 1, int(n * 0.90))]
+        # V13.3: balina eşiği için gerçek üst yüzdelik dilim
+        f["p99"] = vals[min(n - 1, int(n * (1.0 - V12_WHALE_TOP_PCT / 100.0)))]
 
 
 def v12_cvd(symbol: str, window_sec: float = 900) -> Optional[Dict[str, Any]]:
@@ -6385,39 +6391,59 @@ def v12_cvd(symbol: str, window_sec: float = 900) -> Optional[Dict[str, Any]]:
 
 
 def v12_whale_prints(symbol: str, window_sec: float = 900) -> Optional[Dict[str, Any]]:
-    """Balina baskısı: medyanın V12_WHALE_MULT katından büyük TEK işlemler.
-    Bunlar kurumsal iz — mum grafiğinde asla görünmezler."""
+    """Balina baskısı: penceredeki GERÇEKTEN büyük tek işlemler.
+
+    V13.3 — üç sürümde iki kez yanlış yaptım, ikisi de canlı veriyle çıktı:
+      1) p90 × çarpan: kalın kuyruklu coinlerde işlemlerin %5'ini "balina"
+         yapıp güvenlik supabını tetikliyordu ("eşiği kalibresiz — yok
+         sayıldı": MANA, KORU, LINK).
+      2) Sadece sayıyla üst %1: bu sefer TÜM işlemler aynı boyuttayken bile
+         birini balina ilan ediyordu — düz bir tapede balina yoktur.
+    Doğrusu ikisinin birleşimi:
+      • eşik = penceredeki üst %1'in alt sınırı (sayıyla, beraberliğe dayanıklı)
+      • ama bu eşik medyanın V12_WHALE_MULT katından küçükse → balina YOK
+      • eşiği geçen TÜM işlemler sayılır (2 dev emir varsa ikisi de girer)
+    """
     f = _v12_flow.get(symbol)
-    if not f or not f["tr"] or safe_float(f.get("p90")) <= 0:
+    if not f or not f["tr"]:
         return None
-    esik = safe_float(f["p90"]) * V12_WHALE_MULT
     kes = time.time() - window_sec
-    al = sat = 0.0; na = ns = 0; enb = 0.0; enb_buy = None; toplam_islem = 0
-    for ts, notional, buy, _px in f["tr"]:
-        if ts < kes:
-            continue
-        toplam_islem += 1
-        if notional < esik:
-            continue
-        if buy: al += notional; na += 1
-        else:   sat += notional; ns += 1
-        if notional > enb:
-            enb = notional; enb_buy = buy
-    n = na + ns
-    pay = (n / toplam_islem * 100.0) if toplam_islem else 0.0
-    # Kalibrasyon güvenlik supabı: balina "nadir" demektir. İşlemlerin
-    # %3'ünden fazlası eşiği aşıyorsa eşik bozuktur → veri kullanılmaz.
-    if pay > V12_WHALE_MAX_PCT:
+    pencere = [(nt, bu) for ts, nt, bu, _p in f["tr"] if ts >= kes]
+    toplam = len(pencere)
+    if toplam < 10:
+        return None
+
+    boylar = sorted((nt for nt, _ in pencere), reverse=True)
+    medyan = boylar[toplam // 2]
+    if medyan <= 0:
+        return {"n": 0, "al": 0.0, "sat": 0.0, "baski": 0.0, "esik": 0.0,
+                "en_buyuk": 0.0, "pay": 0.0, "medyan": medyan}
+
+    # ÖNCE BÜYÜKLÜK: balina, medyanın V12_WHALE_MULT katından büyük emirdir.
+    esik = medyan * V12_WHALE_MULT
+    aday = [x for x in boylar if x >= esik]
+
+    # SONRA TAVAN: eğer bu kadar çok işlem eşiği geçiyorsa eşik bozuktur
+    # (kalın kuyruk). O zaman üst %1'in sınırına yükseltilir.
+    if len(aday) > toplam * V12_WHALE_MAX_PCT / 100.0:
+        hedef = max(1, int(toplam * V12_WHALE_TOP_PCT / 100.0))
+        esik = boylar[hedef - 1]
+        aday = boylar[:hedef]
+    if not aday:
         return {"n": 0, "al": 0.0, "sat": 0.0, "baski": 0.0, "esik": esik,
-                "en_buyuk": 0.0, "pay": round(pay, 1), "kalibresiz": True}
-    if n == 0:
-        return {"n": 0, "al": 0.0, "sat": 0.0, "baski": 0.0, "esik": esik,
-                "en_buyuk": 0.0, "pay": 0.0}
-    tot = al + sat
+                "en_buyuk": 0.0, "pay": 0.0, "medyan": medyan}
+
+    secili = [(nt, bu) for nt, bu in pencere if nt >= esik]
+    al = sum(nt for nt, bu in secili if bu)
+    sat = sum(nt for nt, bu in secili if not bu)
+    na = sum(1 for _, bu in secili if bu); ns = len(secili) - na
+    n = len(secili); tot = al + sat
+    enb = max((nt for nt, _ in secili), default=0.0)
+    enb_buy = next((bu for nt, bu in secili if nt == enb), None)
     return {"n": n, "na": na, "ns": ns, "al": al, "sat": sat,
             "baski": ((al - sat) / tot) if tot > 0 else 0.0,
-            "esik": esik, "en_buyuk": enb, "en_buyuk_al": enb_buy,
-            "pay": round(pay, 2)}
+            "esik": esik, "medyan": medyan, "en_buyuk": enb,
+            "en_buyuk_al": enb_buy, "pay": round(n / toplam * 100.0, 1)}
 
 
 # --------------------------------------------------------- DEFTER / SPOOFING
@@ -7045,17 +7071,43 @@ def v10_cvd_proxy(k):
 
 
 def v10_detect_sweep(side, k, ms):
-    seg = k[-V10_SWEEP_LOOKBACK:]
-    sl = safe_float(ms.get("last_sl")); sh = safe_float(ms.get("last_sh"))
-    if side == "LONG" and sl > 0:
-        for r in seg:
-            o=safe_float(r[1]); c=safe_float(r[4]); l=safe_float(r[3])
-            if l < sl and c > sl and (min(o,c)-l) > (abs(c-o)+1e-9)*V10_SWEEP_MIN_WICK:
+    """V13.3 ONARIMI — bu fonksiyon sessizce ÖLMÜŞTÜ.
+    Canlı çıktıda 12 sinyalin 12'sinde de 'Sweep▫️' vardı; yani hiç ateşlemiyordu.
+    Sebep v10_sweep_reversal'da düzelttiğim hatanın aynısı: ms['last_sl'] /
+    ['last_sh'] süpürme mumundan SONRAKİ pivotu gösteriyor — süpürme mumunun
+    kendi dibi/tepesi anında yeni pivot oluyor ve delinecek eski seviye
+    ortadan kalkıyor. Ayrıca V12.4 önem filtresi bu pivotu daha da uzağa itiyor.
+    Sonuçları ağırdı: (a) 7 puanlık sweep bileşeni hiç verilmedi,
+    (b) CHoCH sweep şartı TÜM CHoCH sinyallerini bloklıyordu (huni: 197),
+    (c) V126_REQUIRE_SWEEP=true iken hiçbir sinyal çıkamazdı.
+    Çözüm: aday seviye lookback penceresinden ÖNCE oluşmuş pivotlardan seçilir."""
+    if len(k) < 25:
+        return 0.0
+    look = min(V10_SWEEP_LOOKBACK, len(k) - 1)
+    bas = len(k) - look
+    seg = k[bas:]
+    try:
+        sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT)
+    except Exception:
+        sw = []
+    kind = "L" if side == "LONG" else "H"
+    eski = [x for x in sw if x.kind == kind and x.idx <= bas]
+    if eski:
+        piv = min(eski, key=lambda x: x.price) if side == "LONG" else max(eski, key=lambda x: x.price)
+        lvl = piv.price
+    else:
+        # yedek: yapıdan gelen seviye (eski davranış)
+        lvl = safe_float(ms.get("last_sl") if side == "LONG" else ms.get("last_sh"))
+    if lvl <= 0:
+        return 0.0
+    for r in seg:
+        o=safe_float(r[1]); c=safe_float(r[4]); h=safe_float(r[2]); l=safe_float(r[3])
+        govde = abs(c-o) + 1e-9
+        if side == "LONG":
+            if l < lvl and c > lvl and (min(o,c)-l) > govde*V10_SWEEP_MIN_WICK:
                 return 1.0
-    if side == "SHORT" and sh > 0:
-        for r in seg:
-            o=safe_float(r[1]); c=safe_float(r[4]); h=safe_float(r[2])
-            if h > sh and c < sh and (h-max(o,c)) > (abs(c-o)+1e-9)*V10_SWEEP_MIN_WICK:
+        else:
+            if h > lvl and c < lvl and (h-max(o,c)) > govde*V10_SWEEP_MIN_WICK:
                 return 1.0
     return 0.0
 
@@ -7651,7 +7703,19 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
         if akis.get("veto"):
             out["red"].append(akis["veto"])
 
-    S = max(0.0, min(100.0, S))
+    # V13.3 ONARIMI — skor 100'de DOYUYORDU, ayırt etmiyordu.
+    # Canlı çıktıda 5 sinyal AYNEN 100.0 aldı; USELESS iki uyarıya rağmen 100.0.
+    # Sebep: temel 7 test zaten 100 puan üretiyor, üstüne grafik(+20),
+    # balina(+20) ve canlı akış(+20) ekleniyor → ham 160'a çıkıp 100'e kırpılıyor.
+    # Kırpılan her şey aynı görünüyordu. Artık gerçek tavana göre normalize
+    # ediliyor, böylece 70 ile 95 arasındaki fark tekrar görülüyor.
+    ham = S
+    tavan = 100.0
+    if V11_CHART_READER: tavan += 20.0
+    if V11_WHALE_EYE:    tavan += 20.0
+    if akis.get("aktif"): tavan += 20.0
+    S = max(0.0, min(100.0, ham / tavan * 100.0))
+    out["ham"] = round(ham, 1); out["tavan"] = round(tavan, 1)
     out["score"] = round(S, 1)
     if out["red"]:
         out["verdict"] = "TERS" if out["reverse_hint"] else "RED"
@@ -7829,22 +7893,51 @@ def v11_whale_eye(side, oi_change_pct, price_move_pct, funding, ob=None):
     fr=safe_float(funding); ham=0.0
 
     # 1) Balina diverjansı — dosyadaki eşiklerle aynı mantık
-    if pm >= WHALE_PRICE_FLAT_UP_MIN_PCT and oi <= WHALE_OI_BEARISH_DROP_PCT:
+    # V13.3 ONARIMI — burası v10_quality_score ile ÇELİŞİYORDU.
+    # Değişken adları "FLAT" diyor ama koşul flat'i zorlamıyordu:
+    #   pm <= WHALE_PRICE_FLAT_DOWN_MAX_PCT (0.1)  → HER düşüşü yakalıyor
+    # Yani %0.8 düşen bir coin "BOĞA DİVERJANSI / sessiz birikim" sayılıp
+    # SHORT'a -12 veriyordu; oysa v10_quality_score aynı tabloya "düşüşe yeni
+    # short parası" deyip 9/9 tam puan veriyordu. Aynı girdi, zıt sonuç.
+    # Artık flat GERÇEKTEN flat (iki taraflı bant) ve beş hal ayrı ayrı okunuyor.
+    flat_alt = WHALE_PRICE_FLAT_UP_MIN_PCT      # -0.1
+    flat_ust = WHALE_PRICE_FLAT_DOWN_MAX_PCT    # +0.1
+    yatay = (flat_alt <= pm <= flat_ust)
+    oi_artis = (oi >= WHALE_OI_BULLISH_RISE_PCT)
+    oi_erime = (oi <= WHALE_OI_BEARISH_DROP_PCT)
+
+    if pm > flat_ust and oi_erime:
+        # Yükseliş var ama yeni para yok → short kapatmasıyla şişmiş ralli
         out["tip"]="AYI DİVERJANSI"
-        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} ama OI %{oi:+.2f} eriyor — long'lar kaçıyor")
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} ama OI %{oi:+.2f} eriyor — ralli yeni parayla değil, short kapatmayla")
         ham += (-12.0 if up else 14.0)
-    elif pm <= WHALE_PRICE_FLAT_DOWN_MAX_PCT and oi >= WHALE_OI_BULLISH_RISE_PCT:
-        out["tip"]="BOĞA DİVERJANSI"
-        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} ama OI %{oi:+.2f} artıyor — sessiz birikim")
-        ham += (14.0 if up else -12.0)
+    elif pm < flat_alt and oi_erime:
+        # Düşüş var ve pozisyonlar kapanıyor → long tasfiyesi tükeniyor
+        out["tip"]="TASFİYE TÜKENİŞİ"
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f}, OI %{oi:+.2f} eriyor — long tasfiyesi bitmek üzere")
+        ham += (9.0 if up else -6.0)
+    elif yatay and oi_artis:
+        # Fiyat durgun ama pozisyon birikiyor → yön belirsiz, enerji yükleniyor
+        out["tip"]="SESSİZ BİRİKİM"
+        out["notlar"].append(f"🐋 fiyat yatay (%{pm:+.2f}) ama OI %{oi:+.2f} artıyor — birikim, yön henüz belirsiz")
+        ham += 3.0
+    elif pm < flat_alt and oi_artis:
+        # Düşerken yeni pozisyon → yeni short parası (v10 skoruyla AYNI yorum)
+        out["tip"]="AYI DEVAMI"
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} düşerken OI %{oi:+.2f} artıyor — düşüşe yeni para")
+        ham += (-10.0 if up else 12.0)
+    elif pm > flat_ust and oi_artis:
+        out["tip"]="BOĞA DEVAMI"
+        out["notlar"].append(f"🐋 fiyat %{pm:+.2f} yükselirken OI %{oi:+.2f} artıyor — yükselişe yeni para")
+        ham += (12.0 if up else -10.0)
     elif (pm > 0 and oi > 0) or (pm < 0 and oi < 0):
-        out["tip"]="UYUMLU"
         yon_ok = (pm > 0) == up
+        out["tip"] = "TREND UYUMLU" if yon_ok else "TRENDE TERS"
         out["notlar"].append(f"🐋 fiyat ve OI aynı yönde (%{pm:+.2f}/%{oi:+.2f}) — "
                              f"{'pozisyonla uyumlu' if yon_ok else 'pozisyona TERS trend'}")
         ham += (8.0 if yon_ok else -10.0)
     else:
-        out["tip"]="SESSİZ"; out["notlar"].append(f"🐋 balina hareketi yok (OI %{oi:+.2f})")
+        out["tip"]="SESSİZ"; out["notlar"].append(f"🐋 belirgin balina izi yok (OI %{oi:+.2f})")
 
     # 2) Funding ekstremi — kalabalığın tersi
     if fr > FUNDING_BEARISH_THRESHOLD:
@@ -8204,7 +8297,9 @@ def build_v10_message(sig):
     res_line = ""
     if rs:
         notes = rs.get("notes", [])[:7]
-        res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 — ONAY\n"
+        res_line = (f"🔬 Araştırma: {rs.get('score',0)}/100 "
+                    + (f"(ham {rs.get('ham')}/{rs.get('tavan')}) " if rs.get("tavan") else "")
+                    + "— ONAY\n"
                     + "".join(f"   {_v123_isaret(n)} {n}\n" for n in notes))
     gr = (rs.get("grafik") or {}) if rs else {}
     wh = (rs.get("whale") or {}) if rs else {}
