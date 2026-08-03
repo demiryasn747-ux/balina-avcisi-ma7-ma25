@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.4 (Yapı Tipi Ölçümü)"
+VERSION_NAME = "Balina Avcısı V13.5 (Kalıcı Risk + Sessiz Hata Alarmı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.4")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.5")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -109,7 +109,11 @@ MEME_COIN_BASES = set(x.strip().upper() for x in os.getenv("MEME_COIN_BASES",
     ).split(",") if x.strip())
 EXTRA_BLOCKLIST = set(x.strip().upper() for x in os.getenv("EXTRA_BLOCKLIST", "").split(",") if x.strip())
 
-MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "true").lower() == "true"
+# V13.5: MA7/MA25 motoru Haziran 2026'da 1.500-2.000 paper işlemle ölü ilan
+# edildi ve o günden beri /status'ta sinyal sayısı 0. Buna rağmen varsayılanı
+# "true" idi: her turda 200 coin için boşuna analiz yapıp CPU ve API kotası
+# harcıyordu. Varsayılan kapatıldı. Açmak istersen MA_ENGINE_ENABLED=true.
+MA_ENGINE_ENABLED = os.getenv("MA_ENGINE_ENABLED", "false").lower() == "true"
 MA_COIN_LIMIT = int(float(os.getenv("MA_COIN_LIMIT", "200")))
 MA_SCAN_INTERVAL_SEC = float(os.getenv("MA_SCAN_INTERVAL_SEC", "30"))
 MA_KLINE_INTERVAL = os.getenv("MA_KLINE_INTERVAL", "1H").strip()
@@ -545,6 +549,13 @@ def ensure_memory_shape() -> None:
     memory.setdefault("paper_trades", [])
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("last_diag_ts", 0.0)
+    # V13.5: RiskGuard durumu artık memory içinde → diske yazılıyor.
+    # Eskiden self.state sadece bellekteydi; her deploy'da günlük drawdown
+    # sayacı, art arda stop sayaçları ve KARA LİSTE sıfırlanıyordu. Yani
+    # "3 stop → 48 saat kara liste" kuralı bir deploy ile siliniyordu.
+    memory.setdefault("risk_state", {"day_key": "", "daily_pnl_pct": 0.0,
+                                     "halt_until": 0.0, "consec_stops": {},
+                                     "blacklist_until": {}})
     memory["stats"].setdefault("ma_long", 0)
     memory["stats"].setdefault("ma_short", 0)
     memory["stats"].setdefault("ma_analyzed", 0)
@@ -1428,6 +1439,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
         stats["blocked_symbol_skip"] += 1
         return []
 
+    v135_deneme("kline")
     cache_key = f"{symbol}:{interval}:{limit}"
     cached = kline_cache.get(cache_key)
     now_ts = time.time()
@@ -1443,6 +1455,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
         if not rows:
             stats["api_fail"] += 1
             note_symbol_fail(symbol, f"{interval}:empty")
+            v135_sessiz_hata("kline", f"{symbol} {interval}: boş yanıt")
             return []
         note_symbol_success(symbol)
         kline_cache[cache_key] = (now_ts, rows)
@@ -1450,6 +1463,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
     except Exception as e:
         stats["api_fail"] += 1
         note_symbol_fail(symbol, f"{interval}:{e}")
+        v135_sessiz_hata("kline", f"{symbol} {interval}: {e}")
         logger.warning("OKX kline alınamadı %s %s: %s", symbol, interval, e)
         return []
 
@@ -2732,11 +2746,30 @@ class RiskGuard:
         return True, "OK"
 
 
+def _risk_state() -> Dict[str, Any]:
+    """V13.5: RiskGuard'ın kalıcı durumu. memory'ye BAĞLI olduğu için
+    save_memory() ile diske iner ve deploy'dan sağ çıkar."""
+    ensure_memory_shape()
+    return memory["risk_state"]
+
+
 RISK_GUARD = RiskGuard(
     daily_dd_pct=RISK_DAILY_DD_PCT, halt_hours=RISK_HALT_HOURS,
     max_consec_stops=RISK_MAX_CONSEC_STOPS, blacklist_hours=RISK_BLACKLIST_HOURS,
     max_open_per_group=RISK_MAX_OPEN_PER_GROUP,
 )
+
+
+def v135_risk_bagla() -> None:
+    """load_memory() sonrası çağrılır: RiskGuard'ı kalıcı sözlüğe bağlar.
+    Referansla bağlanır — RiskGuard'ın her yazması doğrudan memory'ye işler."""
+    try:
+        RISK_GUARD.state = _risk_state()
+        logger.info("V13.5 RiskGuard kalıcı duruma bağlandı (DD %.2f | kara liste %d)",
+                    safe_float(RISK_GUARD.state.get("daily_pnl_pct")),
+                    len(RISK_GUARD.state.get("blacklist_until") or {}))
+    except Exception as e:
+        logger.warning("V13.5 RiskGuard bağlanamadı: %s", e)
 
 
 async def fetch_okx_oi_change(symbol: str, lookback_periods: int = 12) -> Optional[float]:
@@ -5656,6 +5689,8 @@ async def post_init(application) -> None:
     asyncio.create_task(diagnostic_loop())
     asyncio.create_task(followup_loop())
     asyncio.create_task(save_loop())
+    v135_risk_bagla()                       # RiskGuard'ı kalıcı duruma bağla
+    asyncio.create_task(v135_saglik_loop())
     asyncio.create_task(v10_scan_loop())
     asyncio.create_task(v10_paper_loop())
     if V12_WS_ENABLED:
@@ -5923,6 +5958,11 @@ V12_WS_BOOKS         = os.getenv("V12_WS_BOOKS", "true").lower() == "true"
 V12_WS_PING_SEC      = float(os.getenv("V12_WS_PING_SEC", "20"))
 V12_WS_STALE_SEC     = float(os.getenv("V12_WS_STALE_SEC", "45"))
 V12_WS_HOTLIST_SEC   = float(os.getenv("V12_WS_HOTLIST_SEC", "180"))
+# V13.5: OKX abone/çıkış limiti bağlantı başına 480/saat. Hotlist saatte 20 kez
+# tazeleniyor; normalde sadece FARK gönderiliyor ama hotlist hızlı değişirse
+# limite yaklaşılabilir. Kota dolarsa tazeleme atlanır, BAĞLANTI KORUNUR —
+# bağlantı düşerse tüm CVD verisi gider ve CVD sert şart olduğu için sinyal durur.
+V135_SUB_BUDGET      = int(float(os.getenv("V135_SUB_BUDGET", "400")))
 
 # CVD pencereleri (saniye)
 V12_CVD_WINDOWS      = (300, 900, 3600)
@@ -6140,6 +6180,72 @@ _v132_lock = threading.Lock()
 _v132_state = {"rps": V132_RPS, "son": time.time(), "jeton": 0.0}
 
 
+# ============================================================================ #
+#  V13.5 — SESSİZ HATA ALARMI
+#  Dış incelemenin en değerli tespiti: kod her yerde "except → logla → devam"
+#  yapıyor. Bu yüzden V13.0'ın devre kesicisi 2 GÜN boyunca tüm veriyi
+#  kesti ve kimse fark etmedi; sadece sinyal gelmiyordu. Log dosyasına
+#  bakmadan görülmüyordu.
+#  Artık hatalar TÜRÜNE GÖRE sayılıyor ve oran eşiği aşarsa Telegram'a
+#  alarm gidiyor. Sessizlik artık sessiz değil.
+# ============================================================================ #
+V135_HATA_ALARM      = os.getenv("V135_HATA_ALARM", "true").lower() == "true"
+V135_HATA_ORAN       = float(os.getenv("V135_HATA_ORAN", "25"))     # % — bu oranı aşarsa alarm
+V135_HATA_MIN        = int(float(os.getenv("V135_HATA_MIN", "50"))) # en az bu kadar deneme olmalı
+V135_ALARM_COOLDOWN  = float(os.getenv("V135_ALARM_COOLDOWN_SEC", "1800"))
+_v135_hata: Dict[str, Any] = {}
+_v135_son_alarm: Dict[str, float] = {}
+
+
+def v135_sessiz_hata(tur: str, detay: str = "") -> None:
+    h = _v135_hata.setdefault(tur, {"n": 0, "son": ""})
+    h["n"] += 1; h["son"] = detay[:160]
+
+
+def v135_deneme(tur: str) -> None:
+    h = _v135_hata.setdefault(tur, {"n": 0, "son": ""})
+    h["deneme"] = int(safe_float(h.get("deneme"))) + 1
+
+
+async def v135_saglik_kontrol() -> None:
+    """Hata oranı eşiği aşarsa Telegram'a bir kez alarm gönderir."""
+    if not V135_HATA_ALARM:
+        return
+    now = time.time()
+    for tur, h in list(_v135_hata.items()):
+        dn = int(safe_float(h.get("deneme")))
+        hn = int(safe_float(h.get("n")))
+        if dn < V135_HATA_MIN:
+            continue
+        oran = hn / dn * 100.0
+        if oran < V135_HATA_ORAN:
+            continue
+        if now - safe_float(_v135_son_alarm.get(tur)) < V135_ALARM_COOLDOWN:
+            continue
+        _v135_son_alarm[tur] = now
+        await safe_send_telegram(
+            f"🚨 SESSİZ HATA ALARMI — {tur}\n"
+            f"Son ölçümde {dn:,} denemenin {hn:,} tanesi başarısız (%{oran:.1f}).\n"
+            f"Son hata: {h.get('son') or '-'}\n"
+            f"Bot çalışmaya devam ediyor ama bu oranla sinyal üretemeyebilir.\n"
+            f"Teşhis: /huni (veri kapısı) ve /saglik")
+        logger.error("V13.5 SESSİZ HATA: %s %%%.1f (%d/%d)", tur, oran, hn, dn)
+
+
+def v135_hata_ozeti() -> str:
+    if not _v135_hata:
+        return "hata kaydı yok"
+    p = []
+    for tur, h in sorted(_v135_hata.items(), key=lambda x: -int(safe_float(x[1].get("n")))):
+        dn = int(safe_float(h.get("deneme"))); hn = int(safe_float(h.get("n")))
+        if dn == 0 and hn == 0:
+            continue
+        oran = (hn / dn * 100.0) if dn else 0.0
+        isaret = "🔴" if oran >= V135_HATA_ORAN else ("🟡" if oran >= 5 else "🟢")
+        p.append(f"{isaret} {tur}: {hn:,}/{dn:,} (%{oran:.1f})")
+    return " | ".join(p) if p else "hata kaydı yok"
+
+
 def _v132_bekle() -> None:
     """Token bucket: hız aşılıyorsa isteği GÖNDERMEDEN önce bekletir."""
     with _v132_lock:
@@ -6326,7 +6432,7 @@ from collections import deque as _deque
 _v12_state: Dict[str, Any] = {
     "connected": False, "last_msg_ts": 0.0, "conn_ts": 0.0,
     "reconnects": 0, "msgs": 0, "trades": 0, "books": 0, "errors": 0,
-    "subs": set(), "last_error": "", "sub_calls": 0,
+    "subs": set(), "last_error": "", "sub_calls": 0, "sub_pencere": [],
 }
 _v12_flow: Dict[str, Any] = {}    # symbol -> {"tr": deque, "med": float}
 _v12_book: Dict[str, Any] = {}    # symbol -> {"walls": {}, "spoofs": deque, "bb":, "ba":}
@@ -6684,11 +6790,26 @@ async def v12_ws_loop() -> None:
                 bekle = 2.0
                 logger.info("V12 WS bağlandı: %s", V12_WS_URL)
 
+                def _sub_kota_kalan() -> int:
+                    kes = time.time() - 3600
+                    pen = [t for t in _v12_state.get("sub_pencere", []) if t > kes]
+                    _v12_state["sub_pencere"] = pen
+                    return V135_SUB_BUDGET - len(pen)
+
                 async def _abone(semboller, kanal, op="subscribe"):
                     args = [{"channel": kanal, "instId": s} for s in semboller]
+                    gereken = (len(args) + 39) // 40
+                    if _sub_kota_kalan() < gereken:
+                        stats["v135_sub_kota"] = int(stats.get("v135_sub_kota", 0)) + 1
+                        logger.warning("V13.5 abonelik kotası doldu (%d/%d saat) — "
+                                       "%s %s atlandı, bağlantı korunuyor",
+                                       len(_v12_state.get("sub_pencere", [])),
+                                       V135_SUB_BUDGET, op, kanal)
+                        return
                     for i in range(0, len(args), 40):        # tek mesajda 40 arg
                         await ws.send(json.dumps({"op": op, "args": args[i:i+40]}))
                         _v12_state["sub_calls"] += 1
+                        _v12_state.setdefault("sub_pencere", []).append(time.time())
                         await asyncio.sleep(0.4)             # 3 istek/sn IP limiti
 
                 mevcut_t = set(v12_hotlist_trades()) if V12_WS_TRADES else set()
@@ -8584,6 +8705,17 @@ async def maybe_send_v10_signal(sig):
         logger.warning("V11 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
 
 
+async def v135_saglik_loop() -> None:
+    """Sessiz hata oranını periyodik kontrol eder, eşik aşılırsa alarm verir."""
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await v135_saglik_kontrol()
+        except Exception as e:
+            logger.debug("V13.5 sağlık kontrolü hata: %s", e)
+        await asyncio.sleep(600)
+
+
 async def v10_scan_loop() -> None:
     if not V10_ENGINE_ENABLED:
         return
@@ -8921,6 +9053,12 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"({V130_VOL_SPIKE_MULT:g}x → {V130_VOL_BLOCK_MIN:g}dk) | blok={int(stats.get('v130_vol_blok',0))}"
         + (f" | son: {stats.get('v130_son_vol')}" if stats.get('v130_son_vol') else ""),
         f"🗄 SQLite: {'AÇIK' if v130_db() else 'KAPALI'} — detay için /history",
+        f"🩺 Hata oranları: {v135_hata_ozeti()}",
+        f"🛡 Risk durumu (KALICI): günlük {safe_float(RISK_GUARD.state.get('daily_pnl_pct')):+.2f}% | "
+        f"kara liste {len(RISK_GUARD.state.get('blacklist_until') or {})} coin | "
+        f"halt {'AKTİF' if safe_float(RISK_GUARD.state.get('halt_until')) > time.time() else 'yok'}",
+        f"⚙️ MA7/MA25 motoru: {'AÇIK' if MA_ENGINE_ENABLED else 'KAPALI (ölü motor)'} | "
+        f"abonelik kotası aşımı: {int(stats.get('v135_sub_kota', 0))}",
         f"Akış kapısı reddi: {int(stats.get('v122_red_akis',0))}"
         + (f" | son: {stats.get('v122_son_akis_red')}" if stats.get('v122_son_akis_red') else ""),
         f"Grafik Okuyucu: {'AÇIK' if V11_CHART_READER else 'KAPALI'} (veto={V11_CHART_VETO}) | "
