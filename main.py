@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.3 (Sweep Onarımı + Skor Ayrıştırma)"
+VERSION_NAME = "Balina Avcısı V13.4 (Yapı Tipi Ölçümü)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.3")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.4")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -8779,6 +8779,13 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         KAP = ("SELECT {g}, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
                "FROM islemler WHERE sonuc!='ACIK' GROUP BY {g} HAVING COUNT(*)>=1 "
                "ORDER BY AVG(r) DESC")
+        # V13.4: yapı tipi ayrı bir kolon değil — 'yapi' metninden çıkarılıyor.
+        # (Şema değiştirmemek için; mevcut veritabanları bozulmasın.)
+        YAPI = ("CASE WHEN yapi LIKE '%Süpürme%' THEN 'SÜPÜRME DÖNÜŞÜ' "
+                "WHEN yapi LIKE '%CHoCH%' THEN 'CHoCH (dönüş)' "
+                "WHEN yapi LIKE '%BOS%' THEN 'BOS (devam)' ELSE 'diğer' END")
+        BAND = ("CASE WHEN skor>=90 THEN '90+' WHEN skor>=80 THEN '80-90' "
+                "WHEN skor>=70 THEN '70-80' ELSE '<70' END")
         if arg == "KAPI":
             blok("1D REJİM UYUMU",
                  "SELECT CASE WHEN (yon='LONG' AND gunluk_rejim='UP') OR "
@@ -8786,10 +8793,49 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  "WHEN gunluk_rejim='-' THEN 'rejim bilinmiyor' ELSE 'rejim TERS' END, "
                  "COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
                  "FROM islemler WHERE sonuc!='ACIK' GROUP BY 1 ORDER BY 4 DESC")
+            blok("YAPI TİPİ", KAP.format(g=YAPI))
+            # Hasan'ın hipotezi: "eski CHoCH'lar sinyal kalitesi düşük olduğu
+            # için kaybetti, tipin kendisi bozuk olduğu için değil."
+            # Bu tabloyla test edilir: CHoCH yüksek skorda kazanıp düşük skorda
+            # kaybediyorsa hipotez doğrulanır.
+            blok("YAPI × SKOR BANDI",
+                 f"SELECT {YAPI} || ' | ' || {BAND}, COUNT(*), "
+                 "AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                 "FROM islemler WHERE sonuc!='ACIK' GROUP BY 1 ORDER BY 4 DESC")
             blok("CVD KAYNAĞI", KAP.format(g="cvd_kaynak"))
             blok("SPOOF EĞİLİMİ", KAP.format(g="spoof"))
             blok("BTC 1H", KAP.format(g="btc_1h"))
             blok("YAPI TRENDİ", KAP.format(g="trend_struct"))
+        elif arg in ("CHOCH", "CHOCH?", "CHOÇ"):
+            L.append("\n— CHoCH ODAK RAPORU —")
+            r0 = con.execute(
+                "SELECT COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r), SUM(r) "
+                "FROM islemler WHERE sonuc!='ACIK' AND yapi LIKE '%CHoCH%'").fetchone()
+            r1 = con.execute(
+                "SELECT COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                "FROM islemler WHERE sonuc!='ACIK' AND yapi NOT LIKE '%CHoCH%'").fetchone()
+            n0 = int(safe_float(r0[0])); n1 = int(safe_float(r1[0]))
+            L.append(f"CHoCH   : n={n0:<3} WR%{safe_float(r0[1]):.0f} EV={safe_float(r0[2]):+.3f}R "
+                     f"toplam {safe_float(r0[3]):+.2f}R")
+            L.append(f"Diğerleri: n={n1:<3} WR%{safe_float(r1[1]):.0f} EV={safe_float(r1[2]):+.3f}R")
+            if n0 == 0:
+                L.append("\nHenüz CHoCH kapanışı yok. (V13.3 öncesi sweep dedektörü "
+                         "bozuk olduğu için TÜM CHoCH'lar bloklanıyordu.)")
+            else:
+                blok("CHoCH — skor bandı",
+                     f"SELECT {BAND}, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                     "FROM islemler WHERE sonuc!='ACIK' AND yapi LIKE '%CHoCH%' "
+                     "GROUP BY 1 ORDER BY 4 DESC")
+                blok("CHoCH — yön",
+                     "SELECT yon, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+                     "FROM islemler WHERE sonuc!='ACIK' AND yapi LIKE '%CHoCH%' "
+                     "GROUP BY 1 ORDER BY 4 DESC")
+                if n0 < 30:
+                    L.append(f"\n⚠️ n={n0} — KARAR VERME. En az 30 kapanış gerekiyor; "
+                             "bu sayıda fark gürültüden ayırt edilemez.")
+                else:
+                    fark = safe_float(r0[2]) - safe_float(r1[2])
+                    L.append(f"\nCHoCH ile diğerleri arasındaki EV farkı: {fark:+.3f}R")
         elif arg:
             rows = con.execute(
                 "SELECT sembol,yon,setup,skor,sonuc,r,acilis_ts FROM islemler "
@@ -8809,6 +8855,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 L.append(f"Genel: n={row[0]} WR%{(row[1] or 0):.1f} "
                          f"EV={(row[2] or 0):+.3f}R toplam={(row[3] or 0):+.2f}R")
             blok("SETUP", KAP.format(g="setup"))
+            blok("YAPI TİPİ", KAP.format(g=YAPI))
             blok("YÖN", KAP.format(g="yon"))
             blok("SONUÇ DAĞILIMI",
                  "SELECT sonuc, COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
@@ -8821,7 +8868,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 L.append("\n— En iyi / en kötü —")
                 for x in en: L.append(f"  ✅ {x[0]} {x[1]} {safe_float(x[2]):+.2f}R")
                 for x in ko: L.append(f"  ❌ {x[0]} {x[1]} {safe_float(x[2]):+.2f}R")
-            L.append("\n/history KAPI → kapı bazlı kırılım | /history BTC → coin geçmişi")
+            L.append("\n/history KAPI → kapı kırılımı | /history CHOCH → CHoCH odak | "
+                     "/history BTC → coin geçmişi")
         L.append("\n⚠️ n<30 olan satırlar istatistiksel değil, sadece gözlem.")
     except Exception as e:
         L.append(f"Sorgu hatası: {e}")
