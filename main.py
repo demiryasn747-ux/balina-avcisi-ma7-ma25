@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.5 (Kalıcı Risk + Sessiz Hata Alarmı)"
+VERSION_NAME = "Balina Avcısı V13.6 (Yön Kuralları + Kurulum Bazlı Skor)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V13.6")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6193,6 +6193,74 @@ V135_HATA_ALARM      = os.getenv("V135_HATA_ALARM", "true").lower() == "true"
 V135_HATA_ORAN       = float(os.getenv("V135_HATA_ORAN", "25"))     # % — bu oranı aşarsa alarm
 V135_HATA_MIN        = int(float(os.getenv("V135_HATA_MIN", "50"))) # en az bu kadar deneme olmalı
 V135_ALARM_COOLDOWN  = float(os.getenv("V135_ALARM_COOLDOWN_SEC", "1800"))
+
+# ============================================================================ #
+#  V13.6 — HASAN'IN 8 MADDESİ
+#
+#  Her madde AYRI env anahtarında. Sebep: 20 gün sonra /kazanan verisiyle
+#  hangisinin gerçekten kazandırdığını tek tek açıp kapatabilelim. Hepsini
+#  tek anahtara bağlarsam hangisinin işe yaradığını asla ayıramayız.
+#
+#  İKİ MADDEDE ÖLÇÜLÜ DAVRANDIM — sebepleri aşağıda, her biri gerçek veriyle:
+#
+#  M1 (dönüş 4H uyumu): TAM yasak yerine "en az bir zaman dilimi desteklesin".
+#      Gerekçe: dönüş kurulumu tanımı gereği bir TF'ye ters olur. Tam yasak
+#      son partide 7 dönüş sinyalinin 7'sini de öldürüyordu. Bu haliyle CRO
+#      (15m/1H/4H hepsi UP → SHORT) ve APT (destekleyen TF yok) yine ölüyor —
+#      ki ikisini de ben işaret etmiştim — ama RIVER/LAB/KITE yaşıyor.
+#
+#  M3/M4 (RSI kapıları): RED yerine CEZA.
+#      Gerekçe: "SHORT RSI>75 RED" kuralı son partide RIVER/LAB/KITE'ı
+#      kesiyor ve geriye RSI 46-57 bandını bırakıyordu. Temmuzda 8/8 STOP
+#      olan short'ların RSI'ı tam olarak 45.4-55.2'ydi. Yani kural, elimizdeki
+#      TEK short verisinin tersini yapıyor. Ceza olarak sıralamayı yine
+#      düşürür ama sinyali öldürmez; 20 gün sonra veriyle karar veririz.
+#      Kapı olarak istersen: V136_RSI_HARD=true
+#
+#  M7 (kurulum bazlı eşik): KIRILIM 65 (istediğin gibi), DÖNÜŞ 70.
+#      Gerekçe: 75 eşiği son partideki 7 dönüş sinyalinin 7'sini de kesiyordu
+#      (en yükseği CRO 84.7, o da M1'den ölüyor). Ayrıca skor–sonuç
+#      korelasyonu r=-0.02, yani skor bilgi taşımıyor; taşımayan bir sayıya
+#      daha çok kapı yetkisi vermek riskli. 75 istersen: V136_MIN_DONUS=75
+# ============================================================================ #
+
+# M1 — Süpürme dönüşü zaman dilimi uyumu
+V136_M1_DONUS_TF     = os.getenv("V136_M1_DONUS_TF", "true").lower() == "true"
+V136_M1_KATI         = os.getenv("V136_M1_KATI", "false").lower() == "true"   # true = tam 4H uyumu
+# M2 — 4H'a ters KIRILIM skor cezası
+V136_M2_BOS_CEZA     = float(os.getenv("V136_M2_BOS_CEZA", "10"))
+# M3/M4 — RSI ve 1H uç kuralları
+V136_RSI_HARD        = os.getenv("V136_RSI_HARD", "false").lower() == "true"
+V136_LONG_RSI_MIN    = float(os.getenv("V136_LONG_RSI_MIN", "25"))
+V136_SHORT_RSI_MAX   = float(os.getenv("V136_SHORT_RSI_MAX", "75"))
+V136_RSI_CEZA        = float(os.getenv("V136_RSI_CEZA", "8"))
+V136_1H_TERS_CEZA    = float(os.getenv("V136_1H_TERS_CEZA", "10"))
+V136_1H_HARD         = os.getenv("V136_1H_HARD", "false").lower() == "true"
+# M5 — Hacim (bunu KAPI olarak kabul ettim; son partide hiçbirini kesmiyor)
+V136_M5_VOL_RED      = float(os.getenv("V136_M5_VOL_RED", "0.70"))
+V136_M5_VOL_CEZA_UST = float(os.getenv("V136_M5_VOL_CEZA_UST", "0.80"))
+V136_M5_VOL_CEZA     = float(os.getenv("V136_M5_VOL_CEZA", "5"))
+# M6 — Seviye test sayısı bonusu
+V136_M6_SEVIYE       = os.getenv("V136_M6_SEVIYE", "true").lower() == "true"
+# M7 — Kurulum bazlı min skor
+V136_MIN_KIRILIM     = float(os.getenv("V136_MIN_KIRILIM", "65"))
+# ÖLÇÜM SONUCU: dönüş sinyallerinin skor dağılımı 66-70 bandında oturuyor
+# (son parti: 66.0, 67.1, 67.9, 68.1, 69.2, 70.2, 84.7). Eşiği 70 yapmak
+# kategorinin TAMAMINI siliyor, 75 yapmak da öyle. Ve skor–sonuç korelasyonu
+# r=-0.02, yani eşiği yükseltmek "daha iyi dönüş seçmek" değil, sadece
+# kategoriyi silmek demek. Varsayılan 65; 70/75 istersen env ile ayarla —
+# /v10 raporunda M7'nin kaç dönüş sinyali kestiğini canlı görürsün.
+V136_MIN_DONUS       = float(os.getenv("V136_MIN_DONUS", "65"))
+# M8 — 1H trend teyidi bonusu (5 → 10)
+V136_M8_1H_BONUS     = float(os.getenv("V136_M8_1H_BONUS", "10"))
+
+
+def v136_tf_destek(side: str, t15: str, t1h: str, t4h: str) -> Tuple[int, int]:
+    """Kaç zaman dilimi yönü DESTEKLİYOR, kaçı KARŞI? (RANGE/FLAT nötr sayılır)"""
+    bek = "UP" if side == "LONG" else "DOWN"
+    ters = "DOWN" if side == "LONG" else "UP"
+    tfs = [str(t15 or "").upper(), str(t1h or "").upper(), str(t4h or "").upper()]
+    return sum(1 for t in tfs if t == bek), sum(1 for t in tfs if t == ters)
 _v135_hata: Dict[str, Any] = {}
 _v135_son_alarm: Dict[str, float] = {}
 
@@ -7689,8 +7757,13 @@ async def v11_deep_research(sig: Dict[str, Any], k1h: List[List[Any]]) -> Dict[s
             S += 10; out["notes"].append(f"hacim x{rat:.2f} (kırılımı besliyor)")
         elif rat >= 0.8:
             S += 6; out["notes"].append(f"hacim x{rat:.2f} (normal)")
-        elif V123_VOL_HARD_GATE and rat < V123_MIN_VOL_RATIO:
-            out["red"].append(f"hacim x{rat:.2f} < {V123_MIN_VOL_RATIO:.2f} — kırılımın arkasında para yok")
+        elif V123_VOL_HARD_GATE and rat < V136_M5_VOL_RED:
+            # M5: hacim <0.70 → RED (Hasan'ın istediği gibi sert kapı)
+            out["red"].append(f"M5: hacim x{rat:.2f} < {V136_M5_VOL_RED:.2f} — kırılımın arkasında para yok")
+        elif rat < V136_M5_VOL_CEZA_UST:
+            # M5: 0.70-0.80 arası → skor cezası (RED değil)
+            S -= V136_M5_VOL_CEZA
+            out["notes"].append(f"hacim x{rat:.2f} zayıf → M5 cezası -{V136_M5_VOL_CEZA:g}")
         else:
             S += 1; out["notes"].append(f"hacim x{rat:.2f} ZAYIF — kırılım desteksiz")
     except Exception:
@@ -8193,6 +8266,31 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                 if V10_USE_4H_FILTER and not V125_IGNORE_4H and trend4 != "FLAT":
                     if rside == "LONG" and trend4 != "UP": dur = True
                     if rside == "SHORT" and trend4 != "DOWN": dur = True
+                # ═══ M1: SÜPÜRME DÖNÜŞÜ ZAMAN DİLİMİ UYUMU ═══
+                # Katı mod (V136_M1_KATI=true): 4H ile TAM aynı yön şart.
+                # Varsayılan mod: en az bir zaman dilimi yönü desteklesin.
+                # Dönüş kurulumu doğası gereği bir TF'ye ters olur; tam yasak
+                # son partide 7 dönüş sinyalinin 7'sini de öldürüyordu.
+                if V136_M1_DONUS_TF:
+                    _t15 = ms_r.get("trend", "RANGE")
+                    _t1h_m1 = "-"
+                    try:
+                        _k1 = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
+                        if len(_k1) >= 40:
+                            _t1h_m1 = v10_market_structure(_s_closed(_k1)).get("trend", "-")
+                    except Exception:
+                        pass
+                    _dst, _trs = v136_tf_destek(rside, _t15, _t1h_m1, trend4)
+                    if V136_M1_KATI:
+                        if (rside == "LONG" and trend4 != "UP") or (rside == "SHORT" and trend4 != "DOWN"):
+                            dur = True
+                            stats["v136_m1_red"] = int(stats.get("v136_m1_red", 0)) + 1
+                    elif _dst == 0 and _trs >= 2:
+                        # Hiçbir TF desteklemiyor VE en az ikisi karşı → iptal
+                        dur = True
+                        stats["v136_m1_red"] = int(stats.get("v136_m1_red", 0)) + 1
+                        stats["v136_m1_son"] = (f"{rside} {symbol}: 15m:{_t15} "
+                                                f"1H:{_t1h_m1} 4H:{trend4} — destekleyen TF yok")
                 blk, mv = v10_fomo_block(rside, kc)
                 if not dur and not blk:
                     reversal = rev
@@ -8262,8 +8360,12 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         ms1 = _ms1
         yon1 = ms1.get("event_side")
         bekle = "UP" if side == "LONG" else "DOWN"
-        if yon1 == bekle:
-            h1_teyit = True; h1_bonus = V122_1H_BONUS
+        # M8: bonus 5 → 10 ve artık 1H TRENDİ de sayılıyor (Hasan "1H trendi"
+        # dedi; eski kod yalnızca 1H'te BOS/CHoCH OLAYI arıyordu, o yüzden
+        # çoğu sinyalde "1H teyit yok (olay yok)" çıkıyordu).
+        _trend_uyum = (trend_1h_ger == bekle)
+        if yon1 == bekle or _trend_uyum:
+            h1_teyit = True; h1_bonus = V136_M8_1H_BONUS
             ltf_note = f"1H de aynı yönde ({ms1.get('event')} {yon1}) → +{V122_1H_BONUS:g} bonus"
             stats["v122_1h_teyit"] = int(stats.get("v122_1h_teyit", 0)) + 1
         else:
@@ -8300,6 +8402,65 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if h1_bonus:
         score = round(score + h1_bonus, 1)
         parts["h1_teyit"] = h1_bonus
+
+    # ═══ M2: 4H trendine TERS KIRILIM → skor cezası ═══
+    # Kırılım artık 4H'tan bağımsız çalışabilir (kapı yok), ama ters yönde
+    # olanın skoru düşer. Süpürme dönüşü M1 ile ayrıca ele alınıyor.
+    if not reversal and V136_M2_BOS_CEZA > 0:
+        _t4 = str(gate.get("trend4") or "").upper()
+        if (side == "LONG" and _t4 == "DOWN") or (side == "SHORT" and _t4 == "UP"):
+            score = round(score - V136_M2_BOS_CEZA, 1)
+            parts["m2_4h_ters"] = -V136_M2_BOS_CEZA
+
+    # ═══ M3/M4: RSI uçları + 1H ters yön ═══
+    # Hasan RED istedi; CEZA olarak uyguladım. Gerekçe kod başındaki notta:
+    # "SHORT RSI>75 RED" kuralı, temmuzda 8/8 stop olan RSI 45-55 bandını
+    # koruyup RSI 80'de reddedilen tepeleri kesiyordu. Kapı istersen
+    # V136_RSI_HARD=true.
+    # ÇİFT CEZA DÜZELTMESİ: M3/M4 yalnızca KIRILIM sinyallerine uygulanır.
+    # Sebep: süpürme dönüşünde "RSI 80" ve "1H ters" birer KUSUR değil,
+    # kurulumun TANIMIDIR — tepe reddediliyor diye giriyoruz. Hem M7 ile
+    # daha yüksek eşik koyup hem de bu özellikleri cezalandırmak, aynı şeyi
+    # iki kez cezalandırmaktır ve test bunu doğruladı: dönüş sinyallerinin
+    # 7'si de eşiğin altına düşüyordu.
+    _rsi_ihlal = (not reversal) and ((side == "LONG" and r < V136_LONG_RSI_MIN) or
+                  (side == "SHORT" and r > V136_SHORT_RSI_MAX))
+    if _rsi_ihlal:
+        if V136_RSI_HARD:
+            stats["v136_rsi_red"] = int(stats.get("v136_rsi_red", 0)) + 1
+            return None
+        score = round(score - V136_RSI_CEZA, 1)
+        parts["m34_rsi_uc"] = -V136_RSI_CEZA
+        stats["v136_rsi_ceza"] = int(stats.get("v136_rsi_ceza", 0)) + 1
+
+    _1h_ters = (not reversal) and ((side == "LONG" and trend_1h_ger == "DOWN") or
+                (side == "SHORT" and trend_1h_ger == "UP"))
+    if _1h_ters:
+        if V136_1H_HARD:
+            stats["v136_1h_red"] = int(stats.get("v136_1h_red", 0)) + 1
+            return None
+        score = round(score - V136_1H_TERS_CEZA, 1)
+        parts["m34_1h_ters"] = -V136_1H_TERS_CEZA
+
+    # ═══ M6: seviye kaç kez test edilmiş? ═══
+    # 10+ → +10 | 5-9 → +5 | <3 → -5. Çok test edilen seviyenin arkasında
+    # yoğun stop birikimi olur; kırılımı daha anlamlıdır.
+    if V136_M6_SEVIYE:
+        try:
+            _lvl = safe_float(gate.get("lvl"))
+            _a6 = atr(k, V10_ATR_PERIOD)[-1]
+            if _lvl > 0 and _a6 > 0:
+                _tol = _lvl * 0.0035
+                _dok = sum(1 for _r in k[-80:]
+                           if safe_float(_r[3]) - _tol <= _lvl <= safe_float(_r[2]) + _tol)
+                _b6 = 10.0 if _dok >= 10 else (5.0 if _dok >= 5 else (-5.0 if _dok < 3 else 0.0))
+                if _b6:
+                    score = round(score + _b6, 1)
+                    parts["m6_seviye"] = _b6
+                parts["m6_dokunus"] = _dok
+        except Exception:
+            pass
+
     if gunluk_ceza:
         score = round(score - gunluk_ceza, 1)
         parts["gunluk_rejim"] = -gunluk_ceza
@@ -8316,8 +8477,13 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
         v131_say("rsi")
         return None
-    if score < V10_MIN_QUALITY:
+    # ═══ M7: KIRILIM ve SÜPÜRME DÖNÜŞÜ ayrı eşikler ═══
+    _esik = V136_MIN_DONUS if reversal else V136_MIN_KIRILIM
+    if score < _esik:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
+        stats["v136_m7_son"] = f"{side} {symbol}: {score} < {_esik} ({'DÖNÜŞ' if reversal else 'KIRILIM'})"
+        stats["v136_m7_donus" if reversal else "v136_m7_kirilim"] = int(
+            stats.get("v136_m7_donus" if reversal else "v136_m7_kirilim", 0)) + 1
         v131_say("skor")
         return None
     # --- V11: CANLI GİRİŞ FİYATI -------------------------------------------
@@ -9054,6 +9220,13 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + (f" | son: {stats.get('v130_son_vol')}" if stats.get('v130_son_vol') else ""),
         f"🗄 SQLite: {'AÇIK' if v130_db() else 'KAPALI'} — detay için /history",
         f"🩺 Hata oranları: {v135_hata_ozeti()}",
+        f"📐 V13.6 kuralları: M1 dönüş-TF={'KATI' if V136_M1_KATI else 'esnek'} (red={int(stats.get('v136_m1_red',0))}) | "
+        f"M2 4H-ters BOS -{V136_M2_BOS_CEZA:g} | M3/M4 RSI={'KAPI' if V136_RSI_HARD else f'ceza -{V136_RSI_CEZA:g}'} "
+        f"(uygulanan={int(stats.get('v136_rsi_ceza',0))}) | 1H-ters={'KAPI' if V136_1H_HARD else f'ceza -{V136_1H_TERS_CEZA:g}'}",
+        f"📐 M5 hacim<{V136_M5_VOL_RED:g} RED | M6 seviye bonusu={'AÇIK' if V136_M6_SEVIYE else 'kapalı'} | "
+        f"M7 eşik KIRILIM {V136_MIN_KIRILIM:g} (kesti={int(stats.get('v136_m7_kirilim',0))}) / "
+        f"DÖNÜŞ {V136_MIN_DONUS:g} (kesti={int(stats.get('v136_m7_donus',0))}) | M8 1H bonus +{V136_M8_1H_BONUS:g}"
+        + (f"\n   son M7 reddi: {stats.get('v136_m7_son')}" if stats.get('v136_m7_son') else ""),
         f"🛡 Risk durumu (KALICI): günlük {safe_float(RISK_GUARD.state.get('daily_pnl_pct')):+.2f}% | "
         f"kara liste {len(RISK_GUARD.state.get('blacklist_until') or {})} coin | "
         f"halt {'AKTİF' if safe_float(RISK_GUARD.state.get('halt_until')) > time.time() else 'yok'}",
