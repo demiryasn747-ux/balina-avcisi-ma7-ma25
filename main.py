@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V13.6 (Yön Kuralları + Kurulum Bazlı Skor)"
+VERSION_NAME = "Balina Avcısı V14.0 (Kesin Kural Seti)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V13.6")
+BOT_BUILD = os.getenv("BOT_BUILD", "V14.0")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6255,6 +6255,375 @@ V136_MIN_DONUS       = float(os.getenv("V136_MIN_DONUS", "65"))
 V136_M8_1H_BONUS     = float(os.getenv("V136_M8_1H_BONUS", "10"))
 
 
+# ============================================================================ #
+#  V14.0 — KESİN KURAL SETİ
+#
+#  Hasan'ın tam spesifikasyonu. Karar akışı sabittir ve dışına çıkılmaz:
+#    1) İptal katmanı → 2) Temel skor → 3) Bonus/ceza → 4) Final (0-100)
+#    5) Kalite sınıfı → 6) Risk → 7) Stop → 8) TP → 9) Gönder
+#
+#  TEK SAPMA (Hasan'ın talimatı): MİNİMUM SKOR SİNYALİ ENGELLEMEZ.
+#  Skor ve kalite sınıfı yalnızca GÖSTERGE. Eşik altındaki sinyaller de
+#  gönderilir, mesajda "eşik altı" olarak işaretlenir. Böylece 20 gün sonra
+#  /kazanan verisiyle "eşik gerçekten kazandırıyor mu" ölçülebilir —
+#  eşik kapı olsaydı kesilenlerin sonucunu asla göremezdik.
+#
+#  ÖLÇÜM NOTU (son 13 gerçek sinyale uygulandı): iptal katmanı tek başına
+#  9 sinyali kesiyor (confluence ≤3 → 8 adet, ters 1H BOS → 1 adet).
+#  Confluence dağılımı 2,3,3,3,3,3,3,3,4,4,4,4,3 — medyan 3. Bu yüzden
+#  V14_CONF_IPTAL env ile ayarlanabilir bıraktım (varsayılan 3 = senin dediğin).
+# ============================================================================ #
+V14_ENABLED          = os.getenv("V14_ENABLED", "true").lower() == "true"
+V14_SKOR_KAPI        = os.getenv("V14_SKOR_KAPI", "false").lower() == "true"  # Hasan: GÖSTERGE
+V14_CONF_IPTAL       = int(float(os.getenv("V14_CONF_IPTAL", "3")))    # ≤ bu → iptal
+V14_FOMO_ATR         = float(os.getenv("V14_FOMO_ATR", "1.2"))         # 30dk hareket / ATR15m
+V14_TERS_1H_IPTAL    = os.getenv("V14_TERS_1H_IPTAL", "true").lower() == "true"
+
+# Temel skor ağırlıkları (toplam 100)
+V14_W_1D, V14_W_4H, V14_W_1H = 28.0, 18.0, 15.0
+V14_W_CONF, V14_W_AKIS, V14_W_BALINA, V14_W_GRAFIK = 14.0, 12.0, 8.0, 5.0
+V14_W_CVD, V14_W_HACIM, V14_W_OI = 5.0, 4.0, 3.0        # canlı akışın içi
+
+# Minimum skorlar — GÖSTERGE (V14_SKOR_KAPI=true yapılırsa kapı olur)
+V14_MIN_TREND        = float(os.getenv("V14_MIN_TREND", "70"))
+V14_MIN_COUNTER      = float(os.getenv("V14_MIN_COUNTER", "87"))
+V14_MIN_ISTISNA      = float(os.getenv("V14_MIN_ISTISNA", "90"))
+
+# Kırılım istisnası şartları
+V14_IST_HACIM        = float(os.getenv("V14_IST_HACIM", "2.0"))
+V14_IST_DOKUNUS      = int(float(os.getenv("V14_IST_DOKUNUS", "10")))
+V14_IST_CONF         = int(float(os.getenv("V14_IST_CONF", "5")))
+
+# Balina gözü puan tablosu (yön farkında)
+V14_BALINA_PUAN = {
+    "DEVAM": 12.0, "GÜÇLÜ DAĞITIM": 12.0, "GÜÇLÜ BİRİKİM": 12.0,
+    "SESSİZ": 7.0, "TREND UYUMLU": 5.0, "NÖTR": 0.0,
+    "TRENDE TERS": -18.0, "DİVERJANS": -22.0, "GÜÇLÜ TERS": -28.0,
+}
+# 1H teyit
+V14_1H_BOS, V14_1H_CHOCH, V14_1H_YOK = 12.0, 7.0, -15.0
+# Dinamik likidite
+V14_LIK_ORTA, V14_LIK_DUSUK = 0.65, 0.50
+V14_LIK_CEZA_ORTA, V14_LIK_CEZA_DUSUK = 10.0, 18.0
+# Spoofing kanıt puanı tavanı
+V14_SPOOF_MAX        = float(os.getenv("V14_SPOOF_MAX", "4"))
+V14_TP_LIKIDITE      = os.getenv("V14_TP_LIKIDITE", "true").lower() == "true"
+
+V14_SINIF = ((95,"S+"),(90,"S"),(85,"A+"),(80,"A"),(75,"B"),(70,"C"))
+
+
+def v14_sinif(skor: float) -> str:
+    for esik, ad in V14_SINIF:
+        if skor >= esik:
+            return ad
+    return "RED"
+
+
+def v14_risk_pct(d1: str, side: str) -> float:
+    """1D rejimine göre pozisyon riski (Hasan'ın tablosu)."""
+    bek = "UP" if side == "LONG" else "DOWN"
+    if d1 == bek:      return 1.4
+    if d1 == "RANGE":  return 1.1
+    return 0.9
+
+
+def v14_balina_puan(side: str, tip: str, baski: float) -> Tuple[float, str]:
+    """Balina etiketini yön farkında puana çevirir.
+    V13.3'te etiketler piyasayı tanımlıyordu (BOĞA DEVAMI / AYI DEVAMI...);
+    burada pozisyona göre işaret veriyoruz."""
+    t = str(tip or "").upper()
+    up = (side == "LONG")
+    if "BOĞA DEVAMI" in t:      return (12.0 if up else -18.0), ("BOĞA DEVAMI" if up else "TRENDE TERS")
+    if "AYI DEVAMI" in t:       return (-18.0 if up else 12.0), ("TRENDE TERS" if up else "AYI DEVAMI")
+    if "BOĞA DİVERJANS" in t:   return (12.0 if up else -22.0), ("GÜÇLÜ BİRİKİM" if up else "BOĞA DİVERJANSI")
+    if "AYI DİVERJANS" in t:    return (-22.0 if up else 12.0), ("AYI DİVERJANSI" if up else "GÜÇLÜ DAĞITIM")
+    if "SESSİZ BİRİKİM" in t:   return (7.0 if up else -7.0), ("SESSİZ BİRİKİM" if up else "SESSİZ BİRİKİM (ters)")
+    if "TASFİYE" in t:          return (7.0 if up else -7.0), "TASFİYE TÜKENİŞİ"
+    if "TREND UYUMLU" in t:     return 5.0, "TREND UYUMLU"
+    if "TRENDE TERS" in t:      return -18.0, "TRENDE TERS"
+    return 0.0, "NÖTR"
+
+
+def v14_vwap(k: List[Any], periyot: int) -> float:
+    """Tipik fiyat × hacim ağırlıklı ortalama. periyot = kaç mum geriye."""
+    seg = k[-periyot:] if periyot < len(k) else k
+    tv = pv = 0.0
+    for r in seg:
+        h = safe_float(r[2]); l = safe_float(r[3]); c = safe_float(r[4])
+        v = safe_float(r[5])
+        tp = (h + l + c) / 3.0
+        pv += tp * v; tv += v
+    return (pv / tv) if tv > 0 else 0.0
+
+
+def v14_footprint(symbol: str, window_sec: float = 900) -> Dict[str, Any]:
+    """FOOTPRINT / DELTA — mum içindeki agresif alıcı-satıcı dengesi.
+    WS trades akışında her işlemin taker yönü var; fiyat seviyelerine bölüp
+    seviye bazlı delta çıkarıyoruz. CVD ile uyumsuzluk puan kırar."""
+    f = _v12_flow.get(symbol)
+    if not f or not f["tr"]:
+        return {"aktif": False}
+    kes = time.time() - window_sec
+    pen = [(p, nt, bu) for ts, nt, bu, p in f["tr"] if ts >= kes]
+    if len(pen) < 20:
+        return {"aktif": False}
+    al = sum(nt for _, nt, bu in pen if bu)
+    sat = sum(nt for _, nt, bu in pen if not bu)
+    tot = al + sat
+    delta = (al - sat) / tot if tot > 0 else 0.0
+    # seviye bazlı: fiyat aralığını 10 kovaya böl, her kovanın deltası
+    pxs = [p for p, _, _ in pen if p > 0]
+    lo, hi = min(pxs), max(pxs)
+    kovalar = []
+    if hi > lo:
+        for i in range(10):
+            a = lo + (hi - lo) * i / 10.0; b = lo + (hi - lo) * (i + 1) / 10.0
+            ka = sum(nt for p, nt, bu in pen if a <= p < b and bu)
+            ks = sum(nt for p, nt, bu in pen if a <= p < b and not bu)
+            if ka + ks > 0:
+                kovalar.append({"px": round((a + b) / 2, 8),
+                                "delta": round((ka - ks) / (ka + ks), 3),
+                                "hacim": round(ka + ks, 2)})
+    en_guclu = max(kovalar, key=lambda x: abs(x["delta"]) * x["hacim"]) if kovalar else None
+    return {"aktif": True, "delta": round(delta, 3), "n": len(pen),
+            "kovalar": kovalar, "baskin": en_guclu}
+
+
+def v14_htf_likidite(k1h: List[Any], k4h: List[Any], fiyat: float,
+                     side: str) -> List[Dict[str, Any]]:
+    """HTF LİKİDİTE HEDEFLERİ — eşit tepe/dipler (equal highs/lows).
+    Bunlar stopların biriktiği yerlerdir; fiyat oralara MIKNATIS gibi çekilir.
+    TP'lerin hangi seviyeye denk geldiğini göstermek için kullanılır."""
+    hedefler = []
+    for kk, ad in ((k1h, "1H"), (k4h, "4H")):
+        if not kk or len(kk) < 30:
+            continue
+        try:
+            a = atr(kk, 14)[-1]
+            sw = v10_anlamli_pivotlar(v10_find_swings(kk, 2, 2), a, 0.8)
+        except Exception:
+            continue
+        tol = a * 0.25 if a > 0 else fiyat * 0.001
+        for kind, etiket in (("H", "Equal Highs"), ("L", "Equal Lows")):
+            lst = [x.price for x in sw if x.kind == kind]
+            kume = []
+            for p in lst:
+                yer = next((g for g in kume if abs(g[0] - p) <= tol), None)
+                if yer: yer[1].append(p)
+                else: kume.append([p, [p]])
+            for merkez, uyeler in kume:
+                if len(uyeler) < 2:
+                    continue
+                lvl = sum(uyeler) / len(uyeler)
+                if side == "SHORT" and lvl >= fiyat: continue
+                if side == "LONG" and lvl <= fiyat: continue
+                hedefler.append({"tf": ad, "tip": etiket, "seviye": lvl,
+                                 "dokunus": len(uyeler),
+                                 "uzaklik_pct": abs(lvl - fiyat) / fiyat * 100.0})
+    return sorted(hedefler, key=lambda x: x["uzaklik_pct"])
+
+
+def v14_likidite_kumeleri(k: List[Any], fiyat: float, side: str,
+                          oi_pct: float) -> Dict[str, Any]:
+    """LİKİDİTE KÜMELERİ — DÜRÜST İSİMLENDİRME.
+    Bu bir 'likidasyon heatmap' DEĞİLDİR. OKX böyle bir API vermiyor
+    (Coinglass'ta var ama ücretli). Burada yapılan: yoğun işlem gören
+    fiyat seviyelerini (hacim profili) + çok kez test edilmiş swing
+    seviyelerini çıkarıp, kaldıraçlı stopların muhtemelen biriktiği
+    bölgeleri TAHMİN etmek. Kaba bir vekil ölçüdür, gerçek likidasyon
+    verisi değildir — mesajda da böyle yazılır."""
+    if len(k) < 60:
+        return {"aktif": False}
+    seg = k[-120:]
+    lo = min(safe_float(r[3]) for r in seg); hi = max(safe_float(r[2]) for r in seg)
+    if hi <= lo:
+        return {"aktif": False}
+    N = 24
+    kovalar = [0.0] * N
+    for r in seg:
+        h = safe_float(r[2]); l = safe_float(r[3]); v = safe_float(r[5])
+        i0 = int((l - lo) / (hi - lo) * (N - 1)); i1 = int((h - lo) / (hi - lo) * (N - 1))
+        n = max(1, i1 - i0 + 1)
+        for i in range(max(0, i0), min(N, i1 + 1)):
+            kovalar[i] += v / n
+    ort = sum(kovalar) / N
+    yogun = [{"px": lo + (hi - lo) * (i + 0.5) / N, "guc": kovalar[i] / ort}
+             for i in range(N) if kovalar[i] > ort * 1.5]
+    ileri = [x for x in yogun
+             if (side == "SHORT" and x["px"] < fiyat) or (side == "LONG" and x["px"] > fiyat)]
+    karsi = [x for x in yogun
+             if (side == "SHORT" and x["px"] > fiyat) or (side == "LONG" and x["px"] < fiyat)]
+    karsi_yakin = min((x for x in karsi), key=lambda x: abs(x["px"] - fiyat), default=None)
+    return {"aktif": True, "ileri": sorted(ileri, key=lambda x: abs(x["px"] - fiyat)),
+            "karsi_yakin": karsi_yakin,
+            "karsi_cok_yakin": bool(karsi_yakin and
+                                    abs(karsi_yakin["px"] - fiyat) / fiyat < 0.006),
+            "oi_pct": oi_pct}
+
+
+def v14_dinamik_likidite(k15: List[Any], k1h: List[Any]) -> float:
+    """Son 20 mumun ortalama hacmi / son 24 saatin saatlik ortalaması."""
+    try:
+        s20 = [safe_float(r[5]) for r in k15[-20:]]
+        if not s20: return 1.0
+        ort20 = sum(s20) / len(s20) * 4.0          # 15m → saatlik ölçek
+        s24 = [safe_float(r[5]) for r in k1h[-24:]]
+        if not s24: return 1.0
+        ort24 = sum(s24) / len(s24)
+        return (ort20 / ort24) if ort24 > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def v14_fomo_atr(k15: List[Any]) -> float:
+    """Son 30 dakikadaki (2 adet 15m mum) fiyat hareketi / ATR(15m)."""
+    try:
+        a = atr(k15, V10_ATR_PERIOD)[-1]
+        if a <= 0 or len(k15) < 3: return 0.0
+        return abs(safe_float(k15[-1][4]) - safe_float(k15[-3][4])) / a
+    except Exception:
+        return 0.0
+
+
+def v14_bos_teyidi(side: str, k: List[Any], sweep_idx_lvl: float) -> Dict[str, Any]:
+    """SÜPÜRMEDEN SONRA GERÇEKTEN YAPI DEĞİŞTİ Mİ?
+    Süpürme tek başına yeterli değil; ardından yapı kırılımı (BOS/CHoCH)
+    gelmeliydi. Gelmemişse kurulum zayıftır."""
+    try:
+        ms = v10_market_structure(k)
+    except Exception:
+        return {"bos": False, "puan": 0.0, "not": "yapı okunamadı"}
+    ev = ms.get("event"); es = ms.get("event_side")
+    bek = "UP" if side == "LONG" else "DOWN"
+    if ev in ("BOS", "CHoCH") and es == bek:
+        return {"bos": True, "tip": ev, "puan": 8.0,
+                "not": f"süpürme sonrası {ev} teyidi ✓"}
+    return {"bos": False, "puan": -6.0, "not": "süpürme var ama yapı değişimi YOK — zayıf"}
+
+
+def v14_kurulum_istatistigi(setup: str, side: str, yapi: str) -> str:
+    """Aynı kurulumun geçmiş performansı (SQLite defterinden)."""
+    con = v130_db()
+    if not con:
+        return ""
+    try:
+        r = con.execute(
+            "SELECT COUNT(*), AVG(CASE WHEN r>0 THEN 100.0 ELSE 0 END), AVG(r) "
+            "FROM islemler WHERE sonuc!='ACIK' AND yon=? AND setup=?",
+            (side, setup)).fetchone()
+        n = int(safe_float(r[0]))
+        if n == 0:
+            return f"📊 {setup} {side}: henüz kapanış yok"
+        uyari = "  ⚠️ n<30, yorumlama" if n < 30 else ""
+        return (f"📊 {setup} {side} geçmişi: n={n} | "
+                f"kazanma %{safe_float(r[1]):.0f} | ort {safe_float(r[2]):+.2f}R{uyari}")
+    except Exception:
+        return ""
+
+
+def v14_karar(side: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """V14 karar motoru. Sabit akış: iptal → temel → bonus/ceza → final → sınıf → risk."""
+    out: Dict[str, Any] = {"iptal": None, "notlar": [], "bonus": {}, "istisna": False}
+    bek  = "UP" if side == "LONG" else "DOWN"
+    ters = "DOWN" if side == "LONG" else "UP"
+    d1   = str(ctx.get("d1") or "-").upper()
+    t4h  = str(ctx.get("t4h") or "-").upper()
+    t1h  = str(ctx.get("t1h") or "-").upper()
+    conf = int(safe_float(ctx.get("conf")))
+    teyit = str(ctx.get("teyit_1h") or "yok")     # BOS | CHoCH | yok | ters
+    setup = str(ctx.get("setup") or "KIRILIM")
+    hac   = safe_float(ctx.get("hacim"), 1.0)
+    oi    = safe_float(ctx.get("oi"))
+    dokunus = int(safe_float(ctx.get("dokunus")))
+    btc4 = str(ctx.get("btc_4h") or "-").upper()
+
+    # ═══ 1) İPTAL KATMANI ═══
+    if V14_TERS_1H_IPTAL and teyit == "ters":
+        out["iptal"] = "ters 1H BOS/CHoCH"; return out
+    if conf <= V14_CONF_IPTAL:
+        out["iptal"] = f"confluence {conf}/6 ≤ {V14_CONF_IPTAL}"; return out
+    if safe_float(ctx.get("fomo_atr")) > V14_FOMO_ATR:
+        out["iptal"] = (f"FOMO: son 30dk hareketi {safe_float(ctx.get('fomo_atr')):.2f}×ATR "
+                        f"> {V14_FOMO_ATR:g}"); return out
+
+    # Kırılım istisnası: 1D ters + KIRILIM ise 8 şart aranır
+    ist_gerekli = (setup == "KIRILIM" and d1 == ters)
+    if ist_gerekli:
+        sartlar = [
+            (d1 == ters,                      "1D yöne ters"),
+            (t4h == bek,                      f"4H {bek}"),
+            (teyit == "BOS",                  "1H BOS"),
+            (btc4 == bek,                     f"BTC 4H {bek}"),
+            (hac > V14_IST_HACIM,             f"hacim >{V14_IST_HACIM:g}x"),
+            (dokunus >= V14_IST_DOKUNUS,      f"seviye ≥{V14_IST_DOKUNUS} dokunuş"),
+            (conf >= V14_IST_CONF,            f"confluence ≥{V14_IST_CONF}/6"),
+        ]
+        eksik = [ad for ok, ad in sartlar if not ok]
+        if eksik:
+            out["iptal"] = "kırılım istisnası eksik: " + ", ".join(eksik[:3]); return out
+        out["istisna"] = True
+
+    # ═══ 2) TEMEL SKOR ═══
+    def tf_puan(t, w):
+        return w if t == bek else (w * 0.5 if t == "RANGE" else 0.0)
+    temel  = tf_puan(d1, V14_W_1D) + tf_puan(t4h, V14_W_4H) + tf_puan(t1h, V14_W_1H)
+    temel += V14_W_CONF * (conf / 6.0)
+    cvd = safe_float(ctx.get("cvd"))
+    cvd_uyum = cvd if side == "LONG" else -cvd
+    temel += V14_W_CVD * max(0.0, min(1.0, cvd_uyum / 0.5))
+    temel += V14_W_HACIM * max(0.0, min(1.0, hac / 1.5))
+    oi_uyum = oi if side == "LONG" else -oi
+    temel += V14_W_OI * max(0.0, min(1.0, (oi_uyum + 2.0) / 4.0))
+    bal_p, bal_ad = v14_balina_puan(side, ctx.get("balina_tip"), safe_float(ctx.get("balina")))
+    temel += V14_W_BALINA * max(0.0, min(1.0, (bal_p + 28.0) / 40.0))
+    temel += V14_W_GRAFIK * max(0.0, min(1.0, (safe_float(ctx.get("grafik")) + 20.0) / 40.0))
+    out["temel"] = round(temel, 1)
+
+    # ═══ 3) BONUS / CEZA ═══
+    s = temel
+    def ekle(ad, p):
+        nonlocal s
+        if p:
+            s += p; out["bonus"][ad] = round(p, 1)
+
+    if setup == "KIRILIM":
+        if d1 == "RANGE": ekle("1D RANGE", -15.0)
+    else:                                        # SÜPÜRME DÖNÜŞÜ
+        if d1 == ters:    ekle("1D ters (dönüş)", -22.0)
+        elif d1 == "RANGE": ekle("1D RANGE (dönüş)", -15.0)
+    ekle(f"balina: {bal_ad}", bal_p)
+    ekle("1H teyit", {"BOS": V14_1H_BOS, "CHoCH": V14_1H_CHOCH}.get(teyit, V14_1H_YOK))
+
+    # Hacim + OI kuralı
+    oi_ters = (oi > 0) if side == "SHORT" else (oi < 0)
+    if oi_ters:
+        c = -25.0 if hac < 0.8 else (-15.0 if hac < 1.0 else 0.0)
+        if c and hac > 1.8: c /= 2.0
+        ekle("hacim+OI ters", c)
+    elif hac > 2.5:
+        ekle("hacim>2.5x + OI uyumlu", 10.0)
+
+    # Dinamik likidite
+    lik = safe_float(ctx.get("likidite_oran"), 1.0)
+    if lik < V14_LIK_DUSUK:   ekle("likidite çok düşük", -V14_LIK_CEZA_DUSUK)
+    elif lik < V14_LIK_ORTA:  ekle("likidite düşük", -V14_LIK_CEZA_ORTA)
+
+    # Spoofing sadece kanıt puanı (0..+4), otomatik yön yorumu YOK
+    ekle("spoof kanıtı", max(0.0, min(V14_SPOOF_MAX, safe_float(ctx.get("spoof_kanit")))))
+
+    # ═══ 4) FİNAL (0-100) ═══
+    out["final"] = round(max(0.0, min(100.0, s)), 1)
+    out["sinif"] = v14_sinif(out["final"])
+    # ═══ 5) MİNİMUM SKOR — GÖSTERGE (Hasan'ın talimatı) ═══
+    out["esik"] = (V14_MIN_ISTISNA if out["istisna"]
+                   else (V14_MIN_TREND if t4h == bek else V14_MIN_COUNTER))
+    out["esik_alti"] = out["final"] < out["esik"]
+    out["trend_yonunde"] = (t4h == bek)
+    # ═══ 6) RİSK ═══
+    out["risk_pct"] = v14_risk_pct(d1, side)
+    return out
+
+
 def v136_tf_destek(side: str, t15: str, t1h: str, t4h: str) -> Tuple[int, int]:
     """Kaç zaman dilimi yönü DESTEKLİYOR, kaçı KARŞI? (RANGE/FLAT nötr sayılır)"""
     bek = "UP" if side == "LONG" else "DOWN"
@@ -8477,6 +8846,75 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
         v131_say("rsi")
         return None
+    # ══════════════════ V14 KARAR MOTORU ══════════════════
+    v14 = None
+    if V14_ENABLED:
+        _cf = 0
+        for _t in ("ob", "fvg", "vp", "cvd", "sweep", "obflow"):
+            if safe_float((parts or {}).get(_t)) > 0: _cf += 1
+        _k1h_v14 = []
+        try:
+            _k1h_v14 = _s_closed(await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT))
+        except Exception:
+            pass
+        _teyit = "yok"
+        if h1_teyit: _teyit = "BOS" if str(gate["ms"].get("event")) != "CHoCH" else "CHoCH"
+        elif _1h_ters: _teyit = "ters"
+        _fp = v14_footprint(symbol)
+        # CVD ile footprint uyumsuzluğu → puan kırılır
+        _fp_ceza = 0.0
+        if _fp.get("aktif"):
+            _c = safe_float((akis_bilgi.get("cvd") or {}).get("oran"))
+            if _c * safe_float(_fp.get("delta")) < 0 and abs(safe_float(_fp.get("delta"))) > 0.15:
+                _fp_ceza = 6.0
+        _lik = v14_dinamik_likidite(k, _k1h_v14 or k)
+        _vwap_g = v14_vwap(k, 96); _vwap_h = v14_vwap(k, 672)
+        _px_v14 = closes(k)[-1]
+        _vwap_ok = ((side == "LONG" and _px_v14 > _vwap_g) or
+                    (side == "SHORT" and _px_v14 < _vwap_g))
+        _kume = v14_likidite_kumeleri(k, _px_v14, side, safe_float(oi))
+        _spoof_kanit = 0.0
+        if V12_WS_ENABLED and _v12_state.get("connected"):
+            _sp = (akis_bilgi.get("spoof") or {})
+            _spoof_kanit = min(V14_SPOOF_MAX, safe_float(_sp.get("cekilen")) * 0.5)
+        v14 = v14_karar(side, {
+            "d1": gunluk, "t4h": gate.get("trend4"), "t1h": trend_1h_ger,
+            "conf": _cf, "teyit_1h": _teyit,
+            "setup": ("SÜPÜRME DÖNÜŞÜ" if reversal else "KIRILIM"),
+            "hacim": safe_float((research or {}).get("hacim_orani"), 1.0),
+            "oi": safe_float(oi), "cvd": safe_float((akis_bilgi.get("cvd") or {}).get("oran")),
+            "balina_tip": (akis_bilgi.get("whale") or {}).get("tip"),
+            "balina": safe_float((akis_bilgi.get("whale") or {}).get("baski")),
+            "grafik": safe_float((research.get("grafik") or {}).get("puan")),
+            "dokunus": int(safe_float((parts or {}).get("m6_dokunus"))),
+            "btc_4h": btc,
+            "fomo_atr": v14_fomo_atr(k), "likidite_oran": _lik,
+            "spoof_kanit": _spoof_kanit})
+        if _fp_ceza:
+            v14["final"] = round(max(0.0, v14["final"] - _fp_ceza), 1)
+            v14["bonus"]["footprint uyumsuz"] = -_fp_ceza
+            v14["sinif"] = v14_sinif(v14["final"])
+        v14.update({"footprint": _fp, "vwap_gun": _vwap_g, "vwap_hafta": _vwap_h,
+                    "vwap_ok": _vwap_ok, "kume": _kume, "conf": _cf})
+        if not _vwap_ok:
+            v14["notlar"].append(f"VWAP ters tarafta (günlük {_vwap_g:.6g})")
+        if _kume.get("karsi_cok_yakin"):
+            v14["final"] = round(max(0.0, v14["final"] - 8.0), 1)
+            v14["bonus"]["karşı likidite çok yakın"] = -8.0
+            v14["sinif"] = v14_sinif(v14["final"])
+        # ═══ İPTAL KATMANI — skor DEĞİL, kural iptali ═══
+        if v14.get("iptal"):
+            stats["v14_iptal"] = int(stats.get("v14_iptal", 0)) + 1
+            stats["v14_son_iptal"] = f"{side} {symbol}: {v14['iptal']}"
+            v131_say("v14_iptal")
+            return None
+        # Hasan'ın talimatı: MİNİMUM SKOR SİNYALİ ENGELLEMEZ (gösterge).
+        if V14_SKOR_KAPI and v14["esik_alti"]:
+            stats["v14_esik_red"] = int(stats.get("v14_esik_red", 0)) + 1
+            return None
+        if v14["esik_alti"]:
+            stats["v14_esik_alti"] = int(stats.get("v14_esik_alti", 0)) + 1
+
     # ═══ M7: KIRILIM ve SÜPÜRME DÖNÜŞÜ ayrı eşikler ═══
     _esik = V136_MIN_DONUS if reversal else V136_MIN_KIRILIM
     if score < _esik:
@@ -8515,6 +8953,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "tetik":tetik,"ltf_note":ltf_note,"kirilan_seviye":gate.get("lvl"),
             "h1_teyit":h1_teyit,"struct_tf":V122_STRUCT_TF,"akis":akis_bilgi,
             "setup":("SÜPÜRME DÖNÜŞÜ" if reversal else "KIRILIM"),"reversal":reversal,
+            "v14":v14,
             "retest_not":retest_not,
             "gunluk_rejim":gunluk,"gunluk_mesafe":gunluk_mes,
             "event":gate["ms"]["event"],"structure":gate["why"],
@@ -8602,8 +9041,15 @@ def build_v10_message(sig):
     if news and news.get("n"):
         news_line = f"📰 Haber tonu: {news.get('label')} ({news.get('score'):+.1f}) — {news.get('n')} başlık\n"
 
+    _v = sig.get("v14") or {}
+    _yildiz = {"S+":"⭐⭐⭐⭐⭐","S":"⭐⭐⭐⭐⭐","A+":"⭐⭐⭐⭐","A":"⭐⭐⭐⭐",
+               "B":"⭐⭐⭐","C":"⭐⭐","RED":"⭐"}.get(_v.get("sinif",""), "")
     return (f"🎯 {VERSION_NAME}\n"
-            f"🆕 {sig.get('setup','KIRILIM')} | {sig['direction']} | {sig['symbol']}\n"
+            f"🕐 {tr_str()} | mum {sig.get('candle_ts','-')}\n"
+            + (f"{_yildiz} {_v.get('sinif')} — final skor {_v.get('final')}/100"
+               + (f" ⚠️ eşik altı ({_v.get('esik'):.0f})" if _v.get("esik_alti") else "")
+               + "\n" if _v else "")
+            + f"🆕 {sig.get('setup','KIRILIM')} | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | {sig.get('struct_tf','15m')}:{sig.get('trend_struct','-')}"
             f" 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
@@ -8617,6 +9063,26 @@ def build_v10_message(sig):
             + (f"📅 1D rejim: {sig.get('gunluk_rejim')} (EMA{V130_DAILY_EMA}'e %{sig.get('gunluk_mesafe',0):+.1f})"
                + (" ⚠️ yöne TERS" if sig.get("score_parts",{}).get("gunluk_rejim") else "") + "\n"
                if sig.get("gunluk_rejim") in ("UP","DOWN") else "")
+            + ((f"━━ V14 PANELİ ━━\n"
+                f"Temel {_v.get('temel')} → bonus/ceza → FİNAL {_v.get('final')} ({_v.get('sinif')})\n"
+                f"Confluence {_v.get('conf')}/6 | eşik {_v.get('esik'):.0f} "
+                f"({'trend yönünde' if _v.get('trend_yonunde') else 'COUNTER TREND'}"
+                + (" | KIRILIM İSTİSNASI" if _v.get("istisna") else "") + ")\n"
+                + ("Etkiler: " + " · ".join(f"{k}{v:+.0f}" for k, v in
+                   sorted((_v.get('bonus') or {}).items(), key=lambda x: -abs(x[1]))[:6]) + "\n"
+                   if _v.get("bonus") else "")
+                + (f"📐 VWAP gün {_v.get('vwap_gun'):.6g} — "
+                   + ("✓ doğru tarafta" if _v.get("vwap_ok") else "⚠ ters tarafta") + "\n")
+                + ((f"👣 Footprint delta {_v['footprint'].get('delta'):+.2f} "
+                    f"({_v['footprint'].get('n')} işlem)\n") if (_v.get("footprint") or {}).get("aktif") else "")
+                + (("💧 Likidite kümeleri (vekil ölçü, gerçek likidasyon verisi değil): "
+                    + ", ".join(f"{x['px']:.6g}(×{x['guc']:.1f})" for x in (_v.get('kume') or {}).get('ileri', [])[:3])
+                    + ("  ⚠️ KARŞI küme çok yakın" if (_v.get('kume') or {}).get('karsi_cok_yakin') else "")
+                    + "\n") if (_v.get("kume") or {}).get("aktif") else "")
+                + ("".join(f"🎯 {n.upper()} → {e}\n" for n, e in (_v.get('tp_etiket') or {}).items()))
+                + (v14_kurulum_istatistigi(sig.get('setup',''), sig['direction'],
+                                           str(sig.get('structure',''))) + "\n")
+               ) if _v else "")
             + (f"🔁 Retest: {sig['retest_not']}\n" if sig.get("retest_not") else "")
             + f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
@@ -8847,6 +9313,36 @@ async def maybe_send_v10_signal(sig):
                     research.get("score"), "; ".join(research.get("red", [])[:2]))
         return
 
+    # ═══ V14: TP'LERİ LİKİDİTE HAVUZLARINA GÖRE AYARLA ═══
+    # Fiyat, stopların biriktiği eşit tepe/diplere mıknatıs gibi çekilir.
+    # TP bir havuzun HEMEN ÖTESİNE denk geliyorsa, havuzun biraz berisine
+    # çekilir — havuz vurulduktan sonra dönüş riski yüksektir.
+    try:
+        _v14s = sig.get("v14")
+        if _v14s and V14_TP_LIKIDITE:
+            _k4 = _s_closed(await get_klines(symbol, "4H", 200))
+            _k1 = _s_closed(await get_klines(symbol, MA_KLINE_INTERVAL, 200))
+            _hed = v14_htf_likidite(_k1, _k4, safe_float(sig["entry"]), side)
+            _v14s["likidite_hedefleri"] = _hed[:4]
+            _etiket = {}
+            for _n in ("tp1", "tp2", "tp3"):
+                _tp = safe_float(sig.get(_n))
+                if _tp <= 0: continue
+                _yakin = min(_hed, key=lambda x: abs(x["seviye"] - _tp), default=None)
+                if not _yakin: continue
+                _d = abs(_yakin["seviye"] - _tp) / _tp
+                if _d < 0.012:
+                    _etiket[_n] = f"{_yakin['tf']} {_yakin['tip']}"
+                    # havuzun ötesindeyse berisine çek
+                    _asti = (side == "SHORT" and _tp < _yakin["seviye"]) or \
+                            (side == "LONG" and _tp > _yakin["seviye"])
+                    if _asti and _d > 0.001:
+                        _yeni = (_yakin["seviye"] * (1.0008 if side == "SHORT" else 0.9992))
+                        sig[_n] = round(_yeni, 10)
+                        _etiket[_n] += " (havuz berisine çekildi)"
+            _v14s["tp_etiket"] = _etiket
+    except Exception as _e:
+        logger.debug("V14 TP likidite hatası: %s", _e)
     sig["research"] = research
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
@@ -9220,6 +9716,10 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + (f" | son: {stats.get('v130_son_vol')}" if stats.get('v130_son_vol') else ""),
         f"🗄 SQLite: {'AÇIK' if v130_db() else 'KAPALI'} — detay için /history",
         f"🩺 Hata oranları: {v135_hata_ozeti()}",
+        f"🧮 V14: {'AÇIK' if V14_ENABLED else 'kapalı'} | skor {'KAPI' if V14_SKOR_KAPI else 'GÖSTERGE (engellemez)'} | "
+        f"iptal={int(stats.get('v14_iptal',0))} | eşik altı gönderilen={int(stats.get('v14_esik_alti',0))} | "
+        f"confluence iptal eşiği ≤{V14_CONF_IPTAL}"
+        + (f"\n   son iptal: {stats.get('v14_son_iptal')}" if stats.get('v14_son_iptal') else ""),
         f"📐 V13.6 kuralları: M1 dönüş-TF={'KATI' if V136_M1_KATI else 'esnek'} (red={int(stats.get('v136_m1_red',0))}) | "
         f"M2 4H-ters BOS -{V136_M2_BOS_CEZA:g} | M3/M4 RSI={'KAPI' if V136_RSI_HARD else f'ceza -{V136_RSI_CEZA:g}'} "
         f"(uygulanan={int(stats.get('v136_rsi_ceza',0))}) | 1H-ters={'KAPI' if V136_1H_HARD else f'ceza -{V136_1H_TERS_CEZA:g}'}",
