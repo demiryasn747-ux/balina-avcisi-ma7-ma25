@@ -16,9 +16,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V14.0 (Kesin Kural Seti)"
+VERSION_NAME = "Balina Avcısı V14.2 (Anahtar Doğrulama + Sessizlik Alarmı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V14.0")
+BOT_BUILD = os.getenv("BOT_BUILD", "V14.2")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5691,6 +5691,8 @@ async def post_init(application) -> None:
     asyncio.create_task(save_loop())
     v135_risk_bagla()                       # RiskGuard'ı kalıcı duruma bağla
     asyncio.create_task(v135_saglik_loop())
+    asyncio.create_task(v142_acilis_kontrolu())
+    asyncio.create_task(v142_sessizlik_bekcisi())
     asyncio.create_task(v10_scan_loop())
     asyncio.create_task(v10_paper_loop())
     if V12_WS_ENABLED:
@@ -6342,6 +6344,145 @@ def v14_balina_puan(side: str, tip: str, baski: float) -> Tuple[float, str]:
     if "TREND UYUMLU" in t:     return 5.0, "TREND UYUMLU"
     if "TRENDE TERS" in t:      return -18.0, "TRENDE TERS"
     return 0.0, "NÖTR"
+
+
+# ============================================================================ #
+#  V14.2 — ANAHTAR DOĞRULAMA ve SESSİZLİK ALARMI
+#
+#  NEDEN VAR: Bu botta canlıya çıkan üç hatanın üçü de aynı sınıftandı —
+#  yeni kodu mevcut yapıya bağlarken anahtar/değişken adını doğrulamadan
+#  varsaydım. Kod patlamadı, sessizce 0 okudu:
+#     • V13.0 devre kesici path bazlıydı  → 2 gün sıfır sinyal
+#     • V13.1 kapı çarpımı hesaplanmadı   → sıfır sinyal
+#     • V14.0 confluence anahtarları yanlış → bot sustu
+#  Üçünü de Hasan buldu, ben değil. Testlerim de aynı varsayımı paylaştığı
+#  için yakalayamadılar.
+#
+#  ÇÖZÜM İKİ KATMANLI — söz vermek yerine hatayı İMKÂNSIZ hale getirmek:
+#   1) AÇILIŞTA: V14'ün okuduğu her anahtar gerçekten çözülüyor mu, sentetik
+#      bir sinyalle test edilir. Biri boşa düşüyorsa bot Telegram'a ALARM
+#      basar ve loglar — sessizce sıfır okumaz.
+#   2) ÇALIŞIRKEN: aday akıyor ama sinyal çıkmıyorsa (iptal oranı çok yüksek)
+#      belirli bir eşikten sonra ALARM gider. Artık "bot neden sustu" sorusunu
+#      Hasan'ın sorması gerekmez, bot kendisi söyler.
+# ============================================================================ #
+V142_ANAHTAR_KONTROL = os.getenv("V142_ANAHTAR_KONTROL", "true").lower() == "true"
+V142_SESSIZLIK_MIN   = float(os.getenv("V142_SESSIZLIK_MIN", "90"))    # dakika
+V142_SESSIZLIK_ADAY  = int(float(os.getenv("V142_SESSIZLIK_ADAY", "300")))
+_v142_son_alarm = {"ts": 0.0}
+
+
+def v142_anahtar_kontrol() -> List[str]:
+    """V14'ün okuduğu HER anahtarı sentetik veriyle sınar.
+    Döner: sorunlu anahtarların listesi (boşsa her şey yolunda)."""
+    sorun: List[str] = []
+    # 1) score_parts anahtarları — confluence sayımı bunlara bakıyor
+    try:
+        kk = [[i*900000, 100+i*0.1, 100.6+i*0.1, 99.4+i*0.1, 100+i*0.1, 100, 100, 100, "1"]
+              for i in range(120)]
+        ms = v10_market_structure(kk)
+        _, p, _ = v10_quality_score("SHORT", kk, ms, {
+            "oi_change_pct": -1.0, "funding": 0.0001, "btc_dir": "DOWN",
+            "btc_dir_1h": "DOWN", "orderbook": {"imbalance": -0.2},
+            "price_move_pct": -0.5, "symbol": "TEST-USDT-SWAP"})
+        for anahtar in ("order_block", "fvg", "volume_profile", "cvd", "sweep", "orderbook"):
+            if anahtar not in p:
+                sorun.append(f"score_parts['{anahtar}'] YOK")
+        for anahtar in ("order_block", "fvg", "volume_profile", "cvd", "sweep", "orderbook"):
+            if anahtar not in _V10_CONF_MAX:
+                sorun.append(f"_V10_CONF_MAX['{anahtar}'] YOK")
+    except Exception as e:
+        sorun.append(f"score_parts üretilemedi: {e}")
+
+    # 2) canlı akış anahtarları — DURUMA DUYARLI
+    # Bu kontrolün kendisi bir açık buldu: WS bağlı değilken v122_akis_kapisi
+    # 'whale' ve 'spoof' anahtarlarını hiç üretmiyor. V14 bunları okuyor ama
+    # .get() zinciri sayesinde çökmüyor, sadece 0/NÖTR sayıyor — yani balina
+    # ve spoof katkısı sessizce kayboluyor. Bu ölümcül değil ama BİLİNMELİ.
+    # Bu yüzden: WS AÇIKKEN eksikse HATA, WS kapalıyken sadece bilgi notu.
+    try:
+        _ok, _red, bilgi = v122_akis_kapisi("SHORT", "TEST-USDT-SWAP")
+        _ws_acik = bool(V12_WS_ENABLED and _v12_state.get("connected"))
+        for anahtar in ("cvd", "whale", "spoof"):
+            if anahtar not in bilgi:
+                if _ws_acik or anahtar == "cvd":
+                    sorun.append(f"akis_bilgi['{anahtar}'] YOK (WS açık)")
+                else:
+                    stats["v142_ws_kapali_eksik"] = (
+                        str(stats.get("v142_ws_kapali_eksik") or "") + f"{anahtar} ")
+    except Exception as e:
+        sorun.append(f"akış kapısı çalışmadı: {e}")
+
+    # 3) V14 karar motoru bir uçtan uca çalışıyor mu
+    try:
+        r = v14_karar("SHORT", {"d1": "DOWN", "t4h": "DOWN", "t1h": "DOWN", "conf": 5,
+                                "teyit_1h": "BOS", "setup": "KIRILIM", "hacim": 1.5,
+                                "oi": -1.0, "cvd": -0.5, "balina_tip": "AYI DEVAMI",
+                                "balina": -0.8, "grafik": 15, "dokunus": 12,
+                                "btc_4h": "DOWN", "fomo_atr": 0.4,
+                                "likidite_oran": 1.0, "spoof_kanit": 2})
+        if r.get("iptal"):
+            sorun.append(f"mükemmel tablo İPTAL edildi: {r['iptal']}")
+        if not (0 < safe_float(r.get("final")) <= 100):
+            sorun.append(f"final skor anlamsız: {r.get('final')}")
+        if safe_float(r.get("temel")) <= 0:
+            sorun.append("temel skor 0 — ağırlıklar bağlanmamış")
+    except Exception as e:
+        sorun.append(f"v14_karar çalışmadı: {e}")
+    return sorun
+
+
+def v14_anahtar_ozet() -> str:
+    try:
+        s_ = v142_anahtar_kontrol()
+        return "; ".join(s_[:3]) if s_ else ""
+    except Exception as e:
+        return f"kontrol çalışmadı: {e}"
+
+
+async def v142_acilis_kontrolu() -> None:
+    if not V142_ANAHTAR_KONTROL:
+        return
+    sorun = v142_anahtar_kontrol()
+    if sorun:
+        logger.error("V14.2 ANAHTAR KONTROLÜ BAŞARISIZ: %s", sorun)
+        await safe_send_telegram(
+            "🚨 AÇILIŞ KONTROLÜ BAŞARISIZ\n"
+            "V14'ün okuduğu bazı alanlar çözülmüyor — bu, sinyallerin\n"
+            "SESSİZCE sıfır puan alıp iptal edilmesine yol açar:\n\n"
+            + "\n".join(f"• {x}" for x in sorun[:8])
+            + "\n\nBot çalışıyor ama bu haliyle sinyal üretemeyebilir.")
+    else:
+        logger.info("V14.2 anahtar kontrolü: tüm alanlar çözülüyor ✓")
+
+
+async def v142_sessizlik_bekcisi() -> None:
+    """Aday akıyor ama sinyal çıkmıyorsa alarm verir.
+    Botun sustuğunu Hasan'ın fark etmesi gerekmesin."""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            son = safe_float(memory.get("last_signal_ts"))
+            gecen = (time.time() - son) / 60.0 if son else 1e9
+            aday = int(safe_float((stats.get("v131_huni") or {}).get("tarandi")))
+            if (gecen > V142_SESSIZLIK_MIN and aday > V142_SESSIZLIK_ADAY
+                    and time.time() - _v142_son_alarm["ts"] > 3600):
+                _v142_son_alarm["ts"] = time.time()
+                h = stats.get("v131_huni") or {}
+                ilk = sorted(((k_, int(safe_float(v_))) for k_, v_ in h.items()
+                              if k_ not in ("tarandi", "GONDERILDI")),
+                             key=lambda x: -x[1])[:3]
+                await safe_send_telegram(
+                    f"🔇 SESSİZLİK ALARMI\n"
+                    f"{gecen:.0f} dakikadır sinyal yok ama {aday:,} aday tarandı.\n\n"
+                    f"En çok eleyen 3 kapı:\n"
+                    + "\n".join(f"• {k_}: {v_:,}" for k_, v_ in ilk)
+                    + (f"\n\nV14 iptal: {int(stats.get('v14_iptal',0))}"
+                       f"\nSon iptal: {stats.get('v14_son_iptal') or '-'}")
+                    + "\n\nDetay: /huni ve /v10")
+        except Exception as e:
+            logger.debug("V14.2 sessizlik bekçisi: %s", e)
+        await asyncio.sleep(900)
 
 
 def v14_vwap(k: List[Any], periyot: int) -> float:
@@ -8849,9 +8990,21 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     # ══════════════════ V14 KARAR MOTORU ══════════════════
     v14 = None
     if V14_ENABLED:
-        _cf = 0
-        for _t in ("ob", "fvg", "vp", "cvd", "sweep", "obflow"):
-            if safe_float((parts or {}).get(_t)) > 0: _cf += 1
+        # ═══ V14.1 ONARIMI — BOTUN SUSMASININ SEBEBİ ═══
+        # V14.0'da confluence'ı şu anahtarlarla saymıştım:
+        #     ("ob", "fvg", "vp", "cvd", "sweep", "obflow")
+        # Ama score_parts'ın gerçek anahtarları:
+        #     order_block, fvg, volume_profile, cvd, sweep, orderbook
+        # Yani ob/vp/obflow HER ZAMAN 0 okunuyordu → confluence en fazla 3
+        # çıkıyordu → "confluence ≤3 → İPTAL" kuralı TÜM sinyalleri kesiyordu.
+        # Klasik sessiz hata: kod patlamadı, sadece her şeyi sıfır saydı.
+        #
+        # Ayrıca eşik de yanlıştı: ">0" saymak fazla gevşekti. Artık mesajdaki
+        # ✅ işaretiyle BİREBİR aynı kural kullanılıyor (değer ≥ tavanın %60'ı),
+        # böylece mesajda "4/6" yazarken V14'ün "2/6" görmesi imkânsız.
+        _cf = sum(1 for _t in ("order_block", "fvg", "volume_profile",
+                               "cvd", "sweep", "orderbook")
+                  if safe_float((parts or {}).get(_t)) >= _V10_CONF_MAX.get(_t, 1.0) * 0.6)
         _k1h_v14 = []
         try:
             _k1h_v14 = _s_closed(await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT))
@@ -9065,7 +9218,7 @@ def build_v10_message(sig):
                if sig.get("gunluk_rejim") in ("UP","DOWN") else "")
             + ((f"━━ V14 PANELİ ━━\n"
                 f"Temel {_v.get('temel')} → bonus/ceza → FİNAL {_v.get('final')} ({_v.get('sinif')})\n"
-                f"Confluence {_v.get('conf')}/6 | eşik {_v.get('esik'):.0f} "
+                f"Confluence {_v.get('conf')}/6 (üstteki ✅ sayısı) | eşik {_v.get('esik'):.0f} "
                 f"({'trend yönünde' if _v.get('trend_yonunde') else 'COUNTER TREND'}"
                 + (" | KIRILIM İSTİSNASI" if _v.get("istisna") else "") + ")\n"
                 + ("Etkiler: " + " · ".join(f"{k}{v:+.0f}" for k, v in
@@ -9716,6 +9869,8 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + (f" | son: {stats.get('v130_son_vol')}" if stats.get('v130_son_vol') else ""),
         f"🗄 SQLite: {'AÇIK' if v130_db() else 'KAPALI'} — detay için /history",
         f"🩺 Hata oranları: {v135_hata_ozeti()}",
+        f"🔑 Anahtar kontrolü: " + ("✅ temiz" if not v14_anahtar_ozet() else
+                                     f"🚨 {v14_anahtar_ozet()}"),
         f"🧮 V14: {'AÇIK' if V14_ENABLED else 'kapalı'} | skor {'KAPI' if V14_SKOR_KAPI else 'GÖSTERGE (engellemez)'} | "
         f"iptal={int(stats.get('v14_iptal',0))} | eşik altı gönderilen={int(stats.get('v14_esik_alti',0))} | "
         f"confluence iptal eşiği ≤{V14_CONF_IPTAL}"
