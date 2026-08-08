@@ -13,9 +13,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.5 FİB (SMC + Fibonacci + Grafik Sinyal + Haber Radarı)"
+VERSION_NAME = "Balina Avcısı V10.6 TREND (SMC + Fibonacci + BTC Trend Filtresi + Grafik Sinyal + Haber Radarı)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.5")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.6")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -5134,8 +5134,9 @@ def build_status_report() -> str:
         n = len(vclosed)
         lines += ["", "\u2501\u2501 V10 SMC \u2501\u2501",
                   f"Sinyal (bu oturum): {int(stats.get('v10_signals', 0))} | Açık paper: {len(vopen)} | Kapanan: {n}",
-                  f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{int(V10_MIN_QUALITY)}",
-                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}"]
+                  f"Analiz: {int(stats.get('v10_analyzed', 0))} | Aday: {int(stats.get('v10_candidates', 0))} | Görülen en iyi skor: {stats.get('v10_best_score', 0)}/{('eşik yok' if V10_MIN_QUALITY <= 0 else int(V10_MIN_QUALITY))}",
+                  f"Red: veri={int(stats.get('v10_red_veri', 0))} | yapı/pullback={int(stats.get('v10_red_yapi', 0))} | rsi={int(stats.get('v10_red_rsi', 0))} | kalite={int(stats.get('v10_red_kalite', 0))} | fib={int(stats.get('v10_red_fib', 0))}",
+                  f"V10.6 trend: BTC'ye ters={int(stats.get('v10_red_btc_ters', 0))} | 1H-4H karışık={int(stats.get('v10_red_btc_karisik', 0))} | BTC verisi yok={int(stats.get('v10_red_btc_veri', 0))} | SHORT OB imb={int(stats.get('v10_red_ob_imb', 0))}"]
         if n:
             stop_n = sum(1 for r in vclosed if r.get("outcome") == "STOP")
             be_n = sum(1 for r in vclosed if r.get("outcome") == "BE")
@@ -5621,11 +5622,85 @@ V10_ATR_PERIOD       = int(float(os.getenv("V10_ATR_PERIOD", "14")))
 V10_ATR_MULT         = float(os.getenv("V10_ATR_MULT", "1.5"))
 V10_STOP_MIN_PCT     = float(os.getenv("V10_STOP_MIN_PCT", "0.004"))
 V10_STOP_MAX_PCT     = float(os.getenv("V10_STOP_MAX_PCT", "0.05"))
-V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "65"))
+V10_MIN_QUALITY      = float(os.getenv("V10_MIN_QUALITY_SCORE", "0"))   # V10.6: minimum skor eşiği YOK (0 = kapalı)
 V10_RSI_LONG_MAX     = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN    = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
 V10_FIB_ENABLED      = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 V10_FIB_MIN_DEPTH    = float(os.getenv("V10_FIB_MIN_DEPTH", "0"))  # 0=kapı yok; 0.382 yaparsan sığ girişler tamamen elenir
+
+# ============================================================================ #
+#  V10.6 — ZORUNLU BTC TREND FİLTRESİ + FİB DERİNLİK KAPISI + EK FİLTRELER
+#  1) LONG  : BTC 1H EMA20>EMA50 VE BTC 4H EMA20>EMA50
+#     SHORT : BTC 1H EMA20<EMA50 VE BTC 4H EMA20<EMA50
+#     1H ile 4H uyuşmuyorsa → hiçbir sinyal basılmaz.
+#  2) Fib   : LONG min derinlik 0.382 | %25 (0.25) altı SIĞ sinyaller tamamen bloke
+#  3) Skor  : minimum skor eşiği YOK (V10_MIN_QUALITY_SCORE=0)
+#  5) Ek    : FOMO>%4 → skor cezası + uyarı | SHORT'ta OB imbalance ≤ -0.15 zorunlu
+#             | OI değişimi <%0.3 → skor cezası
+# ============================================================================ #
+V106_BTC_TREND_FILTER   = os.getenv("V106_BTC_TREND_FILTER", "true").lower() == "true"
+V106_BTC_EMA_FAST       = int(float(os.getenv("V106_BTC_EMA_FAST", "20")))
+V106_BTC_EMA_SLOW       = int(float(os.getenv("V106_BTC_EMA_SLOW", "50")))
+V106_BTC_CACHE_SEC      = float(os.getenv("V106_BTC_CACHE_SEC", "90"))
+V106_FIB_MIN_DEPTH_LONG  = float(os.getenv("V106_FIB_MIN_DEPTH_LONG", "0.382"))
+V106_FIB_MIN_DEPTH_SHORT = float(os.getenv("V106_FIB_MIN_DEPTH_SHORT", "0.25"))
+V106_FOMO_WARN_PCT      = float(os.getenv("V106_FOMO_WARN_PCT", "4.0"))
+V106_FOMO_PENALTY       = float(os.getenv("V106_FOMO_PENALTY", "10"))     # 8-10 aralığı; env ile değiştir
+V106_SHORT_MIN_OB_IMB   = float(os.getenv("V106_SHORT_MIN_OB_IMBALANCE", "-0.15"))
+V106_OI_MIN_CHANGE_PCT  = float(os.getenv("V106_OI_MIN_CHANGE_PCT", "0.3"))
+V106_OI_LOW_PENALTY     = float(os.getenv("V106_OI_LOW_PENALTY", "5"))
+
+V106_TREND_OK_LINE    = "Trend Uyumu: BTC ile AYNI YÖN ✅"
+V106_TREND_BLOCK_LINE = "Trend Uyumu: BTC'ye TERS ❌ — Sinyal Engellendi"
+
+_V106_BTC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+
+
+async def v106_btc_trend() -> Dict[str, Any]:
+    """V10.6 zorunlu trend filtresi kaynağı.
+    BTC 1H ve 4H'de EMA20/EMA50 durumunu ölçer (kapanmış mumlarla, repaint yok).
+    dir: EMA20>EMA50 → UP | EMA20<EMA50 → DOWN | eşit/veri yok → FLAT
+    allow: 1H ve 4H aynı yöndeyse "LONG"/"SHORT", değilse None → hiç sinyal yok.
+    """
+    now = time.time()
+    cached = _V106_BTC_CACHE.get("data")
+    if cached is not None and (now - safe_float(_V106_BTC_CACHE.get("ts", 0))) < V106_BTC_CACHE_SEC:
+        return cached
+    out = {"dir_1h": "FLAT", "dir_4h": "FLAT", "allow": None, "ok": False,
+           "ema20_1h": 0.0, "ema50_1h": 0.0, "ema20_4h": 0.0, "ema50_4h": 0.0}
+
+    def _dir(cl: List[float]) -> Tuple[str, float, float]:
+        if len(cl) < V106_BTC_EMA_SLOW + 2:
+            return "FLAT", 0.0, 0.0
+        f = s_ema(cl, V106_BTC_EMA_FAST)[-1]
+        s = s_ema(cl, V106_BTC_EMA_SLOW)[-1]
+        if f > s:
+            return "UP", f, s
+        if f < s:
+            return "DOWN", f, s
+        return "FLAT", f, s
+
+    try:
+        need = max(V106_BTC_EMA_SLOW * 3, 120)
+        k1h = await get_klines(BTC_BIAS_SYMBOL, "1H", need)
+        k4h = await get_klines(BTC_BIAS_SYMBOL, "4H", need)
+        c1 = _s_closes(_s_closed(k1h))
+        c4 = _s_closes(_s_closed(k4h))
+        d1, f1, s1 = _dir(c1)
+        d4, f4, s4 = _dir(c4)
+        allow = None
+        if d1 == "UP" and d4 == "UP":
+            allow = "LONG"
+        elif d1 == "DOWN" and d4 == "DOWN":
+            allow = "SHORT"
+        out = {"dir_1h": d1, "dir_4h": d4, "allow": allow,
+               "ok": (d1 != "FLAT" and d4 != "FLAT"),
+               "ema20_1h": f1, "ema50_1h": s1, "ema20_4h": f4, "ema50_4h": s4}
+    except Exception as e:
+        logger.warning("V10.6 BTC trend hesaplama hata: %s", e)
+    _V106_BTC_CACHE["data"] = out
+    _V106_BTC_CACHE["ts"] = now
+    return out
 
 
 def fib_leg_and_depth(side, lo_v, hi_v, cl_v):
@@ -5949,7 +6024,7 @@ async def v10_fetch_orderbook(symbol):
         return blank
 
 
-def v10_structure_gate(symbol, k1h, k4h):
+def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
     k = _s_closed(k1h)
     if len(k) < 40:
         return None
@@ -5961,6 +6036,11 @@ def v10_structure_gate(symbol, k1h, k4h):
     for side in ("LONG", "SHORT"):
         ok, why = v10_structure_allows(side, ms)
         if not ok: continue
+        # --- V10.6: zorunlu BTC trend filtresi (BTC'ye ters yön hiç değerlendirilmez) ---
+        if allowed_side and side != allowed_side:
+            stats["v10_red_btc_ters"] = int(stats.get("v10_red_btc_ters", 0)) + 1
+            logger.info("V10.6 %s %s → %s", symbol, side, V106_TREND_BLOCK_LINE)
+            continue
         if V10_USE_4H_FILTER and trend4 != "FLAT":
             if side == "LONG" and trend4 != "UP": continue
             if side == "SHORT" and trend4 != "DOWN": continue
@@ -5974,38 +6054,83 @@ def v10_structure_gate(symbol, k1h, k4h):
 
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
+
+    # === V10.6 KURAL 1: ZORUNLU BTC TREND FİLTRESİ (her şeyden önce) ===
+    allowed_side = None
+    btc_1h = "FLAT"; btc_4h = "FLAT"
+    if V106_BTC_TREND_FILTER:
+        bt = await v106_btc_trend()
+        btc_1h = bt.get("dir_1h", "FLAT"); btc_4h = bt.get("dir_4h", "FLAT")
+        if not bt.get("ok"):
+            stats["v10_red_btc_veri"] = int(stats.get("v10_red_btc_veri", 0)) + 1
+            return None
+        allowed_side = bt.get("allow")
+        if not allowed_side:          # 1H ile 4H uyuşmuyor → hiç sinyal basma
+            stats["v10_red_btc_karisik"] = int(stats.get("v10_red_btc_karisik", 0)) + 1
+            return None
+    else:
+        bt = await v106_btc_trend()
+        btc_1h = bt.get("dir_1h", "FLAT"); btc_4h = bt.get("dir_4h", "FLAT")
+
     k1h = await get_klines(symbol, MA_KLINE_INTERVAL, V10_KLINE_LIMIT)
     if len(k1h) < 40:
         stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
         return None
     k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
-    gate = v10_structure_gate(symbol, k1h, k4h)
+    gate = v10_structure_gate(symbol, k1h, k4h, allowed_side)
     if not gate:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
     side = gate["side"]; k = gate["k"]
     oi = await fetch_okx_oi_change(symbol, V10_OI_LOOKBACK_PER)
     funding = await fetch_okx_funding_rate(symbol)
-    btc_bias = await get_btc_trend_bias()
-    btc = btc_bias.get("trend", "FLAT")
-    btc_1h = btc_bias.get("dir_1h", "FLAT")
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
-           "funding": funding, "btc_dir": btc, "btc_dir_1h": btc_1h, "orderbook": ob}
+           "funding": funding, "btc_dir": btc_4h, "btc_dir_1h": btc_1h, "orderbook": ob}
     score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
-    fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k)) if V10_FIB_ENABLED else None
-    if fib:
+
+    # --- Fibonacci: bonus + V10.6 KURAL 2 zorunlu derinlik kapısı ---
+    fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k))
+    if fib and V10_FIB_ENABLED:
         score = round(score + fib["bonus"], 1)
         parts["fib"] = fib["bonus"]
-    if V10_FIB_ENABLED and V10_FIB_MIN_DEPTH > 0 and (not fib or fib["depth"] < V10_FIB_MIN_DEPTH):
+    min_depth = V106_FIB_MIN_DEPTH_LONG if side == "LONG" else V106_FIB_MIN_DEPTH_SHORT
+    min_depth = max(min_depth, V10_FIB_MIN_DEPTH)
+    if min_depth > 0 and (not fib or safe_float(fib.get("depth")) < min_depth):
         stats["v10_red_fib"] = int(stats.get("v10_red_fib", 0)) + 1
+        logger.info("V10.6 %s %s → fib derinlik %s < %s (SIĞ) red",
+                    symbol, side, (fib or {}).get("depth"), min_depth)
         return None
+
+    # --- V10.6 KURAL 5a: FOMO %4 üzerinde → skor cezası + uyarı ---
+    fomo_mv = safe_float(gate.get("fomo"))
+    fomo_uyari = abs(fomo_mv) > V106_FOMO_WARN_PCT
+    if fomo_uyari:
+        score = round(score - V106_FOMO_PENALTY, 1)
+        parts["fomo_cezasi"] = -V106_FOMO_PENALTY
+
+    # --- V10.6 KURAL 5c: OI değişimi çok düşükse skor cezası ---
+    oi_val = safe_float(ext["oi_change_pct"])
+    oi_dusuk = abs(oi_val) < V106_OI_MIN_CHANGE_PCT
+    if oi_dusuk:
+        score = round(score - V106_OI_LOW_PENALTY, 1)
+        parts["oi_dusuk_cezasi"] = -V106_OI_LOW_PENALTY
+
     if score > safe_float(stats.get("v10_best_score", 0)):
         stats["v10_best_score"] = round(score, 1)
+
+    # --- V10.6 KURAL 5b: SHORT'ta orderbook imbalance en az -0.15 ---
+    imb = safe_float(ob.get("imbalance"))
+    if side == "SHORT" and imb > V106_SHORT_MIN_OB_IMB:
+        stats["v10_red_ob_imb"] = int(stats.get("v10_red_ob_imb", 0)) + 1
+        logger.info("V10.6 %s SHORT → OB imbalance %.3f > %.3f red", symbol, imb, V106_SHORT_MIN_OB_IMB)
+        return None
+
     if (side == "LONG" and r > V10_RSI_LONG_MAX) or (side == "SHORT" and r < V10_RSI_SHORT_MIN):
         stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
         return None
-    if score < V10_MIN_QUALITY:
+    # --- V10.6 KURAL 3: minimum skor eşiği yok (V10_MIN_QUALITY=0 → kapalı) ---
+    if V10_MIN_QUALITY > 0 and score < V10_MIN_QUALITY:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
         return None
     entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
@@ -6016,7 +6141,8 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "score":score,"score_parts":parts,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
-            "btc_4h":btc,"btc_1h":btc_1h,
+            "btc_4h":btc_4h,"btc_1h":btc_1h,
+            "trend_uyum":True,"fomo_uyari":fomo_uyari,"oi_dusuk":oi_dusuk,
             "fib_depth":(fib or {}).get("depth"),"fib_zone":(fib or {}).get("zone"),
             "fib_bonus":(fib or {}).get("bonus",0),**tgt}
 
@@ -6039,14 +6165,19 @@ def build_v10_message(sig):
     if sig.get("fib_zone"):
         fib_line = (f"Fib: derinlik %{round(safe_float(sig.get('fib_depth'))*100)} → "
                 f"{sig['fib_zone']} ({safe_float(sig.get('fib_bonus')):+.0f} puan)\n")
-    return (f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
+    # V10.6: en üst satır — trend uyumu
+    trend_line = (V106_TREND_OK_LINE if sig.get("trend_uyum", True) else V106_TREND_BLOCK_LINE) + "\n"
+    fomo_mark = " ⚠️ FOMO" if sig.get("fomo_uyari") else ""
+    oi_mark = " ⚠️ düşük OI" if sig.get("oi_dusuk") else ""
+    return (f"{trend_line}"
+            f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
             f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
-            f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
-            f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
+            f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}{fomo_mark}\n"
+            f"OI%{round(safe_float(sig.get('oi_change_pct')),2)}{oi_mark} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
 
@@ -6257,9 +6388,19 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cl = mp["closed"]; n = len(cl)
     ev = (sum(x["R"] for x in cl)/n) if n else 0
     wins = sum(1 for x in cl if x["R"] > 0)
+    bt = await v106_btc_trend()
+    if bt.get("allow") == "LONG":
+        btc_line = "SADECE LONG ✅"
+    elif bt.get("allow") == "SHORT":
+        btc_line = "SADECE SHORT ✅"
+    else:
+        btc_line = "SİNYAL YOK ❌ (1H-4H uyuşmuyor)"
     lines = [
-        f"🆕 V10 SMC durumu",
-        f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {int(V10_MIN_QUALITY)}",
+        f"🆕 V10.6 SMC durumu",
+        f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {'eşik yok' if V10_MIN_QUALITY <= 0 else int(V10_MIN_QUALITY)}",
+        f"BTC trend (EMA{V106_BTC_EMA_FAST}/{V106_BTC_EMA_SLOW}): 1H:{bt.get('dir_1h','-')} 4H:{bt.get('dir_4h','-')} → {btc_line}",
+        f"Fib kapısı: LONG ≥{V106_FIB_MIN_DEPTH_LONG} | SHORT ≥{V106_FIB_MIN_DEPTH_SHORT}",
+        f"Ek filtre: FOMO>%{V106_FOMO_WARN_PCT:g} → {-V106_FOMO_PENALTY:g} puan | SHORT OBimb ≤{V106_SHORT_MIN_OB_IMB:g} | OI<%{V106_OI_MIN_CHANGE_PCT:g} → {-V106_OI_LOW_PENALTY:g} puan",
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
         f"4H filtre: {V10_USE_4H_FILTER} | Orderbook: {V10_USE_ORDERBOOK} | Öğrenen: {V10_LEARN_AUTO_ADJUST}",
