@@ -1,9 +1,13 @@
 import os
+import re
 import json
 import time
 import copy
+import uuid
 import asyncio
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
@@ -13,9 +17,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.6 TREND (SMC + Fibonacci + BTC Trend Filtresi + Grafik Sinyal + Haber Radarı)"
+VERSION_NAME = "Balina Avcısı V10.7 SAĞLAM (SMC + Fibonacci + BTC Trend + Canlı Giriş + Wick Takip)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.6")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.7")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -85,6 +89,8 @@ NO_SIGNAL_DIAG_SEC = int(float(os.getenv("NO_SIGNAL_DIAG_SEC", str(4 * 3600))))
 AUTO_DIAGNOSTIC = os.getenv("AUTO_DIAGNOSTIC", "false").lower() == "true"  # V10.4: teshis spami kapali
 
 KLINE_CACHE_SEC = int(float(os.getenv("KLINE_CACHE_SEC", "5")))
+KLINE_CACHE_MAX = int(float(os.getenv("KLINE_CACHE_MAX", "1500")))   # V10.7: cache budama sınırı
+V107_HABER_ALAKA_ZORUNLU = os.getenv("V107_HABER_ALAKA_ZORUNLU", "true").lower() == "true"
 TICKER_CACHE_SEC = int(float(os.getenv("TICKER_CACHE_SEC", "8")))
 HTTP_TIMEOUT = int(float(os.getenv("HTTP_TIMEOUT", "12")))
 
@@ -185,7 +191,10 @@ MAX_ALLOWED_SLIPPAGE_PCT = float(os.getenv("MAX_ALLOWED_SLIPPAGE_PCT", "0.1")) #
 # === HİBRİT MTF MOTORU (YENİ ANA STRATEJİ) =================================
 # MA7/MA25 artık BİRİNCİL sinyal değil, sadece 1H tetik. Yön kararı:
 # 1H tetik + 4H trend filtresi (200 EMA) + 15m/5m momentum onayı.
-HYBRID_ENGINE_ENABLED = os.getenv("HYBRID_ENGINE_ENABLED", "true").lower() == "true"
+# V10.7: varsayılan KAPALI. V10.6'da bu motor da 200 coin'i tam tarıyor ve
+# V10 motoruyla AYNI OKX limit bütçesini yiyordu (iki bağımsız tarayıcı).
+# Geri açmak için env: HYBRID_ENGINE_ENABLED=true
+HYBRID_ENGINE_ENABLED = os.getenv("HYBRID_ENGINE_ENABLED", "false").lower() == "true"
 HYBRID_TREND_TF = os.getenv("HYBRID_TREND_TF", "4H").strip()
 HYBRID_TREND_EMA = int(float(os.getenv("HYBRID_TREND_EMA", "100")))   # 4H'da 100 EMA tek istekte gelir; sıfır-sinyal tuzağını önler
 HYBRID_BALANCE_USDT = float(os.getenv("HYBRID_BALANCE_USDT", "1000"))
@@ -426,7 +435,95 @@ logger = logging.getLogger("balina_avcisi")
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "BalinaAvcisiV527HibritOnayli/1.0"})
+SESSION.headers.update({"User-Agent": f"BalinaAvcisi/{BOT_BUILD}"})
+
+# --- V10.7: bağlantı havuzu (varsayılan 10 bağlantı 8'li batch'lerde yetmiyordu) ---
+_HTTP_POOL = int(float(os.getenv("HTTP_POOL_SIZE", "32")))
+try:
+    _adapter = requests.adapters.HTTPAdapter(pool_connections=_HTTP_POOL,
+                                             pool_maxsize=_HTTP_POOL, max_retries=0)
+    SESSION.mount("https://", _adapter)
+    SESSION.mount("http://", _adapter)
+except Exception:
+    pass
+
+# ============================================================================ #
+#  V10.7 — OKX HIZ SINIRLAYICI (token bucket)
+#  Sorun: V10.6'da hiçbir limit yoktu. 200 coin x 2 istek / 30 sn = ~30-40 rps,
+#  üstelik 429 alınca _okx_get RETRY atıp yükü artırıyordu.
+#  Çözüm: thread-güvenli token bucket. Genel uçlar ve rubik (OI) uçları ayrı
+#  kovada, çünkü rubik limiti çok daha dar.
+# ============================================================================ #
+OKX_RATE_GENEL = float(os.getenv("OKX_RATE_GENEL", "14"))      # istek/sn
+OKX_BURST_GENEL = float(os.getenv("OKX_BURST_GENEL", "3"))
+OKX_RATE_RUBIK = float(os.getenv("OKX_RATE_RUBIK", "2"))       # istek/sn (OI/taker uçları)
+OKX_BURST_RUBIK = float(os.getenv("OKX_BURST_RUBIK", "2"))
+OKX_429_CEZA_SEC = float(os.getenv("OKX_429_CEZA_SEC", "20"))  # 429 sonrası yavaşlama süresi
+OKX_EXECUTOR_WORKERS = int(float(os.getenv("OKX_EXECUTOR_WORKERS", "12")))
+
+
+class _TokenBucket:
+    """Thread-güvenli token kovası. acquire() token gelene kadar bloklar.
+    OKX çağrıları worker thread'de çalıştığı için burada beklemek event loop'u
+    dondurmaz — sadece o worker'ı bekletir (istenen geri basınç)."""
+
+    def __init__(self, rate: float, burst: float, ad: str):
+        self.rate = max(0.1, rate)
+        self.burst = max(1.0, burst)
+        self.ad = ad
+        self._tokens = self.burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+        self.bekleme_toplam = 0.0
+        self.bekleyen = 0
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                simdi = time.monotonic()
+                self._tokens = min(self.burst, self._tokens + (simdi - self._last) * self._etkin_rate())
+                self._last = simdi
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                eksik = (1.0 - self._tokens) / self._etkin_rate()
+            uyku = min(max(eksik, 0.005), 1.0)
+            self.bekleme_toplam += uyku
+            time.sleep(uyku)
+
+    def _etkin_rate(self) -> float:
+        # 429 cezası aktifse hızı yarıya düşür
+        if time.monotonic() < _OKX_CEZA["kadar"]:
+            return max(0.5, self.rate * 0.5)
+        return self.rate
+
+
+_OKX_CEZA: Dict[str, float] = {"kadar": 0.0, "sayac": 0.0}
+_BUCKET_GENEL = _TokenBucket(OKX_RATE_GENEL, OKX_BURST_GENEL, "genel")
+_BUCKET_RUBIK = _TokenBucket(OKX_RATE_RUBIK, OKX_BURST_RUBIK, "rubik")
+
+
+def _okx_kova(path: str) -> "_TokenBucket":
+    return _BUCKET_RUBIK if "/rubik/" in path else _BUCKET_GENEL
+
+
+def _okx_429_kaydet() -> None:
+    _OKX_CEZA["kadar"] = time.monotonic() + OKX_429_CEZA_SEC
+    _OKX_CEZA["sayac"] = _OKX_CEZA.get("sayac", 0.0) + 1
+
+
+# OKX çağrıları için AYRI thread havuzu: Telegram gönderimi ve matplotlib
+# render'ı varsayılan havuzu kullanmaya devam etsin, OKX beklemesi onları aç bırakmasın.
+OKX_EXECUTOR = ThreadPoolExecutor(max_workers=OKX_EXECUTOR_WORKERS, thread_name_prefix="okx")
+
+
+async def _okx_get_async(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(OKX_EXECUTOR, _okx_get, path, params, max_retries)
+
+
+# matplotlib pyplot global durum tutar ve thread-safe DEĞİLDİR.
+_CHART_LOCK = threading.Lock()
 
 kline_cache: Dict[str, Tuple[float, List[List[Any]]]] = {}
 ticker_cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
@@ -773,6 +870,13 @@ SIGNAL_NEWS_MAX_AGE_H = float(os.getenv("SIGNAL_NEWS_MAX_AGE_H", "48"))
 _news_cache: Dict[str, Tuple[float, str]] = {}
 
 
+def _render_signal_chart_kilitli(*a, **kw):
+    """V10.7: matplotlib.pyplot global durum tutar ve thread-safe değildir.
+    İki motor aynı anda grafik çizerse figürler birbirine karışır."""
+    with _CHART_LOCK:
+        return _render_signal_chart_sync(*a, **kw)
+
+
 def _render_signal_chart_sync(symbol: str, direction: str, klines: List[List[Any]],
                               entry: float, stop: float, tps: Dict[str, Any],
                               meta: Dict[str, Any], tz_name: str) -> Optional[bytes]:
@@ -1011,7 +1115,7 @@ async def render_signal_chart(symbol: str, direction: str, entry: float, stop: f
         k = await get_klines(symbol, SIGNAL_CHART_TF, SIGNAL_CHART_CANDLES)
         if len(k) < 30:
             return None
-        return await asyncio.to_thread(_render_signal_chart_sync, symbol, direction,
+        return await asyncio.to_thread(_render_signal_chart_kilitli, symbol, direction,
                                        k, entry, stop, tps or {}, meta or {}, TIMEZONE_NAME)
     except Exception as e:
         logger.warning("render_signal_chart hata %s: %s", symbol, e)
@@ -1044,6 +1148,22 @@ async def safe_send_telegram_photo(caption: str, png_bytes: bytes,
     return False
 
 
+def v107_haber_alakali(base: str, title: str) -> bool:
+    """V10.7: V10.6'da dönen başlıklar HİÇ süzülmüyordu — bu yüzden 'Haber Radarı (CC)'
+    altında Bitcoin/İran haberi çıkıyordu. Artık coin adı başlıkta TAM KELİME olarak
+    geçmiyorsa başlık atılır. 3 harf ve altı ticker'larda büyük/küçük harf duyarlı
+    eşleşme aranır (ör. 'CC' kelimesi Türkçe metinde tesadüfen eşleşmesin)."""
+    b = (base or "").strip()
+    if not b or not title:
+        return False
+    try:
+        kalip = r"(?<![0-9A-Za-zĞÜŞİÖÇğüşıöç])" + re.escape(b) + r"(?![0-9A-Za-zĞÜŞİÖÇğüşıöç])"
+        bayrak = 0 if len(b) <= 3 else re.IGNORECASE
+        return re.search(kalip, title, bayrak) is not None
+    except Exception:
+        return False
+
+
 def _fetch_coin_news_sync(base: str) -> str:
     """Google News RSS'ten coin haber başlıkları. Hata -> boş string (sinyali bloklamaz)."""
     import xml.etree.ElementTree as _ET
@@ -1059,6 +1179,9 @@ def _fetch_coin_news_sync(base: str) -> str:
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
         if not title:
+            continue
+        if V107_HABER_ALAKA_ZORUNLU and not v107_haber_alakali(base, title):
+            stats["v107_haber_alakasiz"] = int(stats.get("v107_haber_alakasiz", 0)) + 1
             continue
         age_txt = ""
         try:
@@ -1156,11 +1279,16 @@ def normalize_symbol(symbol: str) -> str:
 def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 2) -> Any:
     url = f"{OKX_BASE_URL}{path}"
     last_err: Optional[Exception] = None
+    kova = _okx_kova(path)
     for attempt in range(max_retries + 1):
         try:
+            kova.acquire()   # V10.7: her denemede token al (retry de limite tabi)
             resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HTTP {resp.status_code}")
+                if resp.status_code == 429:
+                    _okx_429_kaydet()
+                    stats["okx_429"] = int(stats.get("okx_429", 0)) + 1
                 if attempt < max_retries:
                     time.sleep(0.5 + attempt * 0.5)
                     continue
@@ -1194,7 +1322,7 @@ async def get_okx_instruments(force: bool = False) -> Dict[str, Dict[str, Any]]:
     if cached and not force and now_ts - cached[0] <= OKX_INSTRUMENT_CACHE_SEC:
         return cached[1]
     try:
-        data = await asyncio.to_thread(_okx_get, "/api/v5/public/instruments", {"instType": OKX_INST_TYPE})
+        data = await _okx_get_async("/api/v5/public/instruments", {"instType": OKX_INST_TYPE})
         mp: Dict[str, Dict[str, Any]] = {}
         for row in data:
             inst_id = str(row.get("instId", "")).upper().strip()
@@ -1271,7 +1399,21 @@ async def symbol_refresh_loop() -> None:
             logger.exception("symbol_refresh_loop hata: %s", e)
         await asyncio.sleep(max(300, AUTO_SYMBOL_REFRESH_SEC))
 
-async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[Any]]:
+def _kline_cache_buda() -> None:
+    """V10.7: kline_cache hiç boşaltılmıyordu; delist olan coin'lerin verisi
+    süresiz kalıyordu. Kapasite aşılınca en eski kayıtlar atılır."""
+    if len(kline_cache) <= KLINE_CACHE_MAX:
+        return
+    try:
+        sirali = sorted(kline_cache.items(), key=lambda x: x[1][0])
+        for key, _ in sirali[: max(1, len(kline_cache) - KLINE_CACHE_MAX)]:
+            kline_cache.pop(key, None)
+    except Exception:
+        kline_cache.clear()
+
+
+async def get_klines(symbol: str, interval: str, limit: int = 120,
+                     ttl: Optional[float] = None) -> List[List[Any]]:
     symbol = normalize_symbol(symbol)
 
     if okx_live_symbols and symbol not in okx_live_symbols:
@@ -1285,12 +1427,11 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
     cache_key = f"{symbol}:{interval}:{limit}"
     cached = kline_cache.get(cache_key)
     now_ts = time.time()
-    if cached and now_ts - cached[0] <= KLINE_CACHE_SEC:
+    omur = KLINE_CACHE_SEC if ttl is None else float(ttl)
+    if cached and now_ts - cached[0] <= omur:
         return cached[1]
     try:
-        data = await asyncio.to_thread(
-            _okx_get,
-            "/api/v5/market/candles",
+        data = await _okx_get_async("/api/v5/market/candles",
             {"instId": symbol, "bar": interval, "limit": min(limit, 300)},
         )
         rows = [_okx_to_kline(x) for x in reversed(data)]
@@ -1300,6 +1441,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120) -> List[List[
             return []
         note_symbol_success(symbol)
         kline_cache[cache_key] = (now_ts, rows)
+        _kline_cache_buda()
         return rows
     except Exception as e:
         stats["api_fail"] += 1
@@ -1313,7 +1455,7 @@ async def get_24h_tickers() -> Dict[str, Dict[str, Any]]:
     if cached and now_ts - cached[0] <= TICKER_CACHE_SEC:
         return cached[1]
     try:
-        data = await asyncio.to_thread(_okx_get, "/api/v5/market/tickers", {"instType": OKX_INST_TYPE})
+        data = await _okx_get_async("/api/v5/market/tickers", {"instType": OKX_INST_TYPE})
         mp = {str(x.get("instId", "")).upper(): x for x in data if x.get("instId")}
         ticker_cache["24hr"] = (now_ts, mp)
         return mp
@@ -1548,9 +1690,7 @@ async def fetch_okx_open_interest(symbol: str) -> Optional[float]:
 
     stats["whale_oi_calls"] += 1
     try:
-        data = await asyncio.to_thread(
-            _okx_get,
-            "/api/v5/public/open-interest",
+        data = await _okx_get_async("/api/v5/public/open-interest",
             {"instType": "SWAP", "instId": symbol},
         )
         if not isinstance(data, list) or len(data) == 0:
@@ -1605,9 +1745,7 @@ async def fetch_okx_funding_rate(symbol: str) -> Optional[float]:
 
     stats["funding_calls"] += 1
     try:
-        data = await asyncio.to_thread(
-            _okx_get,
-            "/api/v5/public/funding-rate",
+        data = await _okx_get_async("/api/v5/public/funding-rate",
             {"instId": symbol},
         )
         if not data:
@@ -2600,7 +2738,7 @@ async def fetch_okx_oi_change(symbol: str, lookback_periods: int = 12) -> Option
     if not ccy:
         return None
     try:
-        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/open-interest-volume",
+        d = await _okx_get_async("/api/v5/rubik/stat/contracts/open-interest-volume",
                                     {"ccy": ccy, "period": "5m"})
     except Exception as e:
         logger.warning("OI geçmişi alınamadı %s: %s", symbol, e)
@@ -3646,7 +3784,7 @@ async def get_klines_paginated(symbol: str, interval: str, total_needed: int) ->
         if after is not None:
             params["after"] = str(after)
         try:
-            data = await asyncio.to_thread(_okx_get, "/api/v5/market/history-candles", params)
+            data = await _okx_get_async("/api/v5/market/history-candles", params)
         except Exception as e:
             logger.warning("paginated kline hata %s %s: %s", symbol, interval, e)
             break
@@ -3675,7 +3813,7 @@ async def _bt_funding_history(symbol: str, since_ts: int) -> List[Any]:
         if after is not None:
             params["after"] = str(after)
         try:
-            data = await asyncio.to_thread(_okx_get, "/api/v5/public/funding-rate-history", params)
+            data = await _okx_get_async("/api/v5/public/funding-rate-history", params)
         except Exception as e:
             logger.warning("funding history hata %s: %s", symbol, e)
             break
@@ -5459,6 +5597,25 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Not: {f_signal.get('note', '-') or '-'}"
     )
 
+BG_TASKS: List[Any] = []
+
+
+def _task_bitti(task) -> None:
+    """Bir arka plan döngüsü beklenmedik şekilde biterse sessiz kalmasın."""
+    try:
+        if task.cancelled():
+            logger.warning("Arka plan task iptal edildi: %s", task.get_name())
+            return
+        hata = task.exception()
+        if hata is not None:
+            logger.error("Arka plan task ÖLDÜ: %s -> %r", task.get_name(), hata)
+            stats["task_oldu"] = int(stats.get("task_oldu", 0)) + 1
+        else:
+            logger.warning("Arka plan task normal bitti: %s", task.get_name())
+    except Exception:
+        pass
+
+
 async def post_init(application) -> None:
     active_count, pruned_count = await refresh_coin_pool(force=True)
 
@@ -5481,24 +5638,28 @@ async def post_init(application) -> None:
             f"💰 Funding eşik: SHORT > +{FUNDING_BEARISH_THRESHOLD*100:.4f}%, LONG < {FUNDING_BULLISH_THRESHOLD*100:.4f}%\n"
             f"💰 Funding bonus: SHORT +{FUNDING_SHORT_BONUS:.0f}, LONG +{FUNDING_LONG_BONUS:.0f}\n"
             f"Kaldıraç: {LEVERAGE}x | Max Risk/Pozisyon: %{MAX_POSITION_RISK_PCT:.1f} | Likidasyon tamponu: %{LIQUIDATION_BUFFER:.1f}\n"
-            f"V8.1 ULTIMATE: OI + Funding kurumsal motor, LONG mirror, retry'lı OKX API\n"
-            f"Günlük short kilidi: aynı coin gün boyu 1 kez\n"
+            f"— V10.7 DÜZELTMELERİ —\n"
+            f"Giriş fiyatı: {'CANLI' if V107_CANLI_GIRIS else 'mum kapanışı (V10.6 davranışı)'}"
+            + (f" | max bayatlık %{V107_MAX_GIRIS_KAYMA:g}" if V107_MAX_GIRIS_KAYMA > 0 else " | bayatlık kapısı kapalı") + "\n"
+            f"Takip: {V107_TAKIP_TF} mum + wick, {V107_TAKIP_ARALIK_SEC}sn periyot\n"
+            f"Açık pozisyonda tekrar giriş: {'ENGELLİ' if V107_ACIKKEN_ENGELLE else 'serbest'}"
+            + (f" | STOP sonrası bekleme {V107_STOP_BEKLEME_SAAT:g}sa" if V107_STOP_BEKLEME_SAAT > 0 else "") + "\n"
+            f"Pivot belirginlik: {'%.2f×ATR' % V107_PIVOT_ATR if V107_PIVOT_ATR > 0 else 'kapalı'} | RANGE kırılımı: {'ENGELLİ' if V107_RANGE_ENGELLE else 'serbest (ayrı kovada ölçülüyor)'}\n"
+            f"OKX hız limiti: genel {OKX_RATE_GENEL:g}/sn, rubik {OKX_RATE_RUBIK:g}/sn\n"
+            f"Hibrit tarayıcı: {'AÇIK ⚠️ (V10 ile limit paylaşıyor)' if HYBRID_ENGINE_ENABLED else 'kapalı'}\n"
             f"Veri koruması: geçersiz coin temizliği + fail coin geçici blok"
         )
 
-    asyncio.create_task(hot_scan_loop())
-    asyncio.create_task(deep_scan_loop())
-    asyncio.create_task(symbol_refresh_loop())
-    asyncio.create_task(ma_long_scan_loop())
-    asyncio.create_task(ma_short_scan_loop())
-    asyncio.create_task(ma_followup_loop())
-    asyncio.create_task(heartbeat_loop())
-    asyncio.create_task(diagnostic_loop())
-    asyncio.create_task(followup_loop())
-    asyncio.create_task(save_loop())
-    asyncio.create_task(v10_scan_loop())
-    asyncio.create_task(v10_paper_loop())
-    logger.info("Arka plan döngüleri başlatıldı")
+    # V10.7: task'lar global listede tutuluyor — referanssız create_task'ı
+    # çöp toplayıcı ortadan kaldırabiliyordu (motor sessizce ölürdü).
+    for _kur in (hot_scan_loop, deep_scan_loop, symbol_refresh_loop,
+                 ma_long_scan_loop, ma_short_scan_loop, ma_followup_loop,
+                 heartbeat_loop, diagnostic_loop, followup_loop, save_loop,
+                 v10_scan_loop, v10_paper_loop):
+        _t = asyncio.create_task(_kur(), name=_kur.__name__)
+        _t.add_done_callback(_task_bitti)
+        BG_TASKS.append(_t)
+    logger.info("Arka plan döngüleri başlatıldı: %d task", len(BG_TASKS))
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Hangi sürüm canlı + kritik ayarlar (deploy doğrulaması)."""
@@ -5511,7 +5672,12 @@ async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"BTC 1H filtresi: {'açık' if BTC_1H_FILTER else 'kapalı'} | BTC 4H rejim: {'açık' if BTC_BIAS_ENABLED else 'kapalı'}\n"
         f"Sweep MA onayı: {'açık' if SWEEP_MA_CONFIRM else 'kapalı'}\n"
         f"Kaldıraç: {HYBRID_LEVERAGE:.0f}x | Risk %{HYBRID_RISK_PCT:g} | Hacim {MIN_24H_QUOTE_VOLUME/1e6:.0f}M–{(str(int(MAX_24H_QUOTE_VOLUME/1e6))+'M') if MAX_24H_QUOTE_VOLUME>0 else '∞'} | Coin {MA_COIN_LIMIT}\n"
-        f"Eski V527 motoru: {'AÇIK' if ORIGINAL_V527_ENGINE_ENABLED else 'kapalı'} | Paper reset: {'açık' if PAPER_RESET_ON_DEPLOY else 'kapalı'}"
+        f"Eski V527 motoru: {'AÇIK' if ORIGINAL_V527_ENGINE_ENABLED else 'kapalı'} | Paper reset: {'açık' if PAPER_RESET_ON_DEPLOY else 'kapalı'}\n"
+        f"— V10.7 —\n"
+        f"Canlı giriş: {V107_CANLI_GIRIS} (max bayatlık %{V107_MAX_GIRIS_KAYMA:g})\n"
+        f"Takip: {V107_TAKIP_TF}+wick / {V107_TAKIP_ARALIK_SEC}sn | Açıkken engelle: {V107_ACIKKEN_ENGELLE}\n"
+        f"Pivot ATR: {V107_PIVOT_ATR:g} | RANGE engel: {V107_RANGE_ENGELLE} | Hibrit: {HYBRID_ENGINE_ENABLED}\n"
+        f"OKX limit: {OKX_RATE_GENEL:g}/sn genel, {OKX_RATE_RUBIK:g}/sn rubik | 429 sayısı: {stats.get('okx_429',0)}"
     )
     await update.message.reply_text(txt)
 
@@ -5553,7 +5719,7 @@ async def cmd_whaletest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         results.append(("Funding geçmişi", False, str(e)[:50]))
     # 5) Long/Short hesap oranı (rubik)
     try:
-        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+        d = await _okx_get_async("/api/v5/rubik/stat/contracts/long-short-account-ratio",
                                     {"ccy": ccy, "period": "5m"})
         ok = isinstance(d, list) and len(d) > 0
         results.append(("Long/Short ratio", ok, f"son={d[0][1]}" if ok else "boş"))
@@ -5561,7 +5727,7 @@ async def cmd_whaletest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         results.append(("Long/Short ratio", False, str(e)[:50]))
     # 6) Taker volume = CVD ham verisi (rubik)
     try:
-        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/taker-volume",
+        d = await _okx_get_async("/api/v5/rubik/stat/taker-volume",
                                     {"ccy": ccy, "instType": "CONTRACTS", "period": "5m"})
         ok = isinstance(d, list) and len(d) > 0
         results.append(("Taker volume (CVD)", ok, f"{len(d)} kayıt" if ok else "boş"))
@@ -5569,7 +5735,7 @@ async def cmd_whaletest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         results.append(("Taker volume (CVD)", False, str(e)[:50]))
     # 7) OI + hacim geçmişi (rubik)
     try:
-        d = await asyncio.to_thread(_okx_get, "/api/v5/rubik/stat/contracts/open-interest-volume",
+        d = await _okx_get_async("/api/v5/rubik/stat/contracts/open-interest-volume",
                                     {"ccy": ccy, "period": "5m"})
         ok = isinstance(d, list) and len(d) > 0
         results.append(("OI+hacim geçmişi", ok, f"{len(d)} kayıt" if ok else "boş"))
@@ -5777,6 +5943,52 @@ V10_LEARN_AUTO_ADJUST = os.getenv("V10_LEARN_AUTO_ADJUST", "false").lower() == "
 v10_last_alert: Dict[str, float] = {}
 v10_sent_candle: Dict[str, str] = {}
 
+# ============================================================================ #
+#  V10.7 — DÜZELTME AYARLARI
+#  Her biri env ile geri alınabilir. DAVRANIŞ DEĞİŞTİREN olanlar işaretli.
+# ============================================================================ #
+# [DAVRANIŞ] Giriş fiyatı artık CANLI. V10.6'da giriş son KAPANMIŞ 1H mumun
+# kapanışıydı (59 dk'ya kadar bayat) ama stop CANLI fiyatla kontrol ediliyordu.
+V107_CANLI_GIRIS       = os.getenv("V107_CANLI_GIRIS", "true").lower() == "true"
+# Yapı mumunun kapanışı ile canlı fiyat arasındaki fark bu yüzdeyi aşarsa kurulum
+# bayatlamıştır -> sinyal basılmaz. 0 = kapalı.
+V107_MAX_GIRIS_KAYMA   = float(os.getenv("V107_MAX_GIRIS_KAYMA_PCT", "0.8"))
+
+# [DAVRANIŞ] Aynı coin'de açık pozisyon varken yeni sinyal basma.
+# Bu bir "alfa filtresi" değil; örneklem bağımsızlığı düzeltmesi. V10.6'da
+# TRUTH x3, CC x3 gibi tekrarlar tek fikri 3 kez defterlere yazıyordu.
+V107_ACIKKEN_ENGELLE   = os.getenv("V107_ACIKKEN_ENGELLE", "true").lower() == "true"
+# STOP yedikten sonra aynı coin'e tekrar girmeden önce beklenecek saat. 0 = kapalı.
+V107_STOP_BEKLEME_SAAT = float(os.getenv("V107_STOP_BEKLEME_SAAT", "0"))
+
+# [DAVRANIŞ] Pivot belirginlik filtresi (ATR katı). 0 = kapalı.
+# V10.6'da 0.25 ATR'lik mikro kıpırtı ile gerçek yapısal seviye eşit sayılıyordu.
+V107_PIVOT_ATR         = float(os.getenv("V107_PIVOT_ATR", "1.0"))
+
+# [DAVRANIŞ - VARSAYILAN KAPALI] RANGE bağlamındaki kırılımları tamamen blokla.
+V107_RANGE_ENGELLE     = os.getenv("V107_RANGE_ENGELLE", "false").lower() == "true"
+
+# Pozisyon takibi: 1m mum + wick. V10.6 sadece kapanış fiyatına ve >=60 sn
+# çözünürlüğe bakıyordu; iki poll arasındaki hareket görünmüyordu.
+V107_TAKIP_TF          = os.getenv("V107_TAKIP_TF", "1m").strip()
+V107_TAKIP_LIMIT       = int(float(os.getenv("V107_TAKIP_LIMIT", "300")))
+V107_TAKIP_CACHE_SEC   = float(os.getenv("V107_TAKIP_CACHE_SEC", "3"))
+V107_TAKIP_ARALIK_SEC  = int(float(os.getenv("V107_TAKIP_ARALIK_SEC", "45")))
+
+# İlk V10.7 açılışında V10.6 defterini arşivleyip temiz sayfa aç (silmez, arşivler).
+V107_DEFTER_SIFIRLA    = os.getenv("V107_DEFTER_SIFIRLA", "false").lower() == "true"
+
+# Fib uzantılı TP2/TP3 çoğu zaman 8R-30R gibi pratikte ulaşılamaz seviyelere
+# düşüyor. Bu, %30 ve %20'lik dilimleri ölü ağırlık yapar: TP1 sonrası stop
+# girişe çekildiği için gerçekçi sonuç kümesi {-1R, +TP1 payı}'na iner.
+V107_TP_RR_UYARI       = float(os.getenv("V107_TP_RR_UYARI", "8"))    # bu RR üstü -> mesajda uyarı
+V107_MAX_TP_RR         = float(os.getenv("V107_MAX_TP_RR", "0"))      # 0 = kırpma yok (davranış aynı)
+
+# 4H mumlar 3 dakikada anlamlı değişmez -> coin başına 1 istek tasarrufu
+V107_4H_CACHE_SEC      = float(os.getenv("V107_4H_CACHE_SEC", "180"))
+
+_v107_stop_kilit: Dict[str, float] = {}
+
 
 class V10Swing:
     __slots__ = ("idx", "price", "kind")
@@ -5784,7 +5996,31 @@ class V10Swing:
         self.idx = idx; self.price = price; self.kind = kind
 
 
-def v10_find_swings(k, left, right):
+def v107_pivot_ele(sw, min_fark):
+    """V10.7: mikro zikzakları temizler.
+    Ard arda gelen iki ZIT pivot arasındaki mesafe min_fark'tan küçükse o pivot
+    yapısal değildir, atılır. Aynı tip ard arda gelirse daha uç olanı kalır.
+    APT yanlış SHORT vakasının kök nedeni buydu: 0.25 ATR'lik bir kıpırtı
+    event_side'ı belirlerken, gerçek yapısal dip hiç değerlendirilmiyordu."""
+    if min_fark <= 0 or len(sw) < 2:
+        return sw
+    out = []
+    for s_ in sw:
+        if not out:
+            out.append(s_); continue
+        onceki = out[-1]
+        if s_.kind == onceki.kind:
+            if (s_.kind == "H" and s_.price >= onceki.price) or \
+               (s_.kind == "L" and s_.price <= onceki.price):
+                out[-1] = s_
+            continue
+        if abs(s_.price - onceki.price) < min_fark:
+            continue
+        out.append(s_)
+    return out
+
+
+def v10_find_swings(k, left, right, min_fark=0.0):
     H = highs(k); L = lows(k); n = len(k); sw = []
     for i in range(left, n - right):
         wh = H[i-left:i+right+1]; wl = L[i-left:i+right+1]
@@ -5792,14 +6028,25 @@ def v10_find_swings(k, left, right):
             sw.append(V10Swing(i, H[i], "H"))
         elif L[i] == min(wl) and wl.count(L[i]) == 1:
             sw.append(V10Swing(i, L[i], "L"))
+    ham = len(sw)
+    sw = v107_pivot_ele(sw, min_fark)
+    if ham != len(sw):
+        stats["v107_pivot_elendi"] = int(stats.get("v107_pivot_elendi", 0)) + (ham - len(sw))
     return sw
 
 
 def v10_market_structure(k):
-    sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT)
+    # V10.7: pivot belirginlik eşiği ATR cinsinden
+    try:
+        _a = atr(k, V10_ATR_PERIOD)[-1] if V107_PIVOT_ATR > 0 else 0.0
+    except Exception:
+        _a = 0.0
+    min_fark = _a * V107_PIVOT_ATR if (_a and _a > 0) else 0.0
+    sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT, min_fark)
     res = {"trend":"RANGE","hh":False,"hl":False,"lh":False,"ll":False,
            "last_sh":0.0,"last_sh_idx":-1,"last_sl":0.0,"last_sl_idx":-1,
-           "event":None,"event_side":None,"event_level":0.0,"event_idx":-1}
+           "event":None,"event_side":None,"event_level":0.0,"event_idx":-1,
+           "range_break":False,"atr":_a}
     hs = [s for s in sw if s.kind == "H"]; ls = [s for s in sw if s.kind == "L"]
     if hs: res["last_sh"] = hs[-1].price; res["last_sh_idx"] = hs[-1].idx
     if ls: res["last_sl"] = ls[-1].price; res["last_sl_idx"] = ls[-1].idx
@@ -5810,21 +6057,31 @@ def v10_market_structure(k):
     if res["hh"] and res["hl"]: res["trend"] = "UP"
     elif res["lh"] and res["ll"]: res["trend"] = "DOWN"
     lc = closes(k)[-1]
+    # V10.7: RANGE bağlamı artık "BOS (devam)" diye etiketlenmiyor.
+    # V10.6'da ternary'nin else dalı RANGE'i yakalıyor ve devam edecek trend
+    # yokken "devam" yazıyordu — loglarda "Boğa BOS (devam) | 1H:RANGE" böyle çıktı.
     if res["last_sh"] > 0 and lc > res["last_sh"]:
         res["event"] = "CHoCH" if res["trend"] == "DOWN" else "BOS"
         res["event_side"] = "UP"; res["event_level"] = res["last_sh"]; res["event_idx"] = res["last_sh_idx"]
+        res["range_break"] = (res["trend"] == "RANGE")
     elif res["last_sl"] > 0 and lc < res["last_sl"]:
         res["event"] = "CHoCH" if res["trend"] == "UP" else "BOS"
         res["event_side"] = "DOWN"; res["event_level"] = res["last_sl"]; res["event_idx"] = res["last_sl_idx"]
+        res["range_break"] = (res["trend"] == "RANGE")
     return res
 
 
 def v10_structure_allows(side, ms):
     ev, es = ms.get("event"), ms.get("event_side")
+    rb = bool(ms.get("range_break"))
+    if ev == "BOS":
+        aciklama = "RANGE kırılımı — devam edecek trend YOK" if rb else "devam"
+    else:
+        aciklama = "dönüş"
     if side == "LONG" and es == "UP" and ev in ("BOS", "CHoCH"):
-        return True, f"Boğa {ev} ({'devam' if ev=='BOS' else 'dönüş'})"
+        return True, f"Boğa {ev} ({aciklama})"
     if side == "SHORT" and es == "DOWN" and ev in ("BOS", "CHoCH"):
-        return True, f"Ayı {ev} ({'devam' if ev=='BOS' else 'dönüş'})"
+        return True, f"Ayı {ev} ({aciklama})"
     return False, ""
 
 
@@ -5937,18 +6194,56 @@ def v10_detect_sweep(side, k, ms):
     return 0.0
 
 
+def v107_oi_skor(side, oi_pct, fiyat_pct):
+    """V10.7: OI skoru artık YÖN FARKINDA.
+    V10.6'da 'oi > 0.5 -> tam puan' hem LONG hem SHORT için aynıydı; 9 puanlık
+    terim hiçbir yönsel bilgi taşımıyordu.
+    Standart yorum:
+      fiyat YUKARI + OI YUKARI  -> yeni LONG'lar açılıyor      (boğa teyidi)
+      fiyat AŞAĞI  + OI YUKARI  -> yeni SHORT'lar açılıyor     (ayı teyidi)
+      fiyat YUKARI + OI AŞAĞI   -> short kapanışı (zayıf ralli)
+      fiyat AŞAĞI  + OI AŞAĞI   -> long likidasyonu (zayıf düşüş)
+    Döner: (0..1 çarpan, açıklama)"""
+    if abs(oi_pct) < 0.05:
+        return 0.2, "OI yatay"
+    oi_up = oi_pct > 0
+    fiyat_up = fiyat_pct >= 0
+    if oi_up and fiyat_up:
+        return (1.0, "yeni long girişi") if side == "LONG" else (0.3, "yeni long girişi — SHORT'a ters")
+    if oi_up and not fiyat_up:
+        return (1.0, "yeni short girişi") if side == "SHORT" else (0.3, "yeni short girişi — LONG'a ters")
+    if (not oi_up) and fiyat_up:
+        return (0.5, "short kapanışı — zayıf ralli") if side == "LONG" else (0.4, "short kapanışı")
+    return (0.5, "long likidasyonu — zayıf düşüş") if side == "SHORT" else (0.4, "long likidasyonu")
+
+
 def v10_quality_score(side, k, ms, ext):
+    """Döner: (skor, parça sözlüğü, rsi, confluence bayrakları).
+    V10.7: bayraklar ayrı döner — V10.6'da mesajdaki ✅ işaretleri 'puan > 0'
+    testine bakıyordu, ama CVD/VP/OB bileşenlerinin TABAN puanı sıfırdan büyük
+    olduğu için bu üçü HER sinyalde ✅ görünüyordu."""
     p = {}
+    bayrak = {}
     ok, _ = v10_structure_allows(side, ms)
     s = 18.0 if ok else 0.0
     if ok and ms.get("event") == "CHoCH": s *= 0.85
     p["structure"] = s
     vols = [safe_float(r[5]) for r in k[-21:-1]]; av = sum(vols)/len(vols) if vols else 0.0
     lv = safe_float(k[-1][5]); p["volume"] = 2.0*min(1.0, max(0.0, (lv/av-0.8)/0.7)) if av > 0 else 0.0
+    bayrak["volume"] = bool(av > 0 and lv > av)
     r = rsi(closes(k))[-1]
     if side == "LONG": p["rsi"] = 7.0*(1.0 if 45 <= r <= 65 else 0.5 if 35 <= r <= 75 else 0.1)
     else: p["rsi"] = 7.0*(1.0 if 35 <= r <= 55 else 0.5 if 25 <= r <= 65 else 0.1)
-    oi = safe_float(ext.get("oi_change_pct")); p["oi"] = 9.0*(1.0 if oi > 0.5 else 0.5 if oi > 0 else 0.2)
+    oi = safe_float(ext.get("oi_change_pct"))
+    son = k[-1]
+    fiyat_pct = 0.0
+    _o = safe_float(son[1])
+    if _o > 0:
+        fiyat_pct = (safe_float(son[4]) - _o) / _o * 100.0
+    oi_carpan, oi_not = v107_oi_skor(side, oi, fiyat_pct)
+    p["oi"] = 9.0 * oi_carpan
+    bayrak["oi"] = oi_carpan >= 1.0
+    ext["oi_yorum"] = oi_not
     fr = safe_float(ext.get("funding"))
     if side == "LONG": p["funding"] = 7.0*(0.2 if fr > 0.0008 else 1.0 if fr < 0 else 0.7)
     else: p["funding"] = 7.0*(0.2 if fr < -0.0008 else 1.0 if fr > 0 else 0.7)
@@ -5971,17 +6266,34 @@ def v10_quality_score(side, k, ms, ext):
     else:
         obs = (0.6 if imb < -0.15 else 0.3 if imb < 0 else 0.0) + (0.4 if ob.get("ask_wall") else 0.0)
     p["orderbook"] = 7.0*min(1.0, obs)
-    p["order_block"] = 11.0*v10_detect_order_block(side, k)
-    p["fvg"] = 8.0*v10_detect_fvg(side, k)
-    p["volume_profile"] = 5.0*v10_vp_score(side, safe_float(k[-1][4]), v10_volume_profile(k))
+    bayrak["orderbook"] = obs > 0.0
+    _ob_ham = v10_detect_order_block(side, k)
+    p["order_block"] = 11.0*_ob_ham
+    bayrak["order_block"] = _ob_ham >= 1.0          # sadece fiyat OB bölgesinin İÇİNDEyse ✅
+    _fvg_ham = v10_detect_fvg(side, k)
+    p["fvg"] = 8.0*_fvg_ham
+    bayrak["fvg"] = _fvg_ham > 0.0
+    _vp_ham = v10_vp_score(side, safe_float(k[-1][4]), v10_volume_profile(k))
+    p["volume_profile"] = 5.0*_vp_ham
+    bayrak["volume_profile"] = _vp_ham >= 1.0       # POC'un doğru tarafındaysa ✅
     cv = v10_cvd_proxy(k)
-    p["cvd"] = 5.0*(1.0 if (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT") else 0.2)
-    p["sweep"] = 7.0*v10_detect_sweep(side, k, ms)
-    return round(sum(p.values()), 1), {kk: round(vv, 1) for kk, vv in p.items()}, round(r, 1)
+    _cvd_uyum = (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT")
+    p["cvd"] = 5.0*(1.0 if _cvd_uyum else 0.2)
+    bayrak["cvd"] = bool(_cvd_uyum)
+    _sw_ham = v10_detect_sweep(side, k, ms)
+    p["sweep"] = 7.0*_sw_ham
+    bayrak["sweep"] = _sw_ham > 0.0
+    return (round(sum(p.values()), 1),
+            {kk: round(vv, 1) for kk, vv in p.items()},
+            round(r, 1), bayrak)
 
 
 def v10_targets(side, entry, a, fib=None):
     dist = min(max(a*V10_ATR_MULT, entry*V10_STOP_MIN_PCT), entry*V10_STOP_MAX_PCT)
+    # V10.7: stop kaç ATR'lik? MIN==MAX ise ATR terimi tamamen kırpılmış demektir
+    # (V10.6'da öyleydi: her sinyalde stop tam %2, volatiliteden bağımsız).
+    stop_atr = (dist / a) if (a and a > 0) else 0.0
+    kirpildi = abs(V10_STOP_MAX_PCT - V10_STOP_MIN_PCT) < 1e-9
     stop = entry-dist if side == "LONG" else entry+dist
     risk = abs(entry-stop)
     if side == "LONG":
@@ -5996,17 +6308,25 @@ def v10_targets(side, entry, a, fib=None):
         if f2 and f3 and f2 > 0 and f3 > 0 and _rr(f2) >= 1.5 and _rr(f3) > _rr(f2):
             tp2, tp3 = f2, f3
             tp_kaynak = "FİB"
+            # V10.7: isteğe bağlı üst sınır (varsayılan kapalı -> davranış V10.6 ile aynı)
+            if V107_MAX_TP_RR > 0:
+                sinir2 = entry + risk*V107_MAX_TP_RR if side == "LONG" else entry - risk*V107_MAX_TP_RR
+                sinir3 = entry + risk*V107_MAX_TP_RR*1.25 if side == "LONG" else entry - risk*V107_MAX_TP_RR*1.25
+                if _rr(tp2) > V107_MAX_TP_RR:
+                    tp2 = sinir2; tp3 = sinir3; tp_kaynak = "FİB-kırpık"
     return {"stop":stop,"stop_pct":round(dist/entry*100,3),"risk":risk,
             "tp1":tp1,"tp2":tp2,"tp3":tp3,"tp_kaynak":tp_kaynak,
-            "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1)}
+            "tp1_rr":round(abs(tp1-entry)/risk,2),
+            "tp2_rr":round(abs(tp2-entry)/risk,1),"tp3_rr":round(abs(tp3-entry)/risk,1),
+            "stop_atr":round(stop_atr,2),"stop_sabit":kirpildi}
 
 
 async def v10_fetch_orderbook(symbol):
-    blank = {"imbalance":0.0,"bid_wall":False,"ask_wall":False}
+    blank = {"imbalance":0.0,"bid_wall":False,"ask_wall":False,"mid":0.0,"bid":0.0,"ask":0.0}
     if not V10_USE_ORDERBOOK:
         return blank
     try:
-        data = await asyncio.to_thread(_okx_get, "/api/v5/market/books",
+        data = await _okx_get_async("/api/v5/market/books",
                                        {"instId": symbol, "sz": V10_OB_DEPTH})
         if not data:
             return blank
@@ -6016,9 +6336,17 @@ async def v10_fetch_orderbook(symbol):
         bids = sum(bsz); asks = sum(asz); tot = bids+asks
         imb = (bids-asks)/tot if tot > 0 else 0.0
         bmean = bids/len(bsz) if bsz else 0; amean = asks/len(asz) if asz else 0
+        # V10.7: canlı giriş fiyatı için en iyi alış/satış
+        try:
+            bid = safe_float(book.get("bids", [[0]])[0][0])
+            ask = safe_float(book.get("asks", [[0]])[0][0])
+        except Exception:
+            bid = ask = 0.0
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
         return {"imbalance": imb,
                 "bid_wall": (max(bsz) > bmean*V10_OB_WALL_MULT) if bsz and bmean > 0 else False,
-                "ask_wall": (max(asz) > amean*V10_OB_WALL_MULT) if asz and amean > 0 else False}
+                "ask_wall": (max(asz) > amean*V10_OB_WALL_MULT) if asz and amean > 0 else False,
+                "mid": mid, "bid": bid, "ask": ask}
     except Exception as e:
         logger.debug("V10 ob fail %s: %s", symbol, e)
         return blank
@@ -6033,6 +6361,9 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
     if V10_USE_4H_FILTER and k4h and len(k4h) >= 52:
         c4 = closes(_s_closed(k4h)); e = ema(c4, min(50, len(c4)-1))
         trend4 = "UP" if c4[-1] > e[-1] else "DOWN"
+    if V107_RANGE_ENGELLE and ms.get("range_break"):
+        stats["v107_red_range"] = int(stats.get("v107_red_range", 0)) + 1
+        return None
     for side in ("LONG", "SHORT"):
         ok, why = v10_structure_allows(side, ms)
         if not ok: continue
@@ -6050,6 +6381,32 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
         if not pb: continue
         return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),"pullback":note,"k":k}
     return None
+
+
+def v107_canli_giris(k1h, ob, referans):
+    """V10.7 — EN KRİTİK DÜZELTME.
+    V10.6: entry = closes(_s_closed(k1h))[-1]  -> son KAPANMIŞ 1H mumun kapanışı.
+    Yani giriş fiyatı 59 dakikaya kadar bayat olabiliyordu; buna karşılık
+    v10_paper_loop stopu CANLI fiyatla kontrol ediyordu. Sinyal gittiği anda
+    fiyat zaten %2 aşağıdaysa pozisyon saniyeler içinde stop oluyordu.
+    Bu asimetri deftere sistematik negatif kayma enjekte ediyordu.
+
+    Öncelik: orderbook orta fiyatı -> oluşmakta olan mumun son fiyatı -> referans.
+    Döner: (giris, kaynak)"""
+    if not V107_CANLI_GIRIS:
+        return referans, "kapanis"
+    ref = safe_float(referans)
+    mid = safe_float((ob or {}).get("mid"))
+    # sağlık kontrolü: orderbook fiyatı referanstan %10'dan fazla sapıyorsa veri bozuk
+    if mid > 0 and ref > 0 and abs(mid - ref) / ref <= 0.10:
+        return mid, "orderbook"
+    try:
+        forming = safe_float(k1h[-1][4])
+    except Exception:
+        forming = 0.0
+    if forming > 0 and ref > 0 and abs(forming - ref) / ref <= 0.30:
+        return forming, "canli mum"
+    return ref, "kapanis"
 
 
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
@@ -6076,7 +6433,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if len(k1h) < 40:
         stats["v10_red_veri"] = int(stats.get("v10_red_veri", 0)) + 1
         return None
-    k4h = await get_klines(symbol, HYBRID_TREND_TF, 120) if V10_USE_4H_FILTER else None
+    k4h = await get_klines(symbol, HYBRID_TREND_TF, 120, ttl=V107_4H_CACHE_SEC) if V10_USE_4H_FILTER else None
     gate = v10_structure_gate(symbol, k1h, k4h, allowed_side)
     if not gate:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
@@ -6087,7 +6444,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ob = await v10_fetch_orderbook(symbol)
     ext = {"oi_change_pct": oi if oi is not None else 0.0,
            "funding": funding, "btc_dir": btc_4h, "btc_dir_1h": btc_1h, "orderbook": ob}
-    score, parts, r = v10_quality_score(side, k, gate["ms"], ext)
+    score, parts, r, bayrak = v10_quality_score(side, k, gate["ms"], ext)
 
     # --- Fibonacci: bonus + V10.6 KURAL 2 zorunlu derinlik kapısı ---
     fib = fib_leg_and_depth(side, lows(k), highs(k), closes(k))
@@ -6133,16 +6490,31 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     if V10_MIN_QUALITY > 0 and score < V10_MIN_QUALITY:
         stats["v10_red_kalite"] = int(stats.get("v10_red_kalite", 0)) + 1
         return None
-    entry = closes(k)[-1]; a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
+    # --- V10.7: GİRİŞ FİYATI CANLI + BAYATLIK KAPISI ---
+    entry_ref = closes(k)[-1]                       # yapı mumunun kapanışı (referans)
+    entry, giris_kaynak = v107_canli_giris(k1h, ob, entry_ref)
+    kayma = (abs(entry - entry_ref) / entry_ref * 100.0) if entry_ref > 0 else 0.0
+    if V107_MAX_GIRIS_KAYMA > 0 and kayma > V107_MAX_GIRIS_KAYMA:
+        stats["v107_red_kayma"] = int(stats.get("v107_red_kayma", 0)) + 1
+        logger.info("V10.7 %s %s → kurulum bayat: mum kapanışı %.8f, canlı %.8f (%%%.2f kayma) red",
+                    symbol, side, entry_ref, entry, kayma)
+        return None
+    a = atr(k, V10_ATR_PERIOD)[-1]; tgt = v10_targets(side, entry, a, fib)
+    if V107_TP_RR_UYARI > 0 and safe_float(tgt.get("tp2_rr")) > V107_TP_RR_UYARI:
+        stats["v107_ulasilamaz_tp"] = int(stats.get("v107_ulasilamaz_tp", 0)) + 1
     return {"symbol":symbol,"direction":side,"entry":entry,"strategy":"V10_SMC",
+            "entry_ref":entry_ref,"entry_kaynak":giris_kaynak,"entry_kayma_pct":round(kayma,3),
             "event":gate["ms"]["event"],"structure":gate["why"],
+            "range_break":bool(gate["ms"].get("range_break")),
             "trend_1h":gate["ms"]["trend"],"trend_4h":gate["trend4"],
             "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
-            "score":score,"score_parts":parts,"rsi":r,"atr":round(a,8),
+            "score":score,"score_parts":parts,"bayrak":bayrak,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
+            "oi_yorum":ext.get("oi_yorum",""),
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
             "btc_4h":btc_4h,"btc_1h":btc_1h,
             "trend_uyum":True,"fomo_uyari":fomo_uyari,"oi_dusuk":oi_dusuk,
+            "min_quality":V10_MIN_QUALITY,
             "fib_depth":(fib or {}).get("depth"),"fib_zone":(fib or {}).get("zone"),
             "fib_bonus":(fib or {}).get("bonus",0),**tgt}
 
@@ -6156,8 +6528,12 @@ def _v10_fmt(x):
 
 
 def build_v10_message(sig):
+    # V10.7: ✅ artık gerçek tespite bakıyor. V10.6'da 'puan > 0' testi kullanılıyordu
+    # ama CVD/VP/OB'nin taban puanı sıfırdan büyük olduğu için bu üçü her sinyalde
+    # ✅ görünüyordu — yani 6 göstergenin 4'ü sabitti.
+    b = sig.get("bayrak") or {}
     p = sig["score_parts"]
-    tag = lambda key, lbl: f"{lbl}{'✅' if p.get(key,0) > 0 else '▫️'}"
+    tag = lambda key, lbl: f"{lbl}{'✅' if b.get(key, p.get(key,0) > 0) else '▫️'}"
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
                      tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
     fund = safe_float(sig.get("funding"))
@@ -6169,15 +6545,23 @@ def build_v10_message(sig):
     trend_line = (V106_TREND_OK_LINE if sig.get("trend_uyum", True) else V106_TREND_BLOCK_LINE) + "\n"
     fomo_mark = " ⚠️ FOMO" if sig.get("fomo_uyari") else ""
     oi_mark = " ⚠️ düşük OI" if sig.get("oi_dusuk") else ""
+    # V10.7: stop gürültü bandının içindeyse görünür uyarı (1 ATR altı = mum gürültüsü)
+    _satr = safe_float(sig.get("stop_atr"))
+    stop_uyari = " ⚠️ GÜRÜLTÜ İÇİNDE" if (0 < _satr < 1.0) else ""
+    _tp2rr = safe_float(sig.get("tp2_rr"))
+    tp_uyari = " ⚠️ TP2/TP3 pratikte ulaşılamaz" if (V107_TP_RR_UYARI > 0 and _tp2rr > V107_TP_RR_UYARI) else ""
+    _kay = safe_float(sig.get("entry_kayma_pct"))
+    kayma_mark = f" (mum kapanışından %{_kay:+.2f})" if abs(_kay) >= 0.05 else ""
     return (f"{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V10 SMC | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V10.7 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
-            f"Giriş: {_v10_fmt(sig['entry'])}\nStop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']})\n"
-            f"TP1 {_v10_fmt(sig['tp1'])} (1R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]\n"
+            f"Giriş: {_v10_fmt(sig['entry'])} [{sig.get('entry_kaynak','-')}]{kayma_mark}\n"
+            f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']} = {sig.get('stop_atr','?')}×ATR){stop_uyari}\n"
+            f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr', V10_TP1_RR)}R %50) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', V10_TP2_RR)}R %30) | TP3 {_v10_fmt(sig['tp3'])} ({sig.get('tp3_rr', V10_TP3_RR)}R %20) [{sig.get('tp_kaynak','ATR')}]{tp_uyari}\n"
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}{fomo_mark}\n"
-            f"OI%{round(safe_float(sig.get('oi_change_pct')),2)}{oi_mark} Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
+            f"OI%{round(safe_float(sig.get('oi_change_pct')),2)}{oi_mark} ({sig.get('oi_yorum','-')}) Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
 
@@ -6191,7 +6575,7 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V10 SMC — POZİSYON KAPANDI\n"
+        f"🆕 V10.7 SMC — POZİSYON KAPANDI\n"
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
         f"Yön: {pos['side']}\n"
@@ -6209,20 +6593,132 @@ def _v10_mem():
     return memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
 
 
+def v107_kova_adi(sig_veya_pos):
+    """V10.7: RANGE kırılımları kendi kovasında ölçülsün.
+    V10.6'da RANGE kırılımı ile gerçek trend devamı aynı 'BOS' kovasına
+    düşüyordu; ikisinin EV'si ayrıştırılamıyordu."""
+    ev = sig_veya_pos.get("event")
+    rb = "-RANGE" if sig_veya_pos.get("range_break") else ""
+    return f'{ev}{rb}|{v10_score_band(sig_veya_pos.get("score", 0))}'
+
+
+def v107_pos_uid(pos):
+    """Pozisyona kalıcı kimlik. Liste indeksine güvenmek yerine kimlikle silme
+    yapılır — böylece await sırasında eklenen yeni pozisyonlar kaybolmaz."""
+    uid = pos.get("uid")
+    if not uid:
+        uid = f"{pos.get('symbol','?')}|{pos.get('side','?')}|{safe_float(pos.get('open_ts',0)):.3f}|{uuid.uuid4().hex[:6]}"
+        pos["uid"] = uid
+    return uid
+
+
 def v10_open_paper(sig):
     mp = _v10_mem()
-    mp["open"].append({
+    poz = {
+        "uid": f"{sig['symbol']}|{sig['direction']}|{time.time():.3f}|{uuid.uuid4().hex[:6]}",
         "symbol":sig["symbol"],"side":sig["direction"],"entry":sig["entry"],
         "orig_stop":sig["stop"],"stop":sig["stop"],
         "tp1":sig["tp1"],"tp2":sig["tp2"],"tp3":sig["tp3"],
-        "tp1_rr":V10_TP1_RR,"tp2_rr":V10_TP2_RR,"tp3_rr":V10_TP3_RR,
+        "tp1_rr":safe_float(sig.get("tp1_rr", V10_TP1_RR)),
+        "tp2_rr":safe_float(sig.get("tp2_rr", V10_TP2_RR)),
+        "tp3_rr":safe_float(sig.get("tp3_rr", V10_TP3_RR)),
         "hit1":False,"hit2":False,"hit3":False,"realized":0.0,
         "score":sig["score"],"event":sig["event"],
-        "bucket":f'{sig["event"]}|{v10_score_band(sig["score"])}',
-        "open_ts":time.time(),"candle_ts":sig["candle_ts"]})
+        "range_break":bool(sig.get("range_break")),
+        "entry_kaynak":sig.get("entry_kaynak","-"),
+        "entry_kayma_pct":sig.get("entry_kayma_pct",0),
+        "stop_atr":sig.get("stop_atr",0),
+        "min_quality":safe_float(sig.get("min_quality", V10_MIN_QUALITY)),
+        "bucket":v107_kova_adi(sig),
+        "open_ts":time.time(),"scan_ts":0.0,"candle_ts":sig["candle_ts"]}
+    mp["open"].append(poz)
+    return poz
+
+
+async def v107_takip_barlari(pos):
+    """V10.7: takip artık 1m mumlarla ve WICK'lerle yapılır.
+    V10.6: sadece son kapanış fiyatına bakıyordu, üstelik >=60 sn'de bir —
+    iki poll arasındaki hareket tamamen görünmezdi ve defter tekrar üretilemezdi.
+    Ayrıca sadece GİRİŞTEN SONRAKİ barlar işlenir; girişten önceki fitil
+    pozisyonu yanlışlıkla stop ettiremez."""
+    sym = pos["symbol"]
+    open_ms = safe_float(pos.get("open_ts", 0)) * 1000.0
+    scan_ms = safe_float(pos.get("scan_ts", 0))
+    baslangic = max(open_ms, scan_ms)
+    k = await get_klines(sym, V107_TAKIP_TF, V107_TAKIP_LIMIT, ttl=V107_TAKIP_CACHE_SEC)
+    if not k:
+        return [], "veri yok"
+    ilk_ms = safe_float(k[0][0])
+    if baslangic > 0 and ilk_ms > baslangic + 120000:
+        eksik = int((ilk_ms - baslangic) / 60000)
+        stats["v107_takip_bosluk"] = int(stats.get("v107_takip_bosluk", 0)) + 1
+        logger.warning("V10.7 takip boşluğu %s: ~%d bar penceresi dışında kaldı", sym, eksik)
+    barlar = [r for r in k if safe_float(r[0]) >= baslangic]
+    if barlar:
+        pos["scan_ts"] = safe_float(barlar[-1][0])
+        return barlar, V107_TAKIP_TF
+    son = safe_float(k[-1][4])
+    return [[safe_float(k[-1][0]), son, son, son, son, 0]], "son fiyat"
+
+
+def v107_check_paper_bar(pos, hi, lo):
+    """Tek bir mumun yüksek/düşük değerleriyle pozisyonu ilerletir.
+    Aynı mumda hem stop hem TP1 varsa sıra bilinemez -> TEMKİNLİ: stop sayılır."""
+    side = pos["side"]; e = safe_float(pos["entry"]); w = {"tp1":0.5,"tp2":0.3,"tp3":0.2}
+    tp1r = safe_float(pos.get("tp1_rr", V10_TP1_RR))
+    tp2r = safe_float(pos.get("tp2_rr", V10_TP2_RR))
+    tp3r = safe_float(pos.get("tp3_rr", V10_TP3_RR))
+    if side == "LONG":
+        stop_lv = safe_float(pos["orig_stop"]) if not pos["hit1"] else e
+        stop_vuruldu = lo <= stop_lv
+        tp1_vuruldu = (not pos["hit1"]) and hi >= safe_float(pos["tp1"])
+        if stop_vuruldu and tp1_vuruldu:
+            stats["v107_belirsiz_bar"] = int(stats.get("v107_belirsiz_bar", 0)) + 1
+            return -1.0, "STOP"
+        if stop_vuruldu:
+            return (-1.0, "STOP") if not pos["hit1"] else (pos["realized"], "BE")
+        if tp1_vuruldu:
+            pos["hit1"] = True; pos["realized"] += w["tp1"]*tp1r; pos["stop"] = e
+            if lo <= e:
+                return pos["realized"], "BE"
+        if pos["hit1"] and not pos["hit2"] and hi >= safe_float(pos["tp2"]):
+            pos["hit2"] = True; pos["realized"] += w["tp2"]*tp2r
+        if pos["hit2"] and not pos["hit3"] and hi >= safe_float(pos["tp3"]):
+            pos["hit3"] = True; pos["realized"] += w["tp3"]*tp3r
+            return pos["realized"], "TP3"
+    else:
+        stop_lv = safe_float(pos["orig_stop"]) if not pos["hit1"] else e
+        stop_vuruldu = hi >= stop_lv
+        tp1_vuruldu = (not pos["hit1"]) and lo <= safe_float(pos["tp1"])
+        if stop_vuruldu and tp1_vuruldu:
+            stats["v107_belirsiz_bar"] = int(stats.get("v107_belirsiz_bar", 0)) + 1
+            return -1.0, "STOP"
+        if stop_vuruldu:
+            return (-1.0, "STOP") if not pos["hit1"] else (pos["realized"], "BE")
+        if tp1_vuruldu:
+            pos["hit1"] = True; pos["realized"] += w["tp1"]*tp1r; pos["stop"] = e
+            if hi >= e:
+                return pos["realized"], "BE"
+        if pos["hit1"] and not pos["hit2"] and lo <= safe_float(pos["tp2"]):
+            pos["hit2"] = True; pos["realized"] += w["tp2"]*tp2r
+        if pos["hit2"] and not pos["hit3"] and lo <= safe_float(pos["tp3"]):
+            pos["hit3"] = True; pos["realized"] += w["tp3"]*tp3r
+            return pos["realized"], "TP3"
+    return None, None
+
+
+def v107_check_paper_barlar(pos, barlar):
+    for r in barlar:
+        R, oc = v107_check_paper_bar(pos, safe_float(r[2]), safe_float(r[3]))
+        if oc:
+            return R, oc
+    return None, None
 
 
 def v10_check_paper(pos, price):
+    """[V10.6 ARTIĞI] Tek fiyatla kontrol — artık kullanılmıyor.
+    Yerine v107_check_paper_barlar (1m + wick) kullanılır. Geriye dönük
+    uyumluluk için bırakıldı."""
     side = pos["side"]; e = pos["entry"]; w = {"tp1":0.5,"tp2":0.3,"tp3":0.2}
     if side == "LONG":
         if not pos["hit1"] and price <= pos["orig_stop"]: return -1.0, "STOP"
@@ -6249,8 +6745,14 @@ def v10_record_closed(pos, R, outcome):
     mp = _v10_mem()
     mp["closed"].append({"symbol":pos["symbol"],"side":pos["side"],"R":round(R,3),
         "outcome":outcome,
-        "hit1":bool(pos.get("hit1")),"hit2":bool(pos.get("hit2")),"hit3":bool(pos.get("hit3")),"score":pos["score"],"event":pos["event"],
-        "bucket":pos["bucket"],"close_ts":time.time()})
+        "hit1":bool(pos.get("hit1")),"hit2":bool(pos.get("hit2")),"hit3":bool(pos.get("hit3")),
+        "score":pos["score"],"event":pos["event"],
+        "range_break":bool(pos.get("range_break")),
+        "entry_kaynak":pos.get("entry_kaynak","-"),
+        "stop_atr":pos.get("stop_atr",0),
+        "min_quality":pos.get("min_quality",0),
+        "tutma_dk":round((time.time()-safe_float(pos.get("open_ts",0)))/60.0,1),
+        "bucket":pos.get("bucket") or v107_kova_adi(pos),"close_ts":time.time()})
     b = mp["buckets"].setdefault(pos["bucket"], {"n":0,"R":0.0,"win":0})
     b["n"] += 1; b["R"] = round(b["R"]+R, 3)
     if R > 0: b["win"] += 1
@@ -6275,6 +6777,9 @@ def v10_learn_adjust():
             if ev < -0.1 and (worst is None or ev < worst[1]): worst = (bk, ev)
     if worst and V10_MIN_QUALITY < 85:
         V10_MIN_QUALITY += 2
+        # V10.7: eşik değişimi kalıcı olsun — yoksa restart'ta env varsayılanına
+        # dönerken defter devam ediyor, tek örneklem iki farklı politikaya ait oluyordu.
+        memory["v10_min_quality"] = V10_MIN_QUALITY
         logger.info("V10 ADAPTİF: %s EV=%.2f → min skor %d", worst[0], worst[1], int(V10_MIN_QUALITY))
         return f"{worst[0]} kötü (EV {worst[1]:.2f}) → min skor {int(V10_MIN_QUALITY)}"
     return None
@@ -6293,6 +6798,29 @@ async def maybe_send_v10_signal(sig):
         return
     if not v10_cooldown_ok(symbol):
         return
+
+    mp = _v10_mem()
+
+    # --- V10.7 (1) HAYALET SİNYAL: defter doluyken V10.6 sinyali Telegram'a
+    # gönderiyor ama TAKİP ETMİYORDU. Artık dolu defterde sinyal hiç basılmaz.
+    if len(mp["open"]) >= V10_MAX_OPEN:
+        stats["v107_red_defter_dolu"] = int(stats.get("v107_red_defter_dolu", 0)) + 1
+        logger.info("V10.7 %s %s → defter dolu (%d/%d), sinyal basılmadı",
+                    symbol, side, len(mp["open"]), V10_MAX_OPEN)
+        return
+
+    # --- V10.7 (2) ÖRNEKLEM BAĞIMSIZLIĞI: aynı coin'de açık pozisyon varken
+    # tekrar girilmez. V10.6'da TRUTH x3 / CC x3 aynı fikri 3 kez deftere yazıyordu.
+    if V107_ACIKKEN_ENGELLE and any(p.get("symbol") == symbol for p in mp["open"]):
+        stats["v107_red_acik_poz"] = int(stats.get("v107_red_acik_poz", 0)) + 1
+        logger.info("V10.7 %s %s → bu coin'de zaten açık pozisyon var", symbol, side)
+        return
+
+    # --- V10.7 (3) STOP sonrası bekleme (varsayılan kapalı) ---
+    if V107_STOP_BEKLEME_SAAT > 0 and time.time() < _v107_stop_kilit.get(symbol, 0.0):
+        stats["v107_red_stop_bekleme"] = int(stats.get("v107_red_stop_bekleme", 0)) + 1
+        return
+
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
@@ -6303,9 +6831,14 @@ async def maybe_send_v10_signal(sig):
     if ok:
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[ckey] = sig["candle_ts"]
+        # KOŞULSUZ: gönderilen her sinyal deftere işlenir. Kapasite kontrolü
+        # gönderimden ÖNCE yapıldı; await sırasında defter dolduysa taşmayı
+        # kabul edip logluyoruz — takipsiz sinyal bırakmak çok daha kötü.
         mp = _v10_mem()
-        if len(mp["open"]) < V10_MAX_OPEN:
-            v10_open_paper(sig)
+        if len(mp["open"]) >= V10_MAX_OPEN:
+            logger.warning("V10.7 defter kapasitesi aşıldı (%d/%d) — sinyal yine de takibe alındı",
+                           len(mp["open"]) + 1, V10_MAX_OPEN)
+        v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
         stats["last_signal"] = f"V10 {side} {symbol} skor {sig['score']}"
         logger.info("V10 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
@@ -6351,36 +6884,46 @@ async def v10_paper_loop() -> None:
     while True:
         try:
             mp = _v10_mem()
-            still = []
-            for pos in mp["open"]:
-                k = await get_klines(pos["symbol"], MA_KLINE_INTERVAL, 3)
-                if not k:
-                    still.append(pos); continue
+            kapananlar = set()
+            # V10.7 HAYALET POZİSYON DÜZELTMESİ:
+            # V10.6 `for pos in mp["open"]` ile await'ler arasında dönüyor, sonra
+            # `mp["open"] = still` ile listeyi KOMPLE yeniden yazıyordu. Tarama
+            # döngüsü o await'ler sırasında yeni pozisyon eklerse sessizce siliniyordu.
+            # Artık kopya üzerinde dönülüp, silme kimliğe göre yapılıyor.
+            for pos in list(mp["open"]):
+                uid = v107_pos_uid(pos)
+                barlar, kaynak = await v107_takip_barlari(pos)
+                if not barlar:
+                    continue
                 was1, was2 = pos["hit1"], pos["hit2"]
-                R, oc = v10_check_paper(pos, closes(k)[-1])
+                R, oc = v107_check_paper_barlar(pos, barlar)
                 if not oc:
                     if pos["hit1"] and not was1:
                         await safe_send_telegram(
-                            f"✅ V10 TP1 GELDİ — {pos['side']} {pos['symbol']}\n"
+                            f"✅ V10.7 TP1 GELDİ — {pos['side']} {pos['symbol']}\n"
                             f"Fiyat: {_v10_fmt(pos['tp1'])} | %50 realize\n"
                             f"Stop girişe çekildi (artık zararsız) | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
                     if pos["hit2"] and not was2:
                         await safe_send_telegram(
-                            f"✅ V10 TP2 GELDİ — {pos['side']} {pos['symbol']}\n"
+                            f"✅ V10.7 TP2 GELDİ — {pos['side']} {pos['symbol']}\n"
                             f"Fiyat: {_v10_fmt(pos['tp2'])} | %30 realize | +{round(pos['realized'],2)}R kilitli | skor {pos['score']}")
-                    still.append(pos)
                     continue
                 v10_record_closed(pos, R, oc)
+                if oc == "STOP" and V107_STOP_BEKLEME_SAAT > 0:
+                    _v107_stop_kilit[pos["symbol"]] = time.time() + V107_STOP_BEKLEME_SAAT * 3600.0
                 exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp3"] if oc == "TP3" else pos["entry"])
                 await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
-                logger.info("V10 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
-            mp["open"] = still
+                logger.info("V10.7 KAPANDI %s %s %s R=%.2f (takip: %s)",
+                            pos["side"], pos["symbol"], oc, R, kaynak)
+                kapananlar.add(uid)
+            if kapananlar:
+                mp["open"] = [p for p in mp["open"] if v107_pos_uid(p) not in kapananlar]
             adj = v10_learn_adjust()
             if adj:
-                await safe_send_telegram(f"🧠 V10 öğrenen: {adj}")
+                await safe_send_telegram(f"🧠 V10.7 öğrenen: {adj}")
         except Exception as e:
             logger.exception("v10_paper_loop hata: %s", e)
-        await asyncio.sleep(max(60, int(MA_SCAN_INTERVAL_SEC)))
+        await asyncio.sleep(max(V107_TAKIP_ARALIK_SEC, 20))
 
 
 async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6396,13 +6939,18 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         btc_line = "SİNYAL YOK ❌ (1H-4H uyuşmuyor)"
     lines = [
-        f"🆕 V10.6 SMC durumu",
+        f"🆕 V10.7 SMC durumu",
         f"Motor: {'AÇIK' if V10_ENGINE_ENABLED else 'KAPALI'} | Min skor: {'eşik yok' if V10_MIN_QUALITY <= 0 else int(V10_MIN_QUALITY)}",
         f"BTC trend (EMA{V106_BTC_EMA_FAST}/{V106_BTC_EMA_SLOW}): 1H:{bt.get('dir_1h','-')} 4H:{bt.get('dir_4h','-')} → {btc_line}",
         f"Fib kapısı: LONG ≥{V106_FIB_MIN_DEPTH_LONG} | SHORT ≥{V106_FIB_MIN_DEPTH_SHORT}",
         f"Ek filtre: FOMO>%{V106_FOMO_WARN_PCT:g} → {-V106_FOMO_PENALTY:g} puan | SHORT OBimb ≤{V106_SHORT_MIN_OB_IMB:g} | OI<%{V106_OI_MIN_CHANGE_PCT:g} → {-V106_OI_LOW_PENALTY:g} puan",
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
+        "— V10.7 sayaçları —",
+        f"Bayat kurulum red: {stats.get('v107_red_kayma',0)} | Açık poz. red: {stats.get('v107_red_acik_poz',0)} | Defter dolu red: {stats.get('v107_red_defter_dolu',0)}",
+        f"Elenen mikro pivot: {stats.get('v107_pivot_elendi',0)} | RANGE red: {stats.get('v107_red_range',0)} | Alakasız haber: {stats.get('v107_haber_alakasiz',0)}",
+        f"Belirsiz bar (stop/TP aynı mumda): {stats.get('v107_belirsiz_bar',0)} | Takip boşluğu: {stats.get('v107_takip_bosluk',0)}",
+        f"OKX 429: {stats.get('okx_429',0)} | Ölen task: {stats.get('task_oldu',0)} | API hata: {stats.get('api_fail',0)}",
         f"4H filtre: {V10_USE_4H_FILTER} | Orderbook: {V10_USE_ORDERBOOK} | Öğrenen: {V10_LEARN_AUTO_ADJUST}",
         f"RSI filtre: LONG max {int(V10_RSI_LONG_MAX)} | SHORT min {int(V10_RSI_SHORT_MIN)}",
     ]
@@ -6415,7 +6963,8 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("— Açık —")
         for p in mp["open"][:10]:
             tps = "".join("✅" if p[f"hit{i}"] else "▫️" for i in (1, 2, 3))
-            lines.append(f"{p['side']} {p['symbol']} {tps} R:{round(p['realized'],2)} skor {p['score']}")
+            yas = round((time.time() - safe_float(p.get("open_ts", 0))) / 60.0)
+            lines.append(f"{p['side']} {p['symbol']} {tps} R:{round(p['realized'],2)} skor {p['score']} ({yas}dk)")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -6448,9 +6997,27 @@ def build_app():
 def main() -> None:
     validate_config()
     load_memory()
+    # V10.7: öğrenen motorun eşiğini restart sonrası geri yükle
+    global V10_MIN_QUALITY
+    _kayitli = safe_float(memory.get("v10_min_quality", 0))
+    if V10_LEARN_AUTO_ADJUST and _kayitli > V10_MIN_QUALITY:
+        V10_MIN_QUALITY = _kayitli
+        logger.info("V10.7: kayıtlı min skor eşiği geri yüklendi -> %s", V10_MIN_QUALITY)
     if PAPER_RESET_ON_DEPLOY:
         memory["paper_trades"] = []
         logger.info("PAPER_RESET_ON_DEPLOY=true → paper defteri sıfırlandı")
+    # V10.7: ölçüm rejimi değişti (giriş fiyatı canlı, takip wick'li, kovalar
+    # yeniden adlandırıldı). V10.6 kapanışlarıyla V10.7 kapanışlarını aynı
+    # defterde toplamak EV'yi yorumlanamaz hale getirir. Bu bayrak eski defteri
+    # SİLMEZ — arşivler ve temiz sayfa açar.
+    if V107_DEFTER_SIFIRLA:
+        eski = memory.get("v10_paper")
+        if eski and (eski.get("open") or eski.get("closed")):
+            memory.setdefault("v10_paper_arsiv", []).append(
+                {"surum": "V10.6", "arsiv_ts": time.time(), "defter": eski})
+            logger.info("V10.7: V10.6 defteri arşivlendi (%d açık, %d kapalı) → temiz defter",
+                        len(eski.get("open", [])), len(eski.get("closed", [])))
+        memory["v10_paper"] = {"open": [], "closed": [], "buckets": {}}
     # RiskGuard durumunu memory'ye bağla → deploy/restart arası kalıcı
     RISK_GUARD.state = memory.setdefault("risk_guard", RISK_GUARD.state)
     global app
