@@ -17,9 +17,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.7 SAĞLAM (SMC + Fibonacci + BTC Trend + Canlı Giriş + Wick Takip)"
+VERSION_NAME = "Balina Avcısı V10.8 SWEEP (SMC + Fibonacci + BTC Trend + Canlı Giriş + Onarılmış Sweep)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.7")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.8")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6045,11 +6045,15 @@ def v10_market_structure(k):
     sw = v10_find_swings(k, V10_SWING_LEFT, V10_SWING_RIGHT, min_fark)
     res = {"trend":"RANGE","hh":False,"hl":False,"lh":False,"ll":False,
            "last_sh":0.0,"last_sh_idx":-1,"last_sl":0.0,"last_sl_idx":-1,
+           "prev_sh":0.0,"prev_sh_idx":-1,"prev_sl":0.0,"prev_sl_idx":-1,
            "event":None,"event_side":None,"event_level":0.0,"event_idx":-1,
            "range_break":False,"atr":_a}
     hs = [s for s in sw if s.kind == "H"]; ls = [s for s in sw if s.kind == "L"]
     if hs: res["last_sh"] = hs[-1].price; res["last_sh_idx"] = hs[-1].idx
     if ls: res["last_sl"] = ls[-1].price; res["last_sl_idx"] = ls[-1].idx
+    # V10.8: bir önceki pivot — onarılmış sweep dedektörü bunu referans alır
+    if len(hs) >= 2: res["prev_sh"] = hs[-2].price; res["prev_sh_idx"] = hs[-2].idx
+    if len(ls) >= 2: res["prev_sl"] = ls[-2].price; res["prev_sl_idx"] = ls[-2].idx
     if len(hs) >= 2:
         res["hh"] = hs[-1].price > hs[-2].price; res["lh"] = hs[-1].price < hs[-2].price
     if len(ls) >= 2:
@@ -6194,6 +6198,83 @@ def v10_detect_sweep(side, k, ms):
     return 0.0
 
 
+# ============================================================================ #
+#  V10.8 — SWEEP DEDEKTÖRÜ ONARIMI
+#  Ölçüm (6000 senaryo): eski dedektör CHoCH kurulumlarının %0.17'sinde,
+#  BOS'ların %0.84'ünde ateş ediyordu. Paylaşılan 9 canlı sinyalin 9'unda da
+#  Sweep▫️ vardı. Yani 7 puanlık terim pratikte ÖLÜ, hep 0 dönüyordu.
+#
+#  Kök neden — iki ayrı hata:
+#   (1) YANLIŞ SEVİYE: Ayı olayı "kapanış < last_sl" demek. Eski kod SHORT için
+#       last_sh'ın delinmesini arıyor. Aynı 6 mumda hem tepeyi hem dibi kırmak
+#       gerekiyordu; ölçümde last_sh, son 6 mumun tepesinin medyan %0.64
+#       üstünde kalıyor, sadece %0.99 vakada gerçekten deliniyordu.
+#   (2) YANLIŞ PENCERE: gerçek likidite avı, yapı kırılmadan ÖNCE — pivotun
+#       oluştuğu mumda — olur. Son 6 muma bakmak o anı kaçırır.
+#
+#  Onarım: sweep artık iki yoldan tespit edilir.
+#   A) YAPISAL  : son pivotun KENDİSİ bir avdı — o mumun fitili bir ÖNCEKİ
+#                 pivotu deldi, ama kapanış geri döndü (klasik stop avı).
+#   B) PENCERE  : son N mumda ilgili pivot delinip geri alındı (eski davranışın
+#                 doğru seviyeye bağlanmış ve genişletilmiş hali).
+#  Hiçbir filtre zorunlu hale getirilmedi; bu sadece skor terimini diriltir.
+# ============================================================================ #
+V108_SWEEP_ONARIM  = os.getenv("V108_SWEEP_ONARIM", "true").lower() == "true"
+V108_SWEEP_PENCERE = int(float(os.getenv("V108_SWEEP_PENCERE", "20")))
+V108_SWEEP_FITIL   = float(os.getenv("V108_SWEEP_FITIL", "0.5"))
+# CHoCH kurulumlarında sweep teyidini ZORUNLU kılar. Varsayılan KAPALI:
+# canlı Sweep✅ oranı ölçülmeden kapı açmak akışı öldürür (bkz. V10.7 dersi).
+V108_CHOCH_SWEEP_ZORUNLU = os.getenv("V108_CHOCH_SWEEP_ZORUNLU", "false").lower() == "true"
+
+
+def _v108_pivotlar(ms, kind):
+    """Son iki pivotu (fiyat, indeks) olarak döner: (son, onceki)."""
+    if kind == "H":
+        return (safe_float(ms.get("last_sh")), int(ms.get("last_sh_idx", -1)),
+                safe_float(ms.get("prev_sh")), int(ms.get("prev_sh_idx", -1)))
+    return (safe_float(ms.get("last_sl")), int(ms.get("last_sl_idx", -1)),
+            safe_float(ms.get("prev_sl")), int(ms.get("prev_sl_idx", -1)))
+
+
+def v108_sweep_tespit(side, k, ms):
+    """Onarılmış sweep dedektörü. Döner: (skor 0..1, açıklama)."""
+    if not V108_SWEEP_ONARIM:
+        return v10_detect_sweep(side, k, ms), ""
+    n = len(k)
+    kind = "L" if side == "LONG" else "H"
+    son, son_idx, onceki, onceki_idx = _v108_pivotlar(ms, kind)
+    if son <= 0:
+        return 0.0, ""
+
+    def _fitil_ok(r, yon):
+        o = safe_float(r[1]); c = safe_float(r[4])
+        h = safe_float(r[2]); l = safe_float(r[3])
+        govde = abs(c - o) + 1e-9
+        return ((min(o, c) - l) if yon == "alt" else (h - max(o, c))) > govde * V108_SWEEP_FITIL
+
+    # --- A) YAPISAL: son pivotun kendisi bir likidite avıydı ---
+    if onceki > 0 and 0 <= son_idx < n:
+        r = k[son_idx]
+        c = safe_float(r[4]); h = safe_float(r[2]); l = safe_float(r[3])
+        if side == "LONG" and l < onceki and c > onceki and _fitil_ok(r, "alt"):
+            return 1.0, "yapısal"
+        if side == "SHORT" and h > onceki and c < onceki and _fitil_ok(r, "ust"):
+            return 1.0, "yapısal"
+
+    # --- B) PENCERE: son N mumda ilgili pivot delinip geri alındı ---
+    bas = max(0, n - V108_SWEEP_PENCERE)
+    for i in range(bas, n):
+        if i == son_idx:
+            continue
+        r = k[i]
+        c = safe_float(r[4]); h = safe_float(r[2]); l = safe_float(r[3])
+        if side == "LONG" and l < son and c > son and _fitil_ok(r, "alt"):
+            return 1.0, "pencere"
+        if side == "SHORT" and h > son and c < son and _fitil_ok(r, "ust"):
+            return 1.0, "pencere"
+    return 0.0, ""
+
+
 def v107_oi_skor(side, oi_pct, fiyat_pct):
     """V10.7: OI skoru artık YÖN FARKINDA.
     V10.6'da 'oi > 0.5 -> tam puan' hem LONG hem SHORT için aynıydı; 9 puanlık
@@ -6280,9 +6361,16 @@ def v10_quality_score(side, k, ms, ext):
     _cvd_uyum = (cv > 0 and side == "LONG") or (cv < 0 and side == "SHORT")
     p["cvd"] = 5.0*(1.0 if _cvd_uyum else 0.2)
     bayrak["cvd"] = bool(_cvd_uyum)
-    _sw_ham = v10_detect_sweep(side, k, ms)
+    _sw_ham, _sw_tip = v108_sweep_tespit(side, k, ms)
     p["sweep"] = 7.0*_sw_ham
     bayrak["sweep"] = _sw_ham > 0.0
+    ext["sweep_tip"] = _sw_tip
+    # V10.8: canlı isabet sayacı — kapıyı açma kararı bu orana bakılarak verilecek
+    stats["v108_sweep_tot"] = int(stats.get("v108_sweep_tot", 0)) + 1
+    if _sw_ham > 0:
+        stats["v108_sweep_var"] = int(stats.get("v108_sweep_var", 0)) + 1
+        anahtar = "v108_sweep_yapisal" if _sw_tip == "yapısal" else "v108_sweep_pencere"
+        stats[anahtar] = int(stats.get(anahtar, 0)) + 1
     return (round(sum(p.values()), 1),
             {kk: round(vv, 1) for kk, vv in p.items()},
             round(r, 1), bayrak)
@@ -6377,6 +6465,16 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
             if side == "SHORT" and trend4 != "DOWN": continue
         blk, mv = v10_fomo_block(side, k)
         if blk: continue
+        # --- V10.8: CHoCH → sweep teyidi (VARSAYILAN KAPALI) -------------------
+        # Onarılmış dedektörle bile CHoCH'ların ~%17'si geçiyor; açmak akışın
+        # büyük kısmını keser. Canlı Sweep✅ oranı görülene kadar kapalı.
+        # Açmak için: V108_CHOCH_SWEEP_ZORUNLU=true
+        if V108_CHOCH_SWEEP_ZORUNLU and ms.get("event") == "CHoCH":
+            _sk, _ = v108_sweep_tespit(side, k, ms)
+            if _sk <= 0:
+                stats["v108_red_choch_sweep"] = int(stats.get("v108_red_choch_sweep", 0)) + 1
+                logger.info("V10.8 %s %s → CHoCH sweep teyidi yok, kesildi", symbol, side)
+                continue
         pb, note = v10_pullback(side, k, ms)
         if not pb: continue
         return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),"pullback":note,"k":k}
@@ -6510,7 +6608,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "fomo_move_pct":gate["fomo"],"pullback":gate["pullback"],
             "score":score,"score_parts":parts,"bayrak":bayrak,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
-            "oi_yorum":ext.get("oi_yorum",""),
+            "oi_yorum":ext.get("oi_yorum",""),"sweep_tip":ext.get("sweep_tip",""),
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
             "btc_4h":btc_4h,"btc_1h":btc_1h,
             "trend_uyum":True,"fomo_uyari":fomo_uyari,"oi_dusuk":oi_dusuk,
@@ -6534,8 +6632,11 @@ def build_v10_message(sig):
     b = sig.get("bayrak") or {}
     p = sig["score_parts"]
     tag = lambda key, lbl: f"{lbl}{'✅' if b.get(key, p.get(key,0) > 0) else '▫️'}"
+    # V10.8: sweep ✅ ise hangi yoldan tespit edildiğini de göster (yapısal / pencere)
+    _swt = str(sig.get("sweep_tip") or "")
+    _sw_lbl = f"Sweep({_swt})" if (b.get("sweep") and _swt) else "Sweep"
     conf = " ".join([tag("order_block","OB"), tag("fvg","FVG"), tag("volume_profile","VP"),
-                     tag("cvd","CVD"), tag("sweep","Sweep"), tag("orderbook","OBflow")])
+                     tag("cvd","CVD"), tag("sweep", _sw_lbl), tag("orderbook","OBflow")])
     fund = safe_float(sig.get("funding"))
     fib_line = ""
     if sig.get("fib_zone"):
@@ -6553,7 +6654,7 @@ def build_v10_message(sig):
     _kay = safe_float(sig.get("entry_kayma_pct"))
     kayma_mark = f" (mum kapanışından %{_kay:+.2f})" if abs(_kay) >= 0.05 else ""
     return (f"{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V10.7 SMC | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V10.8 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
@@ -6949,6 +7050,13 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "— V10.7 sayaçları —",
         f"Bayat kurulum red: {stats.get('v107_red_kayma',0)} | Açık poz. red: {stats.get('v107_red_acik_poz',0)} | Defter dolu red: {stats.get('v107_red_defter_dolu',0)}",
         f"Elenen mikro pivot: {stats.get('v107_pivot_elendi',0)} | RANGE red: {stats.get('v107_red_range',0)} | Alakasız haber: {stats.get('v107_haber_alakasiz',0)}",
+        (f"Sweep dedektörü: {'ONARILMIŞ' if V108_SWEEP_ONARIM else 'eski (V10.7)'}"
+         f" | pencere {V108_SWEEP_PENCERE} mum | CHoCH kapısı: "
+         f"{'AÇIK' if V108_CHOCH_SWEEP_ZORUNLU else 'kapalı'}"
+         + (f" (kesilen {stats.get('v108_red_choch_sweep',0)})" if V108_CHOCH_SWEEP_ZORUNLU else "")),
+        (f"Canlı sweep isabeti: {int(stats.get('v108_sweep_var',0))}/{int(stats.get('v108_sweep_tot',0))}"
+         f" (%{(stats.get('v108_sweep_var',0)/max(1,stats.get('v108_sweep_tot',0))*100):.1f})"
+         f" — yapısal {int(stats.get('v108_sweep_yapisal',0))}, pencere {int(stats.get('v108_sweep_pencere',0))}"),
         f"Belirsiz bar (stop/TP aynı mumda): {stats.get('v107_belirsiz_bar',0)} | Takip boşluğu: {stats.get('v107_takip_bosluk',0)}",
         f"OKX 429: {stats.get('okx_429',0)} | Ölen task: {stats.get('task_oldu',0)} | API hata: {stats.get('api_fail',0)}",
         f"4H filtre: {V10_USE_4H_FILTER} | Orderbook: {V10_USE_ORDERBOOK} | Öğrenen: {V10_LEARN_AUTO_ADJUST}",
