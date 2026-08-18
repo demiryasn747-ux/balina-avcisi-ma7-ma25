@@ -17,9 +17,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V10.8 SWEEP (SMC + Fibonacci + BTC Trend + Canlı Giriş + Onarılmış Sweep)"
+VERSION_NAME = "Balina Avcısı V10.9 TEYİT (SMC + Fibonacci + BTC Trend + CHoCH Sweep Kapısı + Coin 1H Uyumu)"
 # Her teslimde artar — /version ile hangi sürümün canlı olduğunu doğrula (deploy oldu mu?)
-BOT_BUILD = os.getenv("BOT_BUILD", "V10.8")
+BOT_BUILD = os.getenv("BOT_BUILD", "V10.9")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -6222,9 +6222,49 @@ def v10_detect_sweep(side, k, ms):
 V108_SWEEP_ONARIM  = os.getenv("V108_SWEEP_ONARIM", "true").lower() == "true"
 V108_SWEEP_PENCERE = int(float(os.getenv("V108_SWEEP_PENCERE", "20")))
 V108_SWEEP_FITIL   = float(os.getenv("V108_SWEEP_FITIL", "0.5"))
-# CHoCH kurulumlarında sweep teyidini ZORUNLU kılar. Varsayılan KAPALI:
-# canlı Sweep✅ oranı ölçülmeden kapı açmak akışı öldürür (bkz. V10.7 dersi).
-V108_CHOCH_SWEEP_ZORUNLU = os.getenv("V108_CHOCH_SWEEP_ZORUNLU", "false").lower() == "true"
+# CHoCH kurulumlarında sweep teyidini ZORUNLU kılar.
+# V10.9: canlı ölçüm sonrası AÇILDI. 15-17 Ağu defterinde Sweep✅ %50 oranında
+# geliyordu (akış ölmüyor) ve kapı açık olsaydı CC + BAT kesilip +2.00R
+# kurtarılacaktı; DOT kazananı BOS olduğu için etkilenmezdi.
+V108_CHOCH_SWEEP_ZORUNLU = os.getenv("V108_CHOCH_SWEEP_ZORUNLU", "true").lower() == "true"
+
+# ============================================================================ #
+#  V10.9 — CHoCH'ta COIN'İN KENDİ 1H TREND UYUMU
+#
+#  ÖNEMLİ TESPİT: mesajdaki "1H:UP" etiketi (ms["trend"]) bu iş için KULLANILAMAZ.
+#  Ayı CHoCH'un tanımı zaten "trend UP iken last_sl kırıldı" demek — 8000
+#  senaryoda Ayı CHoCH'un 421/421'i 1H:UP, Boğa CHoCH'un 414/414'ü 1H:DOWN
+#  çıktı. Yani "CHoCH'ta 1H uyumu ara" o etikete bakılarak yazılırsa TÜM CHoCH
+#  kolunu siler; filtre değil, kapatma düğmesi olur.
+#
+#  Bu yüzden uyum, BTC'ye uygulanan testin AYNISIYLA ölçülür: coin'in kendi 1H
+#  EMA20/EMA50 ilişkisi. Bu pivot yapısından bağımsızdır — bir coin'in pivotları
+#  hâlâ HH/HL yaparken EMA'sı çoktan aşağı kesmiş olabilir; asıl aradığımız da
+#  tam olarak bu ayrım.
+#
+#  SHORT CHoCH → coin 1H EMA20 < EMA50 şart | LONG CHoCH → EMA20 > EMA50 şart
+#  Sadece CHoCH'a uygulanır; BOS kurulumları etkilenmez.
+# ============================================================================ #
+V109_COIN_1H_UYUM      = os.getenv("V109_COIN_1H_UYUM", "true").lower() == "true"
+V109_COIN_EMA_FAST     = int(float(os.getenv("V109_COIN_EMA_FAST", "20")))
+V109_COIN_EMA_SLOW     = int(float(os.getenv("V109_COIN_EMA_SLOW", "50")))
+V109_COIN_1H_FLAT_GECER = os.getenv("V109_COIN_1H_FLAT_GECER", "false").lower() == "true"
+
+
+def v109_coin_1h_yon(k1h):
+    """Coin'in kendi 1H EMA20/EMA50 yönü. Kapanmış mumlarla, repaint yok.
+    Döner: "UP" | "DOWN" | "FLAT" (veri yetersizse FLAT)."""
+    try:
+        c = closes(_s_closed(k1h))
+        if len(c) < V109_COIN_EMA_SLOW + 2:
+            return "FLAT"
+        f = ema(c, V109_COIN_EMA_FAST)[-1]
+        y = ema(c, V109_COIN_EMA_SLOW)[-1]
+        if f > y: return "UP"
+        if f < y: return "DOWN"
+    except Exception as e:
+        logger.warning("V10.9 coin 1H EMA yönü hesaplanamadı: %s", e)
+    return "FLAT"
 
 
 def _v108_pivotlar(ms, kind):
@@ -6475,9 +6515,20 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
                 stats["v108_red_choch_sweep"] = int(stats.get("v108_red_choch_sweep", 0)) + 1
                 logger.info("V10.8 %s %s → CHoCH sweep teyidi yok, kesildi", symbol, side)
                 continue
+        # --- V10.9: CHoCH'ta coin'in KENDİ 1H EMA yönü sinyalle uyuşmalı ---
+        # (ms["trend"] burada işe yaramaz — CHoCH tanımı gereği hep ters, bkz. üstteki not)
+        if V109_COIN_1H_UYUM and ms.get("event") == "CHoCH":
+            _cy = v109_coin_1h_yon(k1h)
+            _ters = (side == "LONG" and _cy == "DOWN") or (side == "SHORT" and _cy == "UP")
+            _bilinmiyor = (_cy == "FLAT" and not V109_COIN_1H_FLAT_GECER)
+            if _ters or _bilinmiyor:
+                stats["v109_red_coin_1h"] = int(stats.get("v109_red_coin_1h", 0)) + 1
+                logger.info("V10.9 %s %s → coin 1H EMA yönü %s, CHoCH kesildi", symbol, side, _cy)
+                continue
         pb, note = v10_pullback(side, k, ms)
         if not pb: continue
-        return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),"pullback":note,"k":k}
+        return {"side":side,"ms":ms,"why":why,"trend4":trend4,"fomo":round(mv,2),
+                "pullback":note,"k":k,"coin_1h_ema":v109_coin_1h_yon(k1h)}
     return None
 
 
@@ -6609,6 +6660,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "score":score,"score_parts":parts,"bayrak":bayrak,"rsi":r,"atr":round(a,8),
             "candle_ts":str(k[-1][0]),"oi_change_pct":ext["oi_change_pct"],
             "oi_yorum":ext.get("oi_yorum",""),"sweep_tip":ext.get("sweep_tip",""),
+            "coin_1h_ema":gate.get("coin_1h_ema","-"),
             "funding":funding,"ob_imbalance":ob.get("imbalance",0),
             "btc_4h":btc_4h,"btc_1h":btc_1h,
             "trend_uyum":True,"fomo_uyari":fomo_uyari,"oi_dusuk":oi_dusuk,
@@ -6654,9 +6706,10 @@ def build_v10_message(sig):
     _kay = safe_float(sig.get("entry_kayma_pct"))
     kayma_mark = f" (mum kapanışından %{_kay:+.2f})" if abs(_kay) >= 0.05 else ""
     return (f"{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V10.8 SMC | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V10.9 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
-            f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}\n"
+            f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
+            + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
             f"Skor: {sig['score']}/100  RSI:{sig['rsi']}\nConfluence: {conf}\n{fib_line}"
             f"Giriş: {_v10_fmt(sig['entry'])} [{sig.get('entry_kaynak','-')}]{kayma_mark}\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']} = {sig.get('stop_atr','?')}×ATR){stop_uyari}\n"
@@ -7054,6 +7107,10 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          f" | pencere {V108_SWEEP_PENCERE} mum | CHoCH kapısı: "
          f"{'AÇIK' if V108_CHOCH_SWEEP_ZORUNLU else 'kapalı'}"
          + (f" (kesilen {stats.get('v108_red_choch_sweep',0)})" if V108_CHOCH_SWEEP_ZORUNLU else "")),
+        (f"CHoCH coin 1H EMA{V109_COIN_EMA_FAST}/{V109_COIN_EMA_SLOW} uyumu: "
+         f"{'AÇIK' if V109_COIN_1H_UYUM else 'kapalı'}"
+         + (f" (kesilen {stats.get('v109_red_coin_1h',0)})" if V109_COIN_1H_UYUM else "")
+         + " — BOS kurulumları etkilenmez"),
         (f"Canlı sweep isabeti: {int(stats.get('v108_sweep_var',0))}/{int(stats.get('v108_sweep_tot',0))}"
          f" (%{(stats.get('v108_sweep_var',0)/max(1,stats.get('v108_sweep_tot',0))*100):.1f})"
          f" — yapısal {int(stats.get('v108_sweep_yapisal',0))}, pencere {int(stats.get('v108_sweep_pencere',0))}"),
