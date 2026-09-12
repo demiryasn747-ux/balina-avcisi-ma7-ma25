@@ -1,3 +1,4 @@
+python
 import os
 import re
 import json
@@ -17,8 +18,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11 TEMİZ (SMC + Sabit %2 Stop + Sabit RR)"
-BOT_BUILD = os.getenv("BOT_BUILD", "V11")
+VERSION_NAME = "Balina Avcısı V11.1 TEMİZ (Sabit %2 Stop + Sabit RR + Sert Filtreler)"
+BOT_BUILD = os.getenv("BOT_BUILD", "V11.1")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -26,8 +27,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 OKX_BASE_URL = os.getenv("OKX_BASE_URL", "https://www.okx.com").strip().rstrip("/")
 OKX_INST_TYPE = os.getenv("OKX_INST_TYPE", "SWAP").strip().upper()
 
-MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_v11_memory.json").strip()
-LOG_FILE = os.getenv("LOG_FILE", "balina_v11.log").strip()
+MEMORY_FILE = os.getenv("MEMORY_FILE", "balina_v11_1_memory.json").strip()
+LOG_FILE = os.getenv("LOG_FILE", "balina_v11_1.log").strip()
 LOG_MAX_MB = float(os.getenv("LOG_MAX_MB", "10"))
 LOG_BACKUPS = int(float(os.getenv("LOG_BACKUPS", "3")))
 TIMEZONE_NAME = os.getenv("TIMEZONE_NAME", "Europe/Istanbul").strip()
@@ -87,7 +88,7 @@ TP3_RR = float(os.getenv("TP3_RR", "7.0"))
 TP4_RR = float(os.getenv("TP4_RR", "10.0"))
 
 # === SABİT STOP ===
-SABIT_STOP_PCT = float(os.getenv("SABIT_STOP_PCT", "2.0"))  # %2 sabit stop
+SABIT_STOP_PCT = float(os.getenv("SABIT_STOP_PCT", "2.0"))
 
 # === ZORUNLU FİLTRELER ===
 COIN_1H_EMA_FILTER = os.getenv("COIN_1H_EMA_FILTER", "true").lower() == "true"
@@ -113,13 +114,12 @@ V10_KLINE_LIMIT = int(float(os.getenv("V10_KLINE_LIMIT", "150")))
 V10_SWING_LEFT = int(float(os.getenv("V10_SWING_LEFT", "2")))
 V10_SWING_RIGHT = int(float(os.getenv("V10_SWING_RIGHT", "2")))
 V10_FOMO_LOOKBACK = int(float(os.getenv("V10_FOMO_LOOKBACK", "5")))
-V10_FOMO_MAX_MOVE = float(os.getenv("V10_FOMO_MAX_MOVE_PCT", "4.5"))
+V10_FOMO_MAX_MOVE = float(os.getenv("V10_FOMO_MAX_MOVE_PCT", "3.0"))
 V10_PULLBACK_TOL = float(os.getenv("V10_PULLBACK_TOL_PCT", "0.6"))
 V10_PULLBACK_WAIT = int(float(os.getenv("V10_PULLBACK_MAX_WAIT", "8")))
 V10_ATR_PERIOD = int(float(os.getenv("V10_ATR_PERIOD", "14")))
 V10_RSI_LONG_MAX = float(os.getenv("V10_RSI_LONG_MAX", "40"))
 V10_RSI_SHORT_MIN = float(os.getenv("V10_RSI_SHORT_MIN", "70"))
-V10_FIB_ENABLED = os.getenv("V10_FIB_ENABLED", "true").lower() == "true"
 V10_USE_4H_FILTER = os.getenv("V10_USE_4H_FILTER", "true").lower() == "true"
 V10_OB_LOOKBACK = int(float(os.getenv("V10_OB_LOOKBACK", "20")))
 V10_FVG_LOOKBACK = int(float(os.getenv("V10_FVG_LOOKBACK", "15")))
@@ -143,7 +143,7 @@ V109_COIN_EMA_FAST = int(float(os.getenv("V109_COIN_EMA_FAST", "20")))
 V109_COIN_EMA_SLOW = int(float(os.getenv("V109_COIN_EMA_SLOW", "50")))
 V107_ACIKKEN_ENGELLE = os.getenv("V107_ACIKKEN_ENGELLE", "true").lower() == "true"
 V107_PIVOT_ATR = float(os.getenv("V107_PIVOT_ATR", "1.0"))
-V107_RANGE_ENGELLE = os.getenv("V107_RANGE_ENGELLE", "false").lower() == "true"
+V107_RANGE_ENGELLE = os.getenv("V107_RANGE_ENGELLE", "true").lower() == "true"
 
 # === GRAFİK ===
 SIGNAL_CHART_ENABLED = os.getenv("SIGNAL_CHART_ENABLED", "true").lower() == "true"
@@ -193,7 +193,7 @@ logging.basicConfig(
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger("balina_v11")
+logger = logging.getLogger("balina_v11_1")
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 SESSION = requests.Session()
@@ -303,6 +303,9 @@ stats: Dict[str, Any] = {
     "v107_red_range": 0,
     "v107_belirsiz_bar": 0,
     "v107_takip_bosluk": 0,
+    "v11_red_coin_ema": 0,
+    "v11_red_fomo": 0,
+    "v11_red_oi_zayif": 0,
 }
 
 app = None
@@ -1661,12 +1664,10 @@ def v107_oi_skor(side, oi_pct, fiyat_pct):
 
 
 def v10_targets(side, entry):
-    # Sabit %2 stop
     stop_pct = SABIT_STOP_PCT / 100.0
     stop = entry * (1 - stop_pct) if side == "LONG" else entry * (1 + stop_pct)
     risk = abs(entry - stop)
 
-    # Sabit RR hedefleri
     if side == "LONG":
         tp1 = entry + risk * TP1_RR
         tp2 = entry + risk * TP2_RR
@@ -1752,11 +1753,15 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
                 continue
         blk, mv = v10_fomo_block(side, k)
         if blk:
+            stats["v11_red_fomo"] = int(stats.get("v11_red_fomo", 0)) + 1
             continue
-        if V109_COIN_1H_UYUM and ms.get("event") == "CHoCH":
+        # === V11.1: Coin 1H EMA filtresi TÜM yapılara uygulanıyor ===
+        if V109_COIN_1H_UYUM:
             _cy = v109_coin_1h_yon(k1h)
             _ters = (side == "LONG" and _cy == "DOWN") or (side == "SHORT" and _cy == "UP")
-            if _ters:
+            _bilinmiyor = (_cy == "FLAT")
+            if _ters or _bilinmiyor:
+                stats["v11_red_coin_ema"] = int(stats.get("v11_red_coin_ema", 0)) + 1
                 continue
         pb, note = v10_pullback(side, k, ms)
         if not pb:
@@ -1786,7 +1791,6 @@ def v107_canli_giris(k1h, ob, referans):
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     symbol = normalize_symbol(symbol)
 
-    # === ZORUNLU BTC TREND FİLTRESİ ===
     allowed_side = None
     btc_1h = "FLAT"
     btc_4h = "FLAT"
@@ -1832,6 +1836,15 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_red_rsi"] = int(stats.get("v10_red_rsi", 0)) + 1
         return None
 
+    # === V11.1: OI zayıf sinyal engeli ===
+    oi_yorum = ext.get("oi_yorum", "")
+    if side == "LONG" and "short kapanışı" in oi_yorum:
+        stats["v11_red_oi_zayif"] = int(stats.get("v11_red_oi_zayif", 0)) + 1
+        return None
+    if side == "SHORT" and "long likidasyonu" in oi_yorum:
+        stats["v11_red_oi_zayif"] = int(stats.get("v11_red_oi_zayif", 0)) + 1
+        return None
+
     entry_ref = closes(k)[-1]
     entry, giris_kaynak = v107_canli_giris(k1h, ob, entry_ref)
     kayma = (abs(entry - entry_ref) / entry_ref * 100.0) if entry_ref > 0 else 0.0
@@ -1841,7 +1854,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     tgt = v10_targets(side, entry)
 
-    return {"symbol": symbol, "direction": side, "entry": entry, "strategy": "V11_SMC",
+    return {"symbol": symbol, "direction": side, "entry": entry, "strategy": "V11.1_SMC",
             "entry_ref": entry_ref, "entry_kaynak": giris_kaynak, "entry_kayma_pct": round(kayma, 3),
             "event": gate["ms"]["event"], "structure": gate["why"],
             "range_break": bool(gate["ms"].get("range_break")),
@@ -1868,7 +1881,7 @@ def build_v10_message(sig):
     _kay = safe_float(sig.get("entry_kayma_pct"))
     kayma_mark = f" (mum kapanışından %{_kay:+.2f})" if abs(_kay) >= 0.05 else ""
     return (f"{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V11 SMC | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V11.1 SMC | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -1886,11 +1899,11 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     if outcome == "STOP":
         head = "❌ STOP GELDİ"
     elif outcome == "TP1":
-        head = "✅ TP1 GELDİ — tam çıkış (V11: %100 realize)"
+        head = "✅ TP1 GELDİ — tam çıkış (V11.1: %100 realize)"
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V11 SMC — POZİSYON KAPANDI\n"
+        f"🆕 V11.1 SMC — POZİSYON KAPANDI\n"
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
         f"Yön: {pos['side']}\n"
@@ -1960,7 +1973,6 @@ async def v107_takip_barlari(pos):
 
 
 def v107_check_paper_bar(pos, hi, lo):
-    """V11: TP1 = %100 çıkış. TP2/TP3/TP4 sadece bilgi."""
     side = pos["side"]
     e = safe_float(pos["entry"])
     if side == "LONG":
@@ -2050,10 +2062,10 @@ async def maybe_send_v10_signal(sig):
         v10_sent_candle[ckey] = sig["candle_ts"]
         v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
-        stats["last_signal"] = f"V11 {side} {symbol} skor {sig['score']}"
-        logger.info("V11 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
+        stats["last_signal"] = f"V11.1 {side} {symbol} skor {sig['score']}"
+        logger.info("V11.1 SİNYAL GÖNDERİLDİ %s %s skor=%s", side, symbol, sig["score"])
     else:
-        logger.warning("V11 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
+        logger.warning("V11.1 TELEGRAM GÖNDERİLEMEDİ %s %s", side, symbol)
 
 
 async def v10_scan_loop() -> None:
@@ -2070,7 +2082,7 @@ async def v10_scan_loop() -> None:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for res in results:
                     if isinstance(res, Exception):
-                        logger.warning("V11 batch hata: %s", res)
+                        logger.warning("V11.1 batch hata: %s", res)
                         continue
                     stats["v10_analyzed"] = int(stats.get("v10_analyzed", 0)) + 1
                     if res:
@@ -2099,7 +2111,7 @@ async def v10_paper_loop() -> None:
                 v10_record_closed(pos, R, oc)
                 exit_price = pos["orig_stop"] if oc == "STOP" else pos["tp1"]
                 await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
-                logger.info("V11 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
+                logger.info("V11.1 KAPANDI %s %s %s R=%.2f", pos["side"], pos["symbol"], oc, R)
                 kapananlar.add(uid)
             if kapananlar:
                 mp["open"] = [p for p in mp["open"] if v107_pos_uid(p) not in kapananlar]
@@ -2128,7 +2140,8 @@ async def post_init(application) -> None:
         f"Kaldıraç: {LEVERAGE}x | Risk: %{V10_RISK_PCT}/işlem\n"
         f"TP: {TP1_RR}R / {TP2_RR}R / {TP3_RR}R / {TP4_RR}R (TP1=%100 çıkış)\n"
         f"Stop: Sabit %{SABIT_STOP_PCT}\n"
-        f"Skor: SINYAL ENGELLEMEZ, risk çarpanını belirler"
+        f"Skor: SINYAL ENGELLEMEZ, risk çarpanını belirler\n"
+        f"Filtreler: RANGE kapalı, Coin 1H EMA zorunlu, FOMO eşik %{V10_FOMO_MAX_MOVE}, OI zayıf engeli"
     )
     for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, save_loop):
         asyncio.create_task(_kur(), name=_kur.__name__)
@@ -2140,7 +2153,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Komutlar:\n"
         "/status - durum\n"
         "/test - test mesajı\n"
-        "/v10 - V11 SMC durumu\n"
+        "/v10 - V11.1 SMC durumu\n"
         "/coin BTCUSDT - tek coin analiz\n"
     )
 
@@ -2157,15 +2170,18 @@ def build_status_report() -> str:
     ev = (sum(x["R"] for x in cl)/n) if n else 0
     wins = sum(1 for x in cl if x["R"] > 0)
     lines = [
-        f"📊 BALİNA AVCISI V11 DURUM",
+        f"📊 BALİNA AVCISI V11.1 DURUM",
         f"Saat: {tr_str()}",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
         f"TP1={TP1_RR}R | TP2={TP2_RR}R | TP3={TP3_RR}R | TP4={TP4_RR}R",
         f"Stop: Sabit %{SABIT_STOP_PCT}",
-        f"Coin 1H EMA: {'AÇIK' if V109_COIN_1H_UYUM else 'kapalı'}",
-        f"Skor barajı: YOK (skor sadece risk çarpanı)",
+        f"Coin 1H EMA: {'ZORUNLU' if V109_COIN_1H_UYUM else 'kapalı'}",
+        f"RANGE kırılımı: {'ENGELLİ' if V107_RANGE_ENGELLE else 'serbest'}",
+        f"FOMO eşik: %{V10_FOMO_MAX_MOVE}",
+        f"OI zayıf engeli: AÇIK",
+        f"Skor barajı: YOK",
         f"API fail: {stats.get('api_fail', 0)}",
     ]
     return "\n".join(lines)
@@ -2182,7 +2198,7 @@ async def cmd_coin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için şu an V11 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için şu an V11.1 sinyali yok.")
         return
     await update.message.reply_text(build_v10_message(res))
 
@@ -2201,13 +2217,15 @@ async def cmd_v10(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         btc_line = "SİNYAL YOK ❌ (1H-4H uyuşmuyor)"
     lines = [
-        f"🆕 V11 SMC durumu",
+        f"🆕 V11.1 SMC durumu",
         f"BTC trend: 1H:{bt.get('dir_1h','-')} 4H:{bt.get('dir_4h','-')} → {btc_line}",
         f"Analiz: {stats.get('v10_analyzed',0)} | Aday: {stats.get('v10_candidates',0)} | Sinyal: {stats.get('v10_signals',0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
         f"TP: {TP1_RR}R/{TP2_RR}R/{TP3_RR}R/{TP4_RR}R | TP1=%100 çıkış",
         f"Stop: Sabit %{SABIT_STOP_PCT}",
-        f"Red: veri={stats.get('v10_red_veri',0)} yapı={stats.get('v10_red_yapi',0)} rsi={stats.get('v10_red_rsi',0)} kayma={stats.get('v107_red_kayma',0)}",
+        f"Filtreler: RANGE={V107_RANGE_ENGELLE}, Coin EMA={V109_COIN_1H_UYUM}, FOMO={V10_FOMO_MAX_MOVE}",
+        f"Red: veri={stats.get('v10_red_veri',0)} yapı={stats.get('v10_red_yapi',0)} rsi={stats.get('v10_red_rsi',0)} kayma={stats.get('v107_red_kayma',0)} "
+        f"coin_ema={stats.get('v11_red_coin_ema',0)} range={stats.get('v107_red_range',0)} fomo={stats.get('v11_red_fomo',0)} oi_zayif={stats.get('v11_red_oi_zayif',0)}",
     ]
     if mp["open"]:
         lines.append("— Açık —")
