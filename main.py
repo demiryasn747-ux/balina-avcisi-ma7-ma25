@@ -2884,6 +2884,8 @@ async def v10_paper_loop() -> None:
                 v10_update_excursions(pos, barlar)
                 R, oc = v107_check_paper_barlar(pos, barlar)
                 pending_hits = list(pos.pop("pending_hits", []))
+                if pending_hits:
+                    olcum_db_pozisyon_guncelle(pos)
                 notified = pos.setdefault("notified_hits", [])
                 for idx in pending_hits:
                     if idx in notified:
@@ -3211,12 +3213,23 @@ async def cmd_status(update, context):
     cl = mp["closed"]; n = len(cl)
     wins = sum(1 for x in cl if x["R"] > 0)
     ev = (sum(x["R"] for x in cl) / n) if n else 0
+    tp_rows = olcum_db_tp_satirlari()
+    tp_sayilari = [0, 0, 0, 0]
+    for row in tp_rows:
+        try:
+            hitler = json.loads(row[3] or "{}")
+        except Exception:
+            hitler = {}
+        for idx in range(1, 5):
+            tp_sayilari[idx - 1] += int(bool(hitler.get(f"_hit{idx}")))
+    stop_sayisi = sum(1 for row in tp_rows if row[4] == "STOP")
     lines = [
         f"📊 V11.5 ULTRA DURUM",
         f"Saat: {tr_str()}",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
+        f"TP1: {tp_sayilari[0]} | TP2: {tp_sayilari[1]} | TP3: {tp_sayilari[2]} | TP4: {tp_sayilari[3]} | STOP: {stop_sayisi}",
         f"🎯 Filtre red sayaçları:",
         f"  Yapı: {stats.get('v10_red_yapi', 0)}",
         f"  Coin EMA: {stats.get('v11_red_coin_ema', 0)}",
