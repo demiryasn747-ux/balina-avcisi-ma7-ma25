@@ -19,8 +19,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11.5.1 ÖLÇÜM LABORATUVARI (SMC + MTF + VWAP + Session + Manipulation Guard)"
-BOT_BUILD = os.getenv("BOT_BUILD", "V11.5.1")
+VERSION_NAME = "Balina Avcısı V11.5.2 ÖLÇÜM LABORATUVARI (SMC + MTF + VWAP + Session + Manipulation Guard)"
+BOT_BUILD = os.getenv("BOT_BUILD", "V11.5.2")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -40,6 +40,10 @@ OLCUM_RASTGELE_ORAN = float(os.getenv("OLCUM_RASTGELE_ORAN", "0.10"))
 OLCUM_MIN_HUCRE = int(float(os.getenv("OLCUM_MIN_HUCRE", "100")))
 OLCUM_DB = os.getenv("OLCUM_DB", "balina_olcum.db").strip()
 OLCUM_MAX_OPEN = int(float(os.getenv("OLCUM_MAX_OPEN", "400")))
+GOLGE_IZLEME = os.getenv("GOLGE_IZLEME", "true").lower() == "true"
+GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
+GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
+GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
 
 # === TARAMA ===
 HOT_SCAN_INTERVAL_SEC = float(os.getenv("HOT_SCAN_INTERVAL_SEC", "1.5"))
@@ -384,8 +388,6 @@ _OLCUM_DB_LOCK = threading.Lock()
 
 
 def olcum_db_init() -> None:
-    if not OLCUM_MODU:
-        return
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
@@ -403,11 +405,23 @@ def olcum_db_init() -> None:
                 kapi_json TEXT NOT NULL
             )
         """)
+        mevcut_kolonlar = {row[1] for row in conn.execute("PRAGMA table_info(olcum_pozisyon)")}
+        yeni_kolonlar = {
+            "golge_durum": "TEXT",
+            "golge_tp": "INTEGER",
+            "golge_mfe_pct": "REAL",
+            "golge_mae_pct": "REAL",
+            "golge_tp1_dk": "REAL",
+            "golge_bitis_ts": "REAL",
+        }
+        for kolon, tur in yeni_kolonlar.items():
+            if kolon not in mevcut_kolonlar:
+                conn.execute(f"ALTER TABLE olcum_pozisyon ADD COLUMN {kolon} {tur}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_durum ON olcum_pozisyon(durum)")
 
 
 def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
-    if not OLCUM_MODU:
+    if not OLCUM_MODU and not GOLGE_IZLEME:
         return
     payload = json.dumps(pos.get("kapi_sonuclari", {}), ensure_ascii=False, sort_keys=True)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
@@ -422,16 +436,64 @@ def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
 
 def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
                                r_value: Optional[float] = None) -> None:
-    if not OLCUM_MODU:
+    if not OLCUM_MODU and not GOLGE_IZLEME:
         return
     close_ts = time.time() if durum != "ACIK" else None
     rv = safe_float(pos.get("current_r")) if r_value is None else safe_float(r_value)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        mevcut = conn.execute("SELECT kapi_json FROM olcum_pozisyon WHERE uid=?",
+                              (v107_pos_uid(pos),)).fetchone()
+        try:
+            payload = json.loads(mevcut[0] or "{}") if mevcut else {}
+        except Exception:
+            payload = {}
+        for idx in range(1, 5):
+            payload[f"_hit{idx}"] = bool(pos.get(f"hit{idx}"))
         conn.execute("""
-            UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, mfe_pct=?, mae_pct=?
+            UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, mfe_pct=?, mae_pct=?, kapi_json=?
             WHERE uid=?
         """, (durum, close_ts, rv, safe_float(pos.get("mfe_pct")),
-              safe_float(pos.get("mae_pct")), v107_pos_uid(pos)))
+              safe_float(pos.get("mae_pct")), json.dumps(payload, ensure_ascii=False, sort_keys=True),
+              v107_pos_uid(pos)))
+
+
+def olcum_db_golge_baslat(pos: Dict[str, Any]) -> None:
+    if not GOLGE_IZLEME or not os.path.exists(OLCUM_DB):
+        return
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.execute("""
+            UPDATE olcum_pozisyon
+            SET golge_durum='IZLENIYOR', golge_tp=0, golge_mfe_pct=0,
+                golge_mae_pct=0, golge_tp1_dk=NULL, golge_bitis_ts=NULL
+            WHERE uid=?
+        """, (v107_pos_uid(pos),))
+
+
+def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool = False) -> None:
+    if not GOLGE_IZLEME or not os.path.exists(OLCUM_DB):
+        return
+    durum = "BITTI" if bitti else "IZLENIYOR"
+    bitis_ts = time.time() if bitti else None
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.execute("""
+            UPDATE olcum_pozisyon
+            SET golge_durum=?, golge_tp=?, golge_mfe_pct=?, golge_mae_pct=?,
+                golge_tp1_dk=?, golge_bitis_ts=?
+            WHERE uid=?
+        """, (durum, int(golge.get("golge_tp", 0)), safe_float(golge.get("golge_mfe_pct")),
+              safe_float(golge.get("golge_mae_pct")), golge.get("golge_tp1_dk"), bitis_ts,
+              str(golge.get("uid", ""))))
+
+
+def olcum_db_tp_satirlari() -> List[Tuple[Any, ...]]:
+    if not os.path.exists(OLCUM_DB):
+        return []
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        return conn.execute("""
+            SELECT kontrol,mfe_pct,mae_pct,kapi_json,durum,golge_durum,golge_tp,
+                   golge_mfe_pct,golge_mae_pct,golge_tp1_dk
+            FROM olcum_pozisyon
+        """).fetchall()
 
 
 def olcum_db_satirlari() -> List[Tuple[Any, ...]]:
@@ -488,6 +550,7 @@ def ensure_memory_shape() -> None:
     memory.setdefault("follows", {})
     memory.setdefault("stats", {})
     memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
+    memory["v10_paper"].setdefault("golge", [])
     memory.setdefault("last_signal_ts", 0.0)
     memory.setdefault("runtime", {})
 
@@ -2599,7 +2662,9 @@ def build_v10_close_message(pos, R, outcome, exit_price):
 
 
 def _v10_mem():
-    return memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
+    mp = memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
+    mp.setdefault("golge", [])
+    return mp
 
 
 def v107_pos_uid(pos):
@@ -2844,6 +2909,21 @@ async def v10_paper_loop() -> None:
                 if not oc:
                     continue
                 v10_record_closed(pos, R, oc)
+                if oc == "STOP" and GOLGE_IZLEME:
+                    stop_ts = time.time()
+                    golge = {
+                        "uid": uid,
+                        "symbol": pos["symbol"], "side": pos["side"],
+                        "entry": pos["entry"],
+                        "tp1": pos["tp1"], "tp2": pos["tp2"],
+                        "tp3": pos["tp3"], "tp4": pos["tp4"],
+                        "stop_ts": stop_ts, "scan_ts": 0.0,
+                        "kontrol": bool(pos.get("kontrol")),
+                        "golge_tp": 0, "golge_mfe_pct": 0.0,
+                        "golge_mae_pct": 0.0, "golge_tp1_dk": None,
+                    }
+                    mp["golge"].append(golge)
+                    olcum_db_golge_baslat(pos)
                 exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp4"] if oc == "TP4" else safe_float(barlar[-1][4]))
                 await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
                 kapananlar.add(uid)
@@ -2852,6 +2932,67 @@ async def v10_paper_loop() -> None:
         except Exception as e:
             logger.exception("v10_paper_loop hata: %s", e)
         await asyncio.sleep(max(V107_TAKIP_ARALIK_SEC, 20))
+
+
+def golge_kaydi_guncelle(golge: Dict[str, Any], barlar: List[List[Any]]) -> None:
+    entry = safe_float(golge.get("entry"))
+    stop_ms = safe_float(golge.get("stop_ts")) * 1000.0
+    scan_ms = safe_float(golge.get("scan_ts"))
+    yeni_barlar = [r for r in barlar if safe_float(r[0]) > stop_ms and safe_float(r[0]) > scan_ms]
+    if entry <= 0 or not yeni_barlar:
+        return
+    max_hi = max(safe_float(r[2]) for r in yeni_barlar)
+    min_lo = min(safe_float(r[3]) for r in yeni_barlar)
+    if golge.get("side") == "LONG":
+        lehe = max(0.0, (max_hi - entry) / entry * 100.0)
+        aleyhe = max(0.0, (entry - min_lo) / entry * 100.0)
+        degdi = lambda r, seviye: safe_float(r[2]) >= seviye
+    else:
+        lehe = max(0.0, (entry - min_lo) / entry * 100.0)
+        aleyhe = max(0.0, (max_hi - entry) / entry * 100.0)
+        degdi = lambda r, seviye: safe_float(r[3]) <= seviye
+    golge["golge_mfe_pct"] = round(max(safe_float(golge.get("golge_mfe_pct")), lehe), 6)
+    golge["golge_mae_pct"] = round(max(safe_float(golge.get("golge_mae_pct")), aleyhe), 6)
+    for idx in range(1, 5):
+        seviye = safe_float(golge.get(f"tp{idx}"))
+        if seviye <= 0:
+            continue
+        ilk_bar = next((r for r in yeni_barlar if degdi(r, seviye)), None)
+        if ilk_bar is not None:
+            golge["golge_tp"] = max(int(golge.get("golge_tp", 0)), idx)
+            if idx == 1 and golge.get("golge_tp1_dk") is None:
+                golge["golge_tp1_dk"] = round(
+                    max(0.0, (safe_float(ilk_bar[0]) / 1000.0 - safe_float(golge.get("stop_ts"))) / 60.0), 3
+                )
+    golge["scan_ts"] = max(safe_float(r[0]) for r in yeni_barlar)
+
+
+async def golge_loop() -> None:
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if GOLGE_IZLEME:
+                mp = _v10_mem()
+                gruplar: Dict[str, List[Dict[str, Any]]] = {}
+                for golge in list(mp.get("golge", [])):
+                    gruplar.setdefault(str(golge.get("symbol", "")), []).append(golge)
+                biten_uidler = set()
+                simdi = time.time()
+                for symbol, kayitlar in gruplar.items():
+                    barlar = await get_klines(symbol, GOLGE_TF, 300, ttl=max(10.0, GOLGE_ARALIK_SEC * 0.8))
+                    for golge in kayitlar:
+                        if barlar:
+                            golge_kaydi_guncelle(golge, barlar)
+                        bitti = simdi >= safe_float(golge.get("stop_ts")) + max(0.0, GOLGE_SAAT) * 3600.0
+                        olcum_db_golge_guncelle(golge, bitti)
+                        if bitti:
+                            biten_uidler.add(str(golge.get("uid", "")))
+                if biten_uidler:
+                    mp["golge"] = [g for g in mp.get("golge", [])
+                                   if str(g.get("uid", "")) not in biten_uidler]
+        except Exception as e:
+            logger.exception("golge_loop hata: %s", e)
+        await asyncio.sleep(max(1, GOLGE_ARALIK_SEC))
 
 
 async def save_loop() -> None:
@@ -2919,6 +3060,79 @@ def telegram_parcala(text: str, limit: int = 4000) -> List[str]:
     return parts or [""]
 
 
+def yuzdelik(values: List[float], oran: float) -> float:
+    if not values:
+        return 0.0
+    sirali = sorted(values)
+    konum = (len(sirali) - 1) * clamp(oran, 0.0, 1.0)
+    alt = int(konum)
+    ust = min(alt + 1, len(sirali) - 1)
+    pay = konum - alt
+    return sirali[alt] * (1.0 - pay) + sirali[ust] * pay
+
+
+def tp_raporu_uret() -> str:
+    rows = olcum_db_tp_satirlari()
+    lines = ["📊 TP RAPORU"]
+    for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
+        grup = [r for r in rows if int(r[0] or 0) == kontrol_degeri]
+        kapali = [r for r in grup if r[4] != "ACIK"]
+        acik = [r for r in grup if r[4] == "ACIK"]
+
+        def hit_sayisi(veriler: List[Tuple[Any, ...]], idx: int) -> int:
+            toplam = 0
+            for row in veriler:
+                try:
+                    toplam += int(bool(json.loads(row[3] or "{}").get(f"_hit{idx}")))
+                except Exception:
+                    pass
+            return toplam
+
+        def tp_satiri(baslik: str, veriler: List[Tuple[Any, ...]]) -> str:
+            n = len(veriler)
+            parcalar = []
+            for idx in range(1, 5):
+                sayi = hit_sayisi(veriler, idx)
+                yuzde = sayi / n * 100.0 if n else 0.0
+                parcalar.append(f"TP{idx} {sayi} (%{yuzde:.1f})")
+            return f"{baslik} n={n} | " + " | ".join(parcalar)
+
+        mfe = [safe_float(r[1]) for r in grup]
+        mae = [safe_float(r[2]) for r in grup]
+        stopa_yapisan = sum(1 for x in mae if x >= 2.0)
+        stoplar = [r for r in grup if r[4] == "STOP"]
+        biten = [r for r in stoplar if r[5] == "BITTI"]
+        golge_mfe = [safe_float(r[7]) for r in stoplar if r[5] in ("IZLENIYOR", "BITTI")]
+        golge_mae = [safe_float(r[8]) for r in stoplar if r[5] in ("IZLENIYOR", "BITTI")]
+        golge_tp1_dk = [safe_float(r[9]) for r in stoplar if r[9] is not None]
+
+        lines.append(f"\n{grup_adi}")
+        lines.append(tp_satiri("Kapanmış", kapali))
+        lines.append(tp_satiri("Açık", acik))
+        lines.append(
+            f"MFE n={len(mfe)} | medyan %{yuzdelik(mfe, 0.50):.3f} | ortalama %{avg(mfe):.3f} | "
+            f"p75 %{yuzdelik(mfe, 0.75):.3f} | p90 %{yuzdelik(mfe, 0.90):.3f}"
+        )
+        lines.append(
+            f"MAE n={len(mae)} | medyan %{yuzdelik(mae, 0.50):.3f} | ortalama %{avg(mae):.3f} | "
+            f"stopa yapışan {stopa_yapisan}"
+        )
+        lines.append("STOP SONRASI")
+        lines.append(f"Stop {len(stoplar)} | İzlemesi biten {len(biten)}")
+        for idx in range(1, 5):
+            sayi = sum(1 for r in stoplar if int(r[6] or 0) >= idx)
+            yuzde = sayi / len(stoplar) * 100.0 if stoplar else 0.0
+            lines.append(f"TP{idx} {sayi} (%{yuzde:.1f})")
+        lines.append(
+            f"Gölge MFE n={len(golge_mfe)} | medyan %{yuzdelik(golge_mfe, 0.50):.3f} | "
+            f"ortalama %{avg(golge_mfe):.3f} | p75 %{yuzdelik(golge_mfe, 0.75):.3f} | "
+            f"p90 %{yuzdelik(golge_mfe, 0.90):.3f}"
+        )
+        lines.append(f"Gölge MAE medyan %{yuzdelik(golge_mae, 0.50):.3f}")
+        lines.append(f"TP1 süresi medyan {yuzdelik(golge_tp1_dk, 0.50):.1f} dk")
+    return "\n".join(lines)
+
+
 async def post_init(application) -> None:
     olcum_db_init()
     if OLCUM_MODU:
@@ -2971,7 +3185,7 @@ async def post_init(application) -> None:
         f"\nÖlçüm kaydı: {olcum_kayit_sayisi} pozisyon"
         f"{olcum_kalici_uyari}"
     )
-    for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, save_loop):
+    for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop):
         asyncio.create_task(_kur(), name=_kur.__name__)
 
 
@@ -2980,7 +3194,8 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
-        "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n/kapi - kapı ölçüm raporu\n"
+        "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
+        "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
     )
 
 async def cmd_test(update, context):
@@ -3071,6 +3286,18 @@ async def cmd_kapi(update, context):
         await update.message.reply_text("Kapı raporu hazırlanamadı.")
 
 
+async def cmd_tp(update, context):
+    if not telegram_yetkili(update):
+        return
+    try:
+        rapor = await asyncio.to_thread(tp_raporu_uret)
+        for parca in telegram_parcala(rapor, 4000):
+            await update.message.reply_text(parca)
+    except Exception as e:
+        logger.exception("/tp rapor hatası: %s", e)
+        await update.message.reply_text("TP raporu hazırlanamadı.")
+
+
 def telegram_yetkili(update: Update) -> bool:
     chat = getattr(update, "effective_chat", None)
     return bool(chat and str(chat.id) == str(TELEGRAM_CHAT_ID))
@@ -3084,6 +3311,7 @@ def build_app():
     app.add_handler(CommandHandler("coin", cmd_coin))
     app.add_handler(CommandHandler("v10", cmd_v10))
     app.add_handler(CommandHandler("kapi", cmd_kapi))
+    app.add_handler(CommandHandler("tp", cmd_tp))
     return app
 
 
