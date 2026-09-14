@@ -19,8 +19,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11.5.2 ÖLÇÜM LABORATUVARI (SMC + MTF + VWAP + Session + Manipulation Guard)"
-BOT_BUILD = os.getenv("BOT_BUILD", "V11.5.2")
+VERSION_NAME = "Balina Avcısı V11.5.3 ÖLÇÜM LABORATUVARI (SMC + MTF + VWAP + Session + Manipulation Guard)"
+BOT_BUILD = os.getenv("BOT_BUILD", "V11.5.3")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -40,6 +40,7 @@ OLCUM_RASTGELE_ORAN = float(os.getenv("OLCUM_RASTGELE_ORAN", "0.10"))
 OLCUM_MIN_HUCRE = int(float(os.getenv("OLCUM_MIN_HUCRE", "100")))
 OLCUM_DB = os.getenv("OLCUM_DB", "balina_olcum.db").strip()
 OLCUM_MAX_OPEN = int(float(os.getenv("OLCUM_MAX_OPEN", "400")))
+ORTAK_MIN_N = int(float(os.getenv("ORTAK_MIN_N", "20")))
 GOLGE_IZLEME = os.getenv("GOLGE_IZLEME", "true").lower() == "true"
 GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
@@ -407,6 +408,7 @@ def olcum_db_init() -> None:
         """)
         mevcut_kolonlar = {row[1] for row in conn.execute("PRAGMA table_info(olcum_pozisyon)")}
         yeni_kolonlar = {
+            "sonuc_tipi": "TEXT",
             "golge_durum": "TEXT",
             "golge_tp": "INTEGER",
             "golge_mfe_pct": "REAL",
@@ -418,12 +420,48 @@ def olcum_db_init() -> None:
             if kolon not in mevcut_kolonlar:
                 conn.execute(f"ALTER TABLE olcum_pozisyon ADD COLUMN {kolon} {tur}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_durum ON olcum_pozisyon(durum)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_sonuc_tipi ON olcum_pozisyon(sonuc_tipi)")
+        eski_sonuclar = conn.execute(
+            "SELECT uid,durum,kapi_json FROM olcum_pozisyon WHERE sonuc_tipi IS NULL AND durum!='ACIK'"
+        ).fetchall()
+        for uid, durum, raw_json in eski_sonuclar:
+            try:
+                payload = json.loads(raw_json or "{}")
+            except Exception:
+                payload = {}
+            sonuc_tipi = sonuc_tipi_belirle(durum, payload)
+            conn.execute("UPDATE olcum_pozisyon SET sonuc_tipi=? WHERE uid=?", (sonuc_tipi, uid))
+
+
+def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
+    giris = str(pos.get("entry_kaynak", "") or "").lower()
+    if "orderbook" in giris:
+        giris = "orderbook"
+    elif "mum" in giris:
+        giris = "mum"
+    elif "kapan" in giris:
+        giris = "kapanis"
+    yapi = "RANGE kırılımı" if pos.get("range_break") else pos.get("event")
+    return {
+        "yapi_tipi": yapi,
+        "1h_trend": pos.get("trend_1h"), "4h_trend": pos.get("trend_4h"),
+        "btc_1h": pos.get("btc_1h"), "btc_4h": pos.get("btc_4h"),
+        "coin_1h_ema": pos.get("coin_1h_ema"), "session_name": pos.get("session_name"),
+        "giris_tipi": giris or None, "yon": pos.get("side"),
+        "kontrol": int(bool(pos.get("kontrol"))),
+        "skor": pos.get("score"), "rsi": pos.get("rsi"), "adx": pos.get("adx"),
+        "vwm": pos.get("vwm"), "oi_pct": pos.get("oi_change_pct"),
+        "fomo_pct": pos.get("fomo_move_pct"), "obimb": pos.get("ob_imbalance"),
+        "funding": pos.get("funding"),
+    }
 
 
 def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
     if not OLCUM_MODU and not GOLGE_IZLEME:
         return
-    payload = json.dumps(pos.get("kapi_sonuclari", {}), ensure_ascii=False, sort_keys=True)
+    payload_dict = copy.deepcopy(pos.get("kapi_sonuclari", {}))
+    payload_dict["_ozellikler"] = pozisyon_ozellikleri(pos)
+    payload = json.dumps(payload_dict, ensure_ascii=False, sort_keys=True)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         conn.execute("""
             INSERT OR REPLACE INTO olcum_pozisyon
@@ -449,12 +487,61 @@ def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
             payload = {}
         for idx in range(1, 5):
             payload[f"_hit{idx}"] = bool(pos.get(f"hit{idx}"))
+        if "_ozellikler" not in payload:
+            payload["_ozellikler"] = pozisyon_ozellikleri(pos)
         conn.execute("""
             UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, mfe_pct=?, mae_pct=?, kapi_json=?
             WHERE uid=?
         """, (durum, close_ts, rv, safe_float(pos.get("mfe_pct")),
               safe_float(pos.get("mae_pct")), json.dumps(payload, ensure_ascii=False, sort_keys=True),
               v107_pos_uid(pos)))
+
+
+def sonuc_tipi_belirle(outcome: str, kaynak: Dict[str, Any]) -> str:
+    if outcome == "TP4":
+        return "TP4_TAM"
+    if outcome == "TIME_EXIT":
+        return "TIME_EXIT"
+    if outcome == "STOP":
+        en_yuksek = max((idx for idx in range(1, 5)
+                         if bool(kaynak.get(f"_hit{idx}", kaynak.get(f"hit{idx}", False)))), default=0)
+        return f"TP{min(en_yuksek, 3)}_STOP" if en_yuksek else "TEMIZ_STOP"
+    return str(outcome or "")
+
+
+def olcum_db_sonuc_tipi_yaz(pos: Dict[str, Any], outcome: str) -> None:
+    if not os.path.exists(OLCUM_DB):
+        return
+    payload = {f"hit{idx}": bool(pos.get(f"hit{idx}")) for idx in range(1, 5)}
+    sonuc_tipi = sonuc_tipi_belirle(outcome, payload)
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.execute("UPDATE olcum_pozisyon SET sonuc_tipi=? WHERE uid=?",
+                     (sonuc_tipi, v107_pos_uid(pos)))
+
+
+def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
+    if not os.path.exists(OLCUM_DB):
+        return []
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        rows = conn.execute("""
+            SELECT uid,side,kontrol,durum,r_value,sonuc_tipi,kapi_json
+            FROM olcum_pozisyon
+        """).fetchall()
+    sonuc = []
+    for uid, side, kontrol, durum, r_value, sonuc_tipi, raw_json in rows:
+        try:
+            payload = json.loads(raw_json or "{}")
+        except Exception:
+            payload = {}
+        ozellikler = payload.get("_ozellikler") if isinstance(payload.get("_ozellikler"), dict) else {}
+        ozellikler.setdefault("yon", side)
+        ozellikler.setdefault("kontrol", int(kontrol or 0))
+        kapilar = {ad: payload.get(ad) for ad in OLCUM_KAPILARI if payload.get(ad) in ("gecti", "kesti")}
+        sonuc.append({"uid": uid, "side": side, "kontrol": int(kontrol or 0),
+                      "durum": durum, "r_value": safe_float(r_value), "sonuc_tipi": sonuc_tipi,
+                      "hit1": bool(payload.get("_hit1")), "ozellikler": ozellikler,
+                      "kapilar": kapilar})
+    return sonuc
 
 
 def olcum_db_golge_baslat(pos: Dict[str, Any]) -> None:
@@ -2622,7 +2709,7 @@ def build_v10_message(sig):
     olcum_line = f"🧪 Normalde KESERDİ: {', '.join(keserdi) if keserdi else 'yok'}\n" if OLCUM_MODU else ""
 
     return (f"{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V11.5 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V11.5.3 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -2650,7 +2737,7 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V11.5 — POZİSYON KAPANDI\n"
+        f"🆕 V11.5.3 — POZİSYON KAPANDI\n"
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
         f"Yön: {pos['side']}\n"
@@ -2686,6 +2773,12 @@ def v10_open_paper(sig):
         "notified_hits": [],
         "score": sig["score"], "event": sig["event"],
         "range_break": bool(sig.get("range_break")),
+        "trend_1h": sig.get("trend_1h"), "trend_4h": sig.get("trend_4h"),
+        "btc_1h": sig.get("btc_1h"), "btc_4h": sig.get("btc_4h"),
+        "coin_1h_ema": sig.get("coin_1h_ema"),
+        "rsi": sig.get("rsi"), "adx": sig.get("adx"), "vwm": sig.get("vwm"),
+        "oi_change_pct": sig.get("oi_change_pct"), "fomo_move_pct": sig.get("fomo_move_pct"),
+        "ob_imbalance": sig.get("ob_imbalance"), "funding": sig.get("funding"),
         "entry_kaynak": sig.get("entry_kaynak", "-"),
         "open_ts": time.time(), "scan_ts": 0.0, "candle_ts": sig["candle_ts"],
         "session_name": sig.get("session_name", "-"),
@@ -2911,6 +3004,7 @@ async def v10_paper_loop() -> None:
                 if not oc:
                     continue
                 v10_record_closed(pos, R, oc)
+                olcum_db_sonuc_tipi_yaz(pos, oc)
                 if oc == "STOP" and GOLGE_IZLEME:
                     stop_ts = time.time()
                     golge = {
@@ -3135,6 +3229,103 @@ def tp_raporu_uret() -> str:
     return "\n".join(lines)
 
 
+def sayisal_bantlar(ozellikler: Dict[str, Any]) -> Dict[str, str]:
+    sonuc: Dict[str, str] = {}
+
+    def ekle(ad: str, bantlar: List[Tuple[float, Optional[float], str]]) -> None:
+        deger = ozellikler.get(ad)
+        if deger is None:
+            return
+        try:
+            sayi = float(deger)
+        except Exception:
+            return
+        for alt, ust, etiket in bantlar:
+            if sayi >= alt and (ust is None or sayi < ust):
+                sonuc[ad] = etiket
+                return
+
+    ekle("skor", [(-float("inf"), 60, "<60"), (60, 70, "60-69"),
+                   (70, 80, "70-79"), (80, None, "80+")])
+    ekle("rsi", [(-float("inf"), 30, "<30"), (30, 45, "30-45"),
+                  (45, 55, "45-55"), (55, 70, "55-70"), (70, None, "70+")])
+    ekle("adx", [(-float("inf"), 20, "<20"), (20, 25, "20-25"),
+                  (25, 30, "25-30"), (30, None, "30+")])
+    ekle("vwm", [(-float("inf"), -0.2, "<-0.2"), (-0.2, 0, "-0.2..0"),
+                  (0, 0.2, "0..0.2"), (0.2, None, "0.2+")])
+    ekle("oi_pct", [(-float("inf"), -1, "<-1"), (-1, 0, "-1..0"),
+                     (0, 1, "0..1"), (1, None, "1+")])
+    ekle("fomo_pct", [(-float("inf"), 0, "<0"), (0, 1, "0-1"),
+                       (1, 2, "1-2"), (2, None, "2+")])
+    ekle("obimb", [(-float("inf"), -0.2, "<-0.2"), (-0.2, 0, "-0.2..0"),
+                    (0, 0.2, "0..0.2"), (0.2, None, "0.2+")])
+    ekle("funding", [(-float("inf"), 0, "negatif"), (0, 0.005, "0-0.005"),
+                      (0.005, None, "0.005+")])
+    return sonuc
+
+
+def ortak_ozellik_analiz(grup_a: List[Dict[str, Any]],
+                         grup_b: List[Dict[str, Any]]) -> List[str]:
+    kategorik = ("yapi_tipi", "1h_trend", "4h_trend", "btc_1h", "btc_4h",
+                 "coin_1h_ema", "session_name", "giris_tipi", "yon", "kontrol")
+
+    def say(rec: Dict[str, Any]) -> set:
+        oz = rec.get("ozellikler") or {}
+        degerler = set()
+        for ad in kategorik:
+            if oz.get(ad) is not None:
+                degerler.add((ad, str(oz[ad])))
+        for ad, deger in sayisal_bantlar(oz).items():
+            degerler.add((ad, deger))
+        for ad, deger in (rec.get("kapilar") or {}).items():
+            if deger in ("gecti", "kesti"):
+                degerler.add((f"kapi:{ad}", deger))
+        return degerler
+
+    a_setleri = [say(r) for r in grup_a]
+    b_setleri = [say(r) for r in grup_b]
+    tum = set().union(*a_setleri, *b_setleri) if (a_setleri or b_setleri) else set()
+    adaylar = []
+    toplam_a, toplam_b = len(grup_a), len(grup_b)
+    for ad, deger in tum:
+        n_a = sum(1 for s in a_setleri if (ad, deger) in s)
+        n_b = sum(1 for s in b_setleri if (ad, deger) in s)
+        oran_a = n_a / toplam_a * 100.0 if toplam_a else 0.0
+        oran_b = n_b / toplam_b * 100.0 if toplam_b else 0.0
+        fark = oran_a - oran_b
+        if abs(fark) < 10.0:
+            continue
+        adaylar.append((abs(fark), ad, deger, n_a, n_b, oran_a, oran_b, fark))
+    adaylar.sort(key=lambda x: (-x[0], x[1], x[2]))
+    satirlar = []
+    for _mutlak, ad, deger, n_a, n_b, oran_a, oran_b, fark in adaylar[:15]:
+        if n_a < ORTAK_MIN_N or n_b < ORTAK_MIN_N:
+            satirlar.append(f"{ad} = {deger} | yetersiz (nA={n_a}, nB={n_b})")
+        else:
+            satirlar.append(
+                f"{ad} = {deger} | A: {n_a}/{toplam_a} (%{oran_a:.1f}) | "
+                f"B: {n_b}/{toplam_b} (%{oran_b:.1f}) | fark {fark:+.1f} puan"
+            )
+    return satirlar
+
+
+def ortak_rapor_uret(ters: bool = False) -> str:
+    tum = olcum_db_ortak_satirlari()
+    baslik = "🧪 STOP ORTAK ÖZELLİK" if ters else "🧪 TP ORTAK ÖZELLİK"
+    lines = [baslik + " | açık TP1 pozisyonları dahil"]
+    lines.append("⚠️ ~40 özellik test edildi. Bu kadar özellikte şans eseri fark çıkması beklenir. Buradaki bulgular hipotezdir, karar değildir — yeni bir örnekte doğrulanmadan kapı değiştirme.")
+    tp_sonuclari = {"TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM"}
+    for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
+        kaynak = [r for r in tum if int(r.get("kontrol", 0)) == kontrol_degeri]
+        tp_grubu = [r for r in kaynak if r.get("sonuc_tipi") in tp_sonuclari or
+                    (r.get("durum") == "ACIK" and r.get("hit1"))]
+        temiz_stop = [r for r in kaynak if r.get("sonuc_tipi") == "TEMIZ_STOP"]
+        grup_a, grup_b = (temiz_stop, tp_grubu) if ters else (tp_grubu, temiz_stop)
+        lines.append(f"\n{grup_adi} | A n={len(grup_a)} | B n={len(grup_b)}")
+        lines.extend(ortak_ozellik_analiz(grup_a, grup_b))
+    return "\n".join(lines)
+
+
 async def post_init(application) -> None:
     olcum_db_init()
     if OLCUM_MODU:
@@ -3198,6 +3389,7 @@ async def cmd_start(update, context):
         f"{VERSION_NAME} aktif.\n"
         "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
+        "/tportak - TP ortak özellikleri\n/stoportak - temiz stop ortak özellikleri\n"
     )
 
 async def cmd_test(update, context):
@@ -3213,23 +3405,25 @@ async def cmd_status(update, context):
     cl = mp["closed"]; n = len(cl)
     wins = sum(1 for x in cl if x["R"] > 0)
     ev = (sum(x["R"] for x in cl) / n) if n else 0
-    tp_rows = olcum_db_tp_satirlari()
-    tp_sayilari = [0, 0, 0, 0]
-    for row in tp_rows:
-        try:
-            hitler = json.loads(row[3] or "{}")
-        except Exception:
-            hitler = {}
-        for idx in range(1, 5):
-            tp_sayilari[idx - 1] += int(bool(hitler.get(f"_hit{idx}")))
-    stop_sayisi = sum(1 for row in tp_rows if row[4] == "STOP")
+    sonuc_rows = [r for r in olcum_db_ortak_satirlari() if r.get("durum") != "ACIK"]
+    sonuc_adlari = ("TEMIZ_STOP", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM", "TIME_EXIT")
+    sonuc_satirlari = []
+    for sonuc_adi in sonuc_adlari:
+        grup = [r for r in sonuc_rows if r.get("sonuc_tipi") == sonuc_adi]
+        yuzde = len(grup) / len(sonuc_rows) * 100.0 if sonuc_rows else 0.0
+        ort_r = avg([safe_float(r.get("r_value")) for r in grup])
+        sonuc_satirlari.append(f"{sonuc_adi}: {len(grup)} (%{yuzde:.1f}) | Ort.R {ort_r:+.3f}")
+    en_az_bir_tp = sum(1 for r in sonuc_rows if r.get("hit1"))
+    hic_tp = len(sonuc_rows) - en_az_bir_tp
     lines = [
-        f"📊 V11.5 ULTRA DURUM",
+        f"📊 V11.5.3 ULTRA DURUM",
         f"Saat: {tr_str()}",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
-        f"TP1: {tp_sayilari[0]} | TP2: {tp_sayilari[1]} | TP3: {tp_sayilari[2]} | TP4: {tp_sayilari[3]} | STOP: {stop_sayisi}",
+        *sonuc_satirlari,
+        f"En az bir TP aldı: {en_az_bir_tp} (%{en_az_bir_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
+        f"Hiç TP almadı: {hic_tp} (%{hic_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
         f"🎯 Filtre red sayaçları:",
         f"  Yapı: {stats.get('v10_red_yapi', 0)}",
         f"  Coin EMA: {stats.get('v11_red_coin_ema', 0)}",
@@ -3262,7 +3456,7 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V11.5 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için V11.5.3 sinyali yok.")
         return
     await update.message.reply_text(build_v10_message(res))
 
@@ -3271,7 +3465,7 @@ async def cmd_v10(update, context):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V11.5 ULTRA motor durumu",
+        f"🆕 V11.5.3 ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
@@ -3311,6 +3505,30 @@ async def cmd_tp(update, context):
         await update.message.reply_text("TP raporu hazırlanamadı.")
 
 
+async def cmd_tportak(update, context):
+    if not telegram_yetkili(update):
+        return
+    try:
+        rapor = await asyncio.to_thread(ortak_rapor_uret, False)
+        for parca in telegram_parcala(rapor, 4000):
+            await update.message.reply_text(parca)
+    except Exception as e:
+        logger.exception("/tportak rapor hatası: %s", e)
+        await update.message.reply_text("TP ortak özellik raporu hazırlanamadı.")
+
+
+async def cmd_stoportak(update, context):
+    if not telegram_yetkili(update):
+        return
+    try:
+        rapor = await asyncio.to_thread(ortak_rapor_uret, True)
+        for parca in telegram_parcala(rapor, 4000):
+            await update.message.reply_text(parca)
+    except Exception as e:
+        logger.exception("/stoportak rapor hatası: %s", e)
+        await update.message.reply_text("STOP ortak özellik raporu hazırlanamadı.")
+
+
 def telegram_yetkili(update: Update) -> bool:
     chat = getattr(update, "effective_chat", None)
     return bool(chat and str(chat.id) == str(TELEGRAM_CHAT_ID))
@@ -3325,6 +3543,8 @@ def build_app():
     app.add_handler(CommandHandler("v10", cmd_v10))
     app.add_handler(CommandHandler("kapi", cmd_kapi))
     app.add_handler(CommandHandler("tp", cmd_tp))
+    app.add_handler(CommandHandler("tportak", cmd_tportak))
+    app.add_handler(CommandHandler("stoportak", cmd_stoportak))
     return app
 
 
