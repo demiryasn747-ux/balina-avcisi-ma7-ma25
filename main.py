@@ -9,6 +9,7 @@ import logging
 import threading
 import random
 import sqlite3
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +46,26 @@ GOLGE_IZLEME = os.getenv("GOLGE_IZLEME", "true").lower() == "true"
 GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
 GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
+
+# === CANLI BALINA AKIŞ MOTORU ===
+BALINA_MOTOR_ENABLED = os.getenv("BALINA_MOTOR_ENABLED", "false").lower() == "true"
+BALINA_MOTOR_BLOCK = os.getenv("BALINA_MOTOR_BLOCK", "false").lower() == "true"
+BALINA_WS_URL = os.getenv("BALINA_WS_URL", "wss://ws.okx.com:8443/ws/v5/public").strip()
+BALINA_RECONNECT_MAX_SEC = float(os.getenv("BALINA_RECONNECT_MAX_SEC", "60"))
+BALINA_STALE_SEC = float(os.getenv("BALINA_STALE_SEC", "20"))
+BALINA_TRADE_WINDOW_SEC = int(float(os.getenv("BALINA_TRADE_WINDOW_SEC", "900")))
+BALINA_BOOK_DEPTH = int(float(os.getenv("BALINA_BOOK_DEPTH", "20")))
+BALINA_WHALE_PERCENTILE = float(os.getenv("BALINA_WHALE_PERCENTILE", "99"))
+BALINA_WHALE_MIN_USDT = float(os.getenv("BALINA_WHALE_MIN_USDT", "25000"))
+BALINA_CLUSTER_WINDOW_SEC = float(os.getenv("BALINA_CLUSTER_WINDOW_SEC", "15"))
+BALINA_CLUSTER_MIN_COUNT = int(float(os.getenv("BALINA_CLUSTER_MIN_COUNT", "3")))
+BALINA_WALL_MULT = float(os.getenv("BALINA_WALL_MULT", "3.0"))
+BALINA_WALL_LIFETIME_SEC = float(os.getenv("BALINA_WALL_LIFETIME_SEC", "8"))
+BALINA_SPOOF_CANCEL_RATIO = float(os.getenv("BALINA_SPOOF_CANCEL_RATIO", "0.80"))
+BALINA_SNAPSHOT_SEC = float(os.getenv("BALINA_SNAPSHOT_SEC", "1"))
+BALINA_DB = os.getenv("BALINA_DB", "balina_akis.db").strip()
+BALINA_DB_FLUSH_SEC = float(os.getenv("BALINA_DB_FLUSH_SEC", "2"))
+BALINA_EVENT_RETENTION_HOURS = float(os.getenv("BALINA_EVENT_RETENTION_HOURS", "168"))
 
 # === TARAMA ===
 HOT_SCAN_INTERVAL_SEC = float(os.getenv("HOT_SCAN_INTERVAL_SEC", "1.5"))
@@ -370,6 +391,9 @@ stats: Dict[str, Any] = {
     "v113_red_vwap": 0, "v113_red_session": 0,
     "v113_red_mtf": 0, "v113_red_correlation": 0, "v113_hit_liq_cluster": 0,
     "v113_red_vwm": 0, "okx_timeout": 0,
+    "balina_ws_connect": 0, "balina_ws_disconnect": 0,
+    "balina_ws_message": 0, "balina_trade": 0, "balina_whale": 0,
+    "balina_spoof": 0, "balina_db_fail": 0, "balina_red_conflict": 0,
 }
 
 app = None
@@ -379,6 +403,14 @@ v10_sent_candle: Dict[str, str] = {}
 _v107_stop_kilit: Dict[str, float] = {}
 
 _V106_BTC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+
+_BALINA_LOCK = threading.RLock()
+_BALINA_STATE: Dict[str, Dict[str, Any]] = {}
+_BALINA_DB_QUEUE: Optional[asyncio.Queue] = None
+_BALINA_WS_STATUS: Dict[str, Any] = {
+    "connected": False, "last_message_ts": 0.0, "last_error": "",
+    "connected_ts": 0.0, "subscriptions": 0,
+}
 
 OLCUM_KAPILARI = (
     "btc_hiza", "wash", "pump", "yapi", "range", "fomo",
@@ -453,11 +485,17 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
         "vwm": pos.get("vwm"), "oi_pct": pos.get("oi_change_pct"),
         "fomo_pct": pos.get("fomo_move_pct"), "obimb": pos.get("ob_imbalance"),
         "funding": pos.get("funding"),
+        "balina_durum": pos.get("balina_durum"),
+        "balina_guven": pos.get("balina_guven"),
+        "balina_veri_kaynagi": pos.get("balina_veri_kaynagi"),
+        "balina_cvd_1m": (pos.get("balina_akis") or {}).get("cvd_norm_1m"),
+        "balina_whale_1m": (pos.get("balina_akis") or {}).get("whale_count_1m"),
+        "balina_spoof_1m": (pos.get("balina_akis") or {}).get("spoof_1m"),
     }
 
 
 def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
-    if not OLCUM_MODU and not GOLGE_IZLEME:
+    if not OLCUM_MODU and not GOLGE_IZLEME and not BALINA_MOTOR_ENABLED:
         return
     payload_dict = copy.deepcopy(pos.get("kapi_sonuclari", {}))
     payload_dict["_ozellikler"] = pozisyon_ozellikleri(pos)
@@ -474,7 +512,7 @@ def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
 
 def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
                                r_value: Optional[float] = None) -> None:
-    if not OLCUM_MODU and not GOLGE_IZLEME:
+    if not OLCUM_MODU and not GOLGE_IZLEME and not BALINA_MOTOR_ENABLED:
         return
     close_ts = time.time() if durum != "ACIK" else None
     rv = safe_float(pos.get("current_r")) if r_value is None else safe_float(r_value)
@@ -539,7 +577,9 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         kapilar = {ad: payload.get(ad) for ad in OLCUM_KAPILARI if payload.get(ad) in ("gecti", "kesti")}
         sonuc.append({"uid": uid, "side": side, "kontrol": int(kontrol or 0),
                       "durum": durum, "r_value": safe_float(r_value), "sonuc_tipi": sonuc_tipi,
-                      "hit1": bool(payload.get("_hit1")), "ozellikler": ozellikler,
+                      "hit1": bool(payload.get("_hit1")), "hit2": bool(payload.get("_hit2")),
+                      "hit3": bool(payload.get("_hit3")), "hit4": bool(payload.get("_hit4")),
+                      "ozellikler": ozellikler,
                       "kapilar": kapilar})
     return sonuc
 
@@ -1527,6 +1567,427 @@ def _v10_fmt(x):
     if x >= 1:
         return f"{x:.4f}"
     return f"{x:.6f}"
+
+
+# ============================================================================
+#  CANLI BALINA AKIŞ MOTORU — yalnız BALINA_MOTOR_ENABLED=true iken çalışır
+# ============================================================================
+
+def _balina_yuzdelik(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    p = (len(s) - 1) * clamp(q, 0.0, 1.0)
+    lo = int(p)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] * (hi - p) + s[hi] * (p - lo)
+
+
+def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    with _BALINA_LOCK:
+        state = _BALINA_STATE.get(symbol)
+        if state is None:
+            state = {
+                "trades": deque(maxlen=12000),
+                "whales": deque(maxlen=2000),
+                "books": {"bids": {}, "asks": {}},
+                "walls": {}, "spoofs": deque(maxlen=200),
+                "last_price": 0.0, "last_ts": 0.0,
+                "last_book_ts": 0.0, "snapshot": {},
+            }
+            _BALINA_STATE[symbol] = state
+        return state
+
+
+def balina_db_init() -> None:
+    if not BALINA_MOTOR_ENABLED:
+        return
+    with sqlite3.connect(BALINA_DB, timeout=10) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS balina_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                symbol TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                side TEXT,
+                price REAL,
+                value_usdt REAL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS balina_snapshot (
+                symbol TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                durum TEXT NOT NULL,
+                guven REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balina_event_symbol_ts ON balina_event(symbol,ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balina_event_type_ts ON balina_event(event_type,ts)")
+
+
+def _balina_queue_event(event: Dict[str, Any]) -> None:
+    q = _BALINA_DB_QUEUE
+    if not BALINA_MOTOR_ENABLED or q is None:
+        return
+    try:
+        q.put_nowait(event)
+    except asyncio.QueueFull:
+        stats["balina_db_fail"] = int(stats.get("balina_db_fail", 0)) + 1
+
+
+def _balina_contract_value(symbol: str, price: float, size: float) -> float:
+    inst = okx_live_symbols.get(symbol, {})
+    ct_val = safe_float(inst.get("ctVal"), 0.0)
+    ct_ccy = str(inst.get("ctValCcy", "")).upper()
+    base = _base_of(symbol)
+    if ct_val > 0 and (not ct_ccy or ct_ccy == base):
+        return price * size * ct_val
+    return price * size
+
+
+def _balina_prune(state: Dict[str, Any], now_ts: float) -> None:
+    cutoff = now_ts - max(60, BALINA_TRADE_WINDOW_SEC)
+    for key in ("trades", "whales"):
+        dq = state[key]
+        while dq and safe_float(dq[0].get("ts")) < cutoff:
+            dq.popleft()
+
+
+def _balina_whale_threshold(state: Dict[str, Any]) -> float:
+    values = [safe_float(x.get("value")) for x in state["trades"]]
+    if len(values) < 30:
+        return BALINA_WHALE_MIN_USDT
+    dynamic = _balina_yuzdelik(values[-2000:], BALINA_WHALE_PERCENTILE / 100.0)
+    return max(BALINA_WHALE_MIN_USDT, dynamic)
+
+
+def _balina_process_trade(row: Dict[str, Any]) -> None:
+    symbol = normalize_symbol(str(row.get("instId", "")))
+    price = safe_float(row.get("px"))
+    size = safe_float(row.get("sz"))
+    ts = safe_float(row.get("ts")) / 1000.0
+    side = str(row.get("side", "")).lower()
+    if not symbol or price <= 0 or size <= 0 or side not in ("buy", "sell"):
+        return
+    now_ts = ts if ts > 0 else time.time()
+    value = _balina_contract_value(symbol, price, size)
+    state = _balina_symbol_state(symbol)
+    with _BALINA_LOCK:
+        trade = {"ts": now_ts, "side": side, "price": price, "size": size, "value": value}
+        state["trades"].append(trade)
+        state["last_price"] = price
+        state["last_ts"] = now_ts
+        _balina_prune(state, now_ts)
+        threshold = _balina_whale_threshold(state)
+        if value >= threshold:
+            trade["threshold"] = threshold
+            state["whales"].append(dict(trade))
+            stats["balina_whale"] = int(stats.get("balina_whale", 0)) + 1
+            _balina_queue_event({"ts": now_ts, "symbol": symbol, "event_type": "WHALE_TRADE",
+                                 "side": side, "price": price, "value_usdt": value,
+                                 "threshold": threshold})
+    stats["balina_trade"] = int(stats.get("balina_trade", 0)) + 1
+
+
+def _balina_trade_near(state: Dict[str, Any], side: str, price: float,
+                       since_ts: float, tolerance_pct: float = 0.05) -> float:
+    if price <= 0:
+        return 0.0
+    tol = tolerance_pct / 100.0
+    return sum(safe_float(t.get("value")) for t in state["trades"]
+               if t.get("side") == side and safe_float(t.get("ts")) >= since_ts
+               and abs(safe_float(t.get("price")) - price) / price <= tol)
+
+
+def _balina_process_book(row: Dict[str, Any]) -> None:
+    symbol = normalize_symbol(str(row.get("instId", "")))
+    ts = safe_float(row.get("ts")) / 1000.0 or time.time()
+    if not symbol:
+        return
+    state = _balina_symbol_state(symbol)
+    depth = max(5, BALINA_BOOK_DEPTH)
+    bids = [(safe_float(x[0]), safe_float(x[1])) for x in row.get("bids", [])[:depth]
+            if len(x) >= 2 and safe_float(x[0]) > 0]
+    asks = [(safe_float(x[0]), safe_float(x[1])) for x in row.get("asks", [])[:depth]
+            if len(x) >= 2 and safe_float(x[0]) > 0]
+    with _BALINA_LOCK:
+        previous_keys = set(state["walls"])
+        active_keys = set()
+        for book_side, levels in (("bids", bids), ("asks", asks)):
+            mean_qty = avg([q for _, q in levels])
+            state["books"][book_side] = {p: q for p, q in levels}
+            if mean_qty <= 0:
+                continue
+            for price, qty in levels:
+                if qty < mean_qty * BALINA_WALL_MULT:
+                    continue
+                key = ""
+                for old_key, old_wall in state["walls"].items():
+                    old_price = safe_float(old_wall.get("price"))
+                    if (old_wall.get("side") == book_side and old_price > 0 and
+                            abs(price - old_price) / old_price <= SPOOF_FIYAT_TOLERANS_PCT / 100.0):
+                        key = old_key
+                        break
+                if not key:
+                    key = f"{book_side}:{price:.12g}"
+                active_keys.add(key)
+                wall = state["walls"].setdefault(key, {
+                    "side": book_side, "price": price, "first_ts": ts,
+                    "last_ts": ts, "first_qty": qty, "max_qty": qty,
+                })
+                wall["last_ts"] = ts
+                wall["price"] = price
+                wall["last_qty"] = qty
+                wall["max_qty"] = max(safe_float(wall.get("max_qty")), qty)
+        for key in previous_keys - active_keys:
+            wall = state["walls"].pop(key, None)
+            if not wall:
+                continue
+            lifetime = ts - safe_float(wall.get("first_ts"))
+            book_side = wall.get("side")
+            taker_side = "sell" if book_side == "bids" else "buy"
+            executed = _balina_trade_near(state, taker_side, safe_float(wall.get("price")),
+                                          safe_float(wall.get("first_ts")))
+            wall_notional = _balina_contract_value(symbol, safe_float(wall.get("price")),
+                                                    safe_float(wall.get("max_qty")))
+            executed_ratio = executed / wall_notional if wall_notional > 0 else 0.0
+            cancel_ratio = clamp(1.0 - executed_ratio, 0.0, 1.0)
+            if lifetime >= BALINA_WALL_LIFETIME_SEC and cancel_ratio >= BALINA_SPOOF_CANCEL_RATIO:
+                event = {"ts": ts, "symbol": symbol, "event_type": "SPOOF_WALL",
+                         "side": book_side, "price": wall.get("price"),
+                         "value_usdt": wall_notional, "lifetime": lifetime,
+                         "cancel_ratio": cancel_ratio}
+                state["spoofs"].append(event)
+                stats["balina_spoof"] = int(stats.get("balina_spoof", 0)) + 1
+                _balina_queue_event(event)
+        state["last_book_ts"] = ts
+
+
+def _balina_window_metrics(state: Dict[str, Any], seconds: float, now_ts: float) -> Dict[str, float]:
+    rows = [t for t in state["trades"] if safe_float(t.get("ts")) >= now_ts - seconds]
+    buy = sum(safe_float(t.get("value")) for t in rows if t.get("side") == "buy")
+    sell = sum(safe_float(t.get("value")) for t in rows if t.get("side") == "sell")
+    total = buy + sell
+    prices = [safe_float(t.get("price")) for t in rows if safe_float(t.get("price")) > 0]
+    move = pct_change(prices[0], prices[-1]) if len(prices) >= 2 else 0.0
+    return {"buy": buy, "sell": sell, "total": total, "cvd": buy - sell,
+            "cvd_norm": (buy - sell) / total if total > 0 else 0.0,
+            "price_move_pct": move, "count": float(len(rows))}
+
+
+def balina_snapshot(symbol: str) -> Dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    if not BALINA_MOTOR_ENABLED:
+        return {"enabled": False, "source": "REST", "status": "KAPALI",
+                "durum": "OLCUMSUZ", "guven": 0.0}
+    now_ts = time.time()
+    state = _balina_symbol_state(symbol)
+    with _BALINA_LOCK:
+        stale = now_ts - safe_float(state.get("last_ts")) > BALINA_STALE_SEC
+        m5 = _balina_window_metrics(state, 5, now_ts)
+        m15 = _balina_window_metrics(state, 15, now_ts)
+        m60 = _balina_window_metrics(state, 60, now_ts)
+        m300 = _balina_window_metrics(state, 300, now_ts)
+        whales = [w for w in state["whales"] if safe_float(w.get("ts")) >= now_ts - 60]
+        whale_buy = sum(safe_float(w.get("value")) for w in whales if w.get("side") == "buy")
+        whale_sell = sum(safe_float(w.get("value")) for w in whales if w.get("side") == "sell")
+        whale_total = whale_buy + whale_sell
+        whale_cvd_norm = (whale_buy - whale_sell) / whale_total if whale_total > 0 else 0.0
+        clustered_buy = sum(1 for w in whales if w.get("side") == "buy" and
+                            safe_float(w.get("ts")) >= now_ts - BALINA_CLUSTER_WINDOW_SEC)
+        clustered_sell = sum(1 for w in whales if w.get("side") == "sell" and
+                             safe_float(w.get("ts")) >= now_ts - BALINA_CLUSTER_WINDOW_SEC)
+        bids = state["books"].get("bids", {})
+        asks = state["books"].get("asks", {})
+        bid_qty, ask_qty = sum(bids.values()), sum(asks.values())
+        book_imb = (bid_qty - ask_qty) / (bid_qty + ask_qty) if bid_qty + ask_qty > 0 else 0.0
+        recent_spoof = [x for x in state["spoofs"] if safe_float(x.get("ts")) >= now_ts - 60]
+
+        durum = "BELIRSIZ"
+        guven = 0.0
+        if stale:
+            durum = "VERI_YETERSIZ"
+        else:
+            absorption_sell = m60["cvd_norm"] < -0.25 and m60["price_move_pct"] > -0.15
+            absorption_buy = m60["cvd_norm"] > 0.25 and m60["price_move_pct"] < 0.15
+            accumulation = abs(m300["price_move_pct"]) < 0.8 and m300["cvd_norm"] > 0.18
+            distribution = abs(m300["price_move_pct"]) < 0.8 and m300["cvd_norm"] < -0.18
+            if clustered_buy >= BALINA_CLUSTER_MIN_COUNT and whale_cvd_norm > 0.35:
+                durum = "PARCALI_BALINA_ALIMI"
+                guven = min(95.0, 60.0 + clustered_buy * 5.0 + whale_cvd_norm * 15.0)
+            elif clustered_sell >= BALINA_CLUSTER_MIN_COUNT and whale_cvd_norm < -0.35:
+                durum = "PARCALI_BALINA_SATISI"
+                guven = min(95.0, 60.0 + clustered_sell * 5.0 + abs(whale_cvd_norm) * 15.0)
+            elif absorption_sell:
+                durum = "SATIS_EMILIMI"
+                guven = min(90.0, 50.0 + abs(m60["cvd_norm"]) * 80.0)
+            elif absorption_buy:
+                durum = "ALIS_EMILIMI"
+                guven = min(90.0, 50.0 + abs(m60["cvd_norm"]) * 80.0)
+            elif accumulation:
+                durum = "BIRIKIM"
+                guven = min(88.0, 45.0 + m300["cvd_norm"] * 100.0)
+            elif distribution:
+                durum = "DAGITIM"
+                guven = min(88.0, 45.0 + abs(m300["cvd_norm"]) * 100.0)
+            elif whale_cvd_norm > 0.35 and whale_total > 0:
+                durum = "BALINA_ALIMI"
+                guven = min(85.0, 45.0 + whale_cvd_norm * 50.0)
+            elif whale_cvd_norm < -0.35 and whale_total > 0:
+                durum = "BALINA_SATISI"
+                guven = min(85.0, 45.0 + abs(whale_cvd_norm) * 50.0)
+        out = {
+            "enabled": True, "source": "WEBSOCKET" if _BALINA_WS_STATUS.get("connected") else "REST_YEDEK",
+            "status": "BAYAT" if stale else "CANLI", "symbol": symbol,
+            "ts": now_ts, "durum": durum, "guven": round(guven, 1),
+            "cvd_5s": round(m5["cvd"], 2), "cvd_15s": round(m15["cvd"], 2),
+            "cvd_1m": round(m60["cvd"], 2), "cvd_5m": round(m300["cvd"], 2),
+            "cvd_norm_1m": round(m60["cvd_norm"], 4),
+            "price_move_1m_pct": round(m60["price_move_pct"], 4),
+            "whale_buy_1m": round(whale_buy, 2), "whale_sell_1m": round(whale_sell, 2),
+            "whale_count_1m": len(whales), "whale_cvd_norm": round(whale_cvd_norm, 4),
+            "book_imbalance": round(book_imb, 4), "active_walls": len(state["walls"]),
+            "spoof_1m": len(recent_spoof), "last_data_age_sec": round(now_ts - safe_float(state.get("last_ts")), 2),
+        }
+        state["snapshot"] = out
+        return copy.deepcopy(out)
+
+
+def _balina_db_flush_sync(events: List[Dict[str, Any]], snapshots: List[Dict[str, Any]]) -> None:
+    if not events and not snapshots:
+        return
+    with sqlite3.connect(BALINA_DB, timeout=10) as conn:
+        if events:
+            conn.executemany("""
+                INSERT INTO balina_event(ts,symbol,event_type,side,price,value_usdt,payload_json)
+                VALUES(?,?,?,?,?,?,?)
+            """, [(safe_float(e.get("ts")), str(e.get("symbol", "")), str(e.get("event_type", "")),
+                    str(e.get("side", "")), safe_float(e.get("price")), safe_float(e.get("value_usdt")),
+                    json.dumps(e, ensure_ascii=False, separators=(",", ":"))) for e in events])
+        for snap in snapshots:
+            conn.execute("""
+                INSERT INTO balina_snapshot(symbol,ts,durum,guven,payload_json)
+                VALUES(?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET
+                ts=excluded.ts,durum=excluded.durum,guven=excluded.guven,payload_json=excluded.payload_json
+            """, (str(snap.get("symbol", "")), safe_float(snap.get("ts")), str(snap.get("durum", "")),
+                  safe_float(snap.get("guven")), json.dumps(snap, ensure_ascii=False, separators=(",", ":"))))
+        cutoff = time.time() - max(1.0, BALINA_EVENT_RETENTION_HOURS) * 3600.0
+        conn.execute("DELETE FROM balina_event WHERE ts < ?", (cutoff,))
+
+
+async def balina_db_loop() -> None:
+    global _BALINA_DB_QUEUE
+    _BALINA_DB_QUEUE = asyncio.Queue(maxsize=20000)
+    while True:
+        await asyncio.sleep(max(0.5, BALINA_DB_FLUSH_SEC))
+        events = []
+        try:
+            while len(events) < 2000:
+                events.append(_BALINA_DB_QUEUE.get_nowait())
+        except asyncio.QueueEmpty:
+            pass
+        snapshots = [balina_snapshot(sym) for sym in list(_BALINA_STATE)]
+        try:
+            await asyncio.to_thread(_balina_db_flush_sync, events, snapshots)
+        except Exception as exc:
+            stats["balina_db_fail"] = int(stats.get("balina_db_fail", 0)) + 1
+            logger.warning("Balina DB yazma hatası: %s", exc)
+
+
+async def _balina_ws_subscribe(ws, symbols: List[str]) -> None:
+    args = []
+    for symbol in symbols:
+        args.append({"channel": "trades", "instId": symbol})
+        args.append({"channel": "books5", "instId": symbol})
+    for i in range(0, len(args), 40):
+        await ws.send(json.dumps({"op": "subscribe", "args": args[i:i + 40]}, separators=(",", ":")))
+        await asyncio.sleep(0.2)
+    _BALINA_WS_STATUS["subscriptions"] = len(args)
+
+
+async def _balina_ws_change_symbols(ws, old_symbols: set, new_symbols: set) -> None:
+    for op, symbols in (("unsubscribe", sorted(old_symbols - new_symbols)),
+                        ("subscribe", sorted(new_symbols - old_symbols))):
+        args = []
+        for symbol in symbols:
+            args.extend(({"channel": "trades", "instId": symbol},
+                         {"channel": "books5", "instId": symbol}))
+        for i in range(0, len(args), 40):
+            await ws.send(json.dumps({"op": op, "args": args[i:i + 40]}, separators=(",", ":")))
+            await asyncio.sleep(0.2)
+    _BALINA_WS_STATUS["subscriptions"] = len(new_symbols) * 2
+
+
+async def balina_ws_loop() -> None:
+    if not BALINA_MOTOR_ENABLED:
+        return
+    try:
+        import websockets
+    except Exception:
+        _BALINA_WS_STATUS["last_error"] = "websockets paketi kurulu değil"
+        logger.error("Balina motoru için 'websockets' paketi gerekli")
+        return
+    backoff = 1.0
+    while True:
+        try:
+            symbols = [normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]]
+            async with websockets.connect(BALINA_WS_URL, ping_interval=15, ping_timeout=10,
+                                          close_timeout=5, max_queue=20000) as ws:
+                _BALINA_WS_STATUS.update({"connected": True, "connected_ts": time.time(),
+                                          "last_error": "", "last_message_ts": time.time()})
+                stats["balina_ws_connect"] = int(stats.get("balina_ws_connect", 0)) + 1
+                await _balina_ws_subscribe(ws, symbols)
+                subscribed = set(symbols)
+                last_symbol_check = time.time()
+                backoff = 1.0
+                async for raw in ws:
+                    _BALINA_WS_STATUS["last_message_ts"] = time.time()
+                    stats["balina_ws_message"] = int(stats.get("balina_ws_message", 0)) + 1
+                    if raw == "pong":
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    channel = str((msg.get("arg") or {}).get("channel", ""))
+                    inst_id = str((msg.get("arg") or {}).get("instId", ""))
+                    for row in msg.get("data", []):
+                        if inst_id and "instId" not in row:
+                            row["instId"] = inst_id
+                        if channel == "trades":
+                            _balina_process_trade(row)
+                        elif channel == "books5":
+                            _balina_process_book(row)
+                    if time.time() - last_symbol_check >= 30.0:
+                        current = {normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]}
+                        if current != subscribed:
+                            await _balina_ws_change_symbols(ws, subscribed, current)
+                            subscribed = current
+                        last_symbol_check = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stats["balina_ws_disconnect"] = int(stats.get("balina_ws_disconnect", 0)) + 1
+            _BALINA_WS_STATUS.update({"connected": False, "last_error": str(exc)[:220]})
+            logger.warning("Balina WebSocket koptu; REST devam ediyor: %s", exc)
+            await asyncio.sleep(min(max(1.0, backoff), BALINA_RECONNECT_MAX_SEC))
+            backoff = min(max(2.0, backoff * 2.0), BALINA_RECONNECT_MAX_SEC)
+
+
+def balina_signal_ekle(sig: Dict[str, Any]) -> Dict[str, Any]:
+    if not BALINA_MOTOR_ENABLED:
+        return sig
+    snap = balina_snapshot(str(sig.get("symbol", "")))
+    sig["balina_akis"] = snap
+    sig["balina_durum"] = snap.get("durum", "VERI_YETERSIZ")
+    sig["balina_guven"] = snap.get("guven", 0.0)
+    sig["balina_veri_kaynagi"] = snap.get("source", "REST_YEDEK")
+    return sig
 
 
 # ============================================================================
@@ -2707,6 +3168,14 @@ def build_v10_message(sig):
         liq_line = f"💥 Likidite: {sig['liq_note']}"
     keserdi = [ad for ad, durum in (sig.get("kapi_sonuclari") or {}).items() if durum == "kesti"]
     olcum_line = f"🧪 Normalde KESERDİ: {', '.join(keserdi) if keserdi else 'yok'}\n" if OLCUM_MODU else ""
+    balina_line = ""
+    if BALINA_MOTOR_ENABLED:
+        akis = sig.get("balina_akis") or {}
+        balina_line = (f"🐋 Balina: {akis.get('durum', 'VERI_YETERSIZ')} | "
+                       f"Güven {safe_float(akis.get('guven')):.0f}/100 | "
+                       f"CVD1m {safe_float(akis.get('cvd_norm_1m')):+.2f} | "
+                       f"W:{int(safe_float(akis.get('whale_count_1m')))} | "
+                       f"{akis.get('source', 'REST_YEDEK')}\n")
 
     return (f"{trend_line}"
             f"🎯 {VERSION_NAME}\n🆕 V11.5.3 | {sig['direction']} | {sig['symbol']}\n"
@@ -2717,6 +3186,7 @@ def build_v10_message(sig):
             + "\n".join([savunma_lines[0], vwap_line, adx_line, session_line, mtf_line, vwm_line, liq_line] +
                         savunma_lines[1:]) + "\n"
             f"{olcum_line}"
+            f"{balina_line}"
             f"Giriş: {_v10_fmt(sig['entry'])} [{sig.get('entry_kaynak','-')}]{kayma_mark}\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']} sabit)\n"
             f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr', TP1_RR)}R) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', TP2_RR)}R) | "
@@ -2783,6 +3253,10 @@ def v10_open_paper(sig):
         "open_ts": time.time(), "scan_ts": 0.0, "candle_ts": sig["candle_ts"],
         "session_name": sig.get("session_name", "-"),
         "piyasa_modu": sig.get("piyasa_modu", "-"),
+        "balina_durum": sig.get("balina_durum", "OLCUMSUZ"),
+        "balina_guven": safe_float(sig.get("balina_guven")),
+        "balina_veri_kaynagi": sig.get("balina_veri_kaynagi", "REST"),
+        "balina_akis": copy.deepcopy(sig.get("balina_akis", {})),
         "kapi_sonuclari": copy.deepcopy(sig.get("kapi_sonuclari", {})),
         "kontrol": bool(sig.get("kontrol")),
         "mfe_pct": 0.0, "mae_pct": 0.0, "current_r": 0.0,
@@ -2919,6 +3393,19 @@ async def maybe_send_v10_signal(sig):
     if V107_ACIKKEN_ENGELLE and any(p.get("symbol") == symbol for p in mp["open"]):
         stats["v107_red_acik_poz"] = int(stats.get("v107_red_acik_poz", 0)) + 1
         return
+
+    balina_signal_ekle(sig)
+    if BALINA_MOTOR_BLOCK:
+        akis = sig.get("balina_akis") or {}
+        durum = str(akis.get("durum", ""))
+        guven = safe_float(akis.get("guven"))
+        long_conflicts = {"DAGITIM", "ALIS_EMILIMI", "BALINA_SATISI", "PARCALI_BALINA_SATISI"}
+        short_conflicts = {"BIRIKIM", "SATIS_EMILIMI", "BALINA_ALIMI", "PARCALI_BALINA_ALIMI"}
+        conflict = ((side == "LONG" and durum in long_conflicts) or
+                    (side == "SHORT" and durum in short_conflicts))
+        if akis.get("status") == "CANLI" and guven >= 70.0 and conflict:
+            stats["balina_red_conflict"] = int(stats.get("balina_red_conflict", 0)) + 1
+            return
 
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
@@ -3328,6 +3815,8 @@ def ortak_rapor_uret(ters: bool = False) -> str:
 
 async def post_init(application) -> None:
     olcum_db_init()
+    if BALINA_MOTOR_ENABLED:
+        await asyncio.to_thread(balina_db_init)
     if OLCUM_MODU:
         for pos in _v10_mem().get("open", []):
             saved = olcum_db_acik_durum(v107_pos_uid(pos))
@@ -3377,9 +3866,13 @@ async def post_init(application) -> None:
         f"\n🧪 Ölçüm modu: {'AKTİF' if OLCUM_MODU else 'kapalı'} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}"
         f"\nÖlçüm kaydı: {olcum_kayit_sayisi} pozisyon"
         f"{olcum_kalici_uyari}"
+        f"\n🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}"
     )
     for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop):
         asyncio.create_task(_kur(), name=_kur.__name__)
+    if BALINA_MOTOR_ENABLED:
+        asyncio.create_task(balina_db_loop(), name="balina_db_loop")
+        asyncio.create_task(balina_ws_loop(), name="balina_ws_loop")
 
 
 async def cmd_start(update, context):
@@ -3390,6 +3883,9 @@ async def cmd_start(update, context):
         "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
         "/tportak - TP ortak özellikleri\n/stoportak - temiz stop ortak özellikleri\n"
+        "/balina [COIN] - balina akış durumu\n/akis COIN - büyük işlemler\n"
+        "/birikim - birikim adayları\n/dagitim - dağıtım adayları\n"
+        "/ws - canlı bağlantı durumu\n/balinarapor - motor olay özeti\n"
     )
 
 async def cmd_test(update, context):
@@ -3405,7 +3901,9 @@ async def cmd_status(update, context):
     cl = mp["closed"]; n = len(cl)
     wins = sum(1 for x in cl if x["R"] > 0)
     ev = (sum(x["R"] for x in cl) / n) if n else 0
-    sonuc_rows = [r for r in olcum_db_ortak_satirlari() if r.get("durum") != "ACIK"]
+    tum_rows = olcum_db_ortak_satirlari()
+    sonuc_rows = [r for r in tum_rows if r.get("durum") != "ACIK"]
+    acik_rows = [r for r in tum_rows if r.get("durum") == "ACIK"]
     sonuc_adlari = ("TEMIZ_STOP", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM", "TIME_EXIT")
     sonuc_satirlari = []
     for sonuc_adi in sonuc_adlari:
@@ -3415,12 +3913,24 @@ async def cmd_status(update, context):
         sonuc_satirlari.append(f"{sonuc_adi}: {len(grup)} (%{yuzde:.1f}) | Ort.R {ort_r:+.3f}")
     en_az_bir_tp = sum(1 for r in sonuc_rows if r.get("hit1"))
     hic_tp = len(sonuc_rows) - en_az_bir_tp
+    toplam_tp1 = sum(1 for r in tum_rows if r.get("hit1"))
+    toplam_tp2 = sum(1 for r in tum_rows if r.get("hit2"))
+    toplam_tp3 = sum(1 for r in tum_rows if r.get("hit3"))
+    toplam_tp4 = sum(1 for r in tum_rows if r.get("hit4"))
+    acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
+    acik_tpsiz = len(acik_rows) - acik_tp
     lines = [
         f"📊 V11.5.3 ULTRA DURUM",
         f"Saat: {tr_str()}",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
+        f"Tüm sinyallerde TP teması: TP1 {toplam_tp1} | TP2 {toplam_tp2} | TP3 {toplam_tp3} | TP4 {toplam_tp4}",
+        f"Açık pozisyon: TP gören {acik_tp} | Henüz TP görmeyen {acik_tpsiz}",
+        f"TP görmeden stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TEMIZ_STOP')}",
+        f"TP1 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP1_STOP')} | "
+        f"TP2 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP2_STOP')} | "
+        f"TP3 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP3_STOP')}",
         *sonuc_satirlari,
         f"En az bir TP aldı: {en_az_bir_tp} (%{en_az_bir_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
         f"Hiç TP almadı: {hic_tp} (%{hic_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
@@ -3444,6 +3954,9 @@ async def cmd_status(update, context):
         f"  Insider: {stats.get('v112_red_insider', 0)}",
         f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
         f"  OKX timeout: {stats.get('okx_timeout', 0)}",
+        f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
+        f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'YEDEK/KAPALI'} | "
+        f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -3529,6 +4042,137 @@ async def cmd_stoportak(update, context):
         await update.message.reply_text("STOP ortak özellik raporu hazırlanamadı.")
 
 
+def _balina_snapshot_satiri(s: Dict[str, Any]) -> str:
+    return (f"{_base_of(str(s.get('symbol', '')))} | {s.get('durum', 'VERI_YETERSIZ')} "
+            f"{safe_float(s.get('guven')):.0f}/100 | CVD1m {safe_float(s.get('cvd_norm_1m')):+.2f} | "
+            f"Balina A/S {safe_float(s.get('whale_buy_1m'))/1000:.0f}K/"
+            f"{safe_float(s.get('whale_sell_1m'))/1000:.0f}K | OB {safe_float(s.get('book_imbalance')):+.2f}")
+
+
+async def cmd_balina(update, context):
+    if not telegram_yetkili(update):
+        return
+    if not BALINA_MOTOR_ENABLED:
+        await update.message.reply_text("Balina motoru kapalı. BALINA_MOTOR_ENABLED=true ile açılır.")
+        return
+    if context.args:
+        snap = balina_snapshot(normalize_symbol(context.args[0]))
+        lines = ["🐋 BALİNA AKIŞ DURUMU", _balina_snapshot_satiri(snap),
+                 f"Kaynak: {snap.get('source')} | Durum: {snap.get('status')}",
+                 f"CVD 5s/15s/1m/5m: {safe_float(snap.get('cvd_5s')):+.0f} / "
+                 f"{safe_float(snap.get('cvd_15s')):+.0f} / {safe_float(snap.get('cvd_1m')):+.0f} / "
+                 f"{safe_float(snap.get('cvd_5m')):+.0f}",
+                 f"Balina işlem: {int(safe_float(snap.get('whale_count_1m')))} | "
+                 f"Aktif duvar: {int(safe_float(snap.get('active_walls')))} | "
+                 f"Spoof 1m: {int(safe_float(snap.get('spoof_1m')))}",
+                 f"Veri yaşı: {safe_float(snap.get('last_data_age_sec')):.1f} sn"]
+    else:
+        snaps = [balina_snapshot(sym) for sym in list(_BALINA_STATE)]
+        snaps = [s for s in snaps if s.get("status") == "CANLI"]
+        snaps.sort(key=lambda s: safe_float(s.get("guven")), reverse=True)
+        lines = [f"🐋 BALİNA MOTORU | İzlenen {len(_BALINA_STATE)} coin"]
+        lines.extend(_balina_snapshot_satiri(s) for s in snaps[:15])
+        if len(lines) == 1:
+            lines.append("Henüz canlı veri birikmedi.")
+    for part in telegram_parcala("\n".join(lines), 4000):
+        await update.message.reply_text(part)
+
+
+async def cmd_akis(update, context):
+    if not telegram_yetkili(update):
+        return
+    if not BALINA_MOTOR_ENABLED:
+        await update.message.reply_text("Balina motoru kapalı.")
+        return
+    if not context.args:
+        await update.message.reply_text("Kullanım: /akis BTC")
+        return
+    symbol = normalize_symbol(context.args[0])
+    state = _balina_symbol_state(symbol)
+    with _BALINA_LOCK:
+        rows = list(state["whales"])[-20:]
+    lines = [f"🐋 BÜYÜK İŞLEMLER | {symbol}"]
+    for row in reversed(rows):
+        lines.append(f"{tr_str(safe_float(row.get('ts')))} | {str(row.get('side')).upper()} | "
+                     f"{_v10_fmt(row.get('price'))} | {safe_float(row.get('value')):,.0f} USDT")
+    if not rows:
+        lines.append("Kayıt yok.")
+    for part in telegram_parcala("\n".join(lines), 4000):
+        await update.message.reply_text(part)
+
+
+async def _cmd_balina_liste(update, durumlar: Tuple[str, ...], baslik: str) -> None:
+    if not BALINA_MOTOR_ENABLED:
+        await update.message.reply_text("Balina motoru kapalı.")
+        return
+    snaps = [balina_snapshot(sym) for sym in list(_BALINA_STATE)]
+    snaps = [s for s in snaps if s.get("durum") in durumlar and s.get("status") == "CANLI"]
+    snaps.sort(key=lambda s: safe_float(s.get("guven")), reverse=True)
+    lines = [baslik] + [_balina_snapshot_satiri(s) for s in snaps[:25]]
+    if len(lines) == 1:
+        lines.append("Aktif aday yok.")
+    for part in telegram_parcala("\n".join(lines), 4000):
+        await update.message.reply_text(part)
+
+
+async def cmd_birikim(update, context):
+    if not telegram_yetkili(update):
+        return
+    await _cmd_balina_liste(update, ("BIRIKIM", "SATIS_EMILIMI", "BALINA_ALIMI", "PARCALI_BALINA_ALIMI"),
+                            "🐋 BİRİKİM / ALIM ADAYLARI")
+
+
+async def cmd_dagitim(update, context):
+    if not telegram_yetkili(update):
+        return
+    await _cmd_balina_liste(update, ("DAGITIM", "ALIS_EMILIMI", "BALINA_SATISI", "PARCALI_BALINA_SATISI"),
+                            "🐋 DAĞITIM / SATIM ADAYLARI")
+
+
+async def cmd_ws(update, context):
+    if not telegram_yetkili(update):
+        return
+    age = time.time() - safe_float(_BALINA_WS_STATUS.get("last_message_ts"))
+    await update.message.reply_text(
+        "🌐 BALİNA WEBSOCKET\n"
+        f"Motor: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}\n"
+        f"Bağlantı: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK/YEDEK'}\n"
+        f"Abonelik: {_BALINA_WS_STATUS.get('subscriptions', 0)}\n"
+        f"Son veri yaşı: {age:.1f} sn\n"
+        f"Mesaj: {stats.get('balina_ws_message', 0)} | İşlem: {stats.get('balina_trade', 0)} | "
+        f"Balina: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}\n"
+        f"Bağlanma/Kopma: {stats.get('balina_ws_connect', 0)}/{stats.get('balina_ws_disconnect', 0)}\n"
+        f"Son hata: {_BALINA_WS_STATUS.get('last_error') or '-'}"
+    )
+
+
+def balina_raporu_uret() -> str:
+    if not os.path.exists(BALINA_DB):
+        return "🐋 BALİNA RAPORU\nKayıt yok."
+    cutoff = time.time() - 24 * 3600
+    with sqlite3.connect(BALINA_DB, timeout=10) as conn:
+        rows = conn.execute("""
+            SELECT event_type,side,COUNT(*),COALESCE(SUM(value_usdt),0)
+            FROM balina_event WHERE ts>=? GROUP BY event_type,side ORDER BY COUNT(*) DESC
+        """, (cutoff,)).fetchall()
+        snaps = conn.execute("""
+            SELECT durum,COUNT(*),AVG(guven) FROM balina_snapshot GROUP BY durum ORDER BY COUNT(*) DESC
+        """).fetchall()
+    lines = ["🐋 BALİNA RAPORU | Son 24 saat", "OLAYLAR"]
+    lines.extend(f"{t} {s or '-'}: {n} | {safe_float(v):,.0f} USDT" for t, s, n, v in rows)
+    lines.append("ANLIK DURUMLAR")
+    lines.extend(f"{d}: {n} | Ort.güven {safe_float(g):.1f}" for d, n, g in snaps)
+    return "\n".join(lines)
+
+
+async def cmd_balinarapor(update, context):
+    if not telegram_yetkili(update):
+        return
+    rapor = await asyncio.to_thread(balina_raporu_uret)
+    for part in telegram_parcala(rapor, 4000):
+        await update.message.reply_text(part)
+
+
 def telegram_yetkili(update: Update) -> bool:
     chat = getattr(update, "effective_chat", None)
     return bool(chat and str(chat.id) == str(TELEGRAM_CHAT_ID))
@@ -3545,6 +4189,12 @@ def build_app():
     app.add_handler(CommandHandler("tp", cmd_tp))
     app.add_handler(CommandHandler("tportak", cmd_tportak))
     app.add_handler(CommandHandler("stoportak", cmd_stoportak))
+    app.add_handler(CommandHandler("balina", cmd_balina))
+    app.add_handler(CommandHandler("akis", cmd_akis))
+    app.add_handler(CommandHandler("birikim", cmd_birikim))
+    app.add_handler(CommandHandler("dagitim", cmd_dagitim))
+    app.add_handler(CommandHandler("ws", cmd_ws))
+    app.add_handler(CommandHandler("balinarapor", cmd_balinarapor))
     return app
 
 
