@@ -66,6 +66,12 @@ BALINA_SNAPSHOT_SEC = float(os.getenv("BALINA_SNAPSHOT_SEC", "1"))
 BALINA_DB = os.getenv("BALINA_DB", "balina_akis.db").strip()
 BALINA_DB_FLUSH_SEC = float(os.getenv("BALINA_DB_FLUSH_SEC", "2"))
 BALINA_EVENT_RETENTION_HOURS = float(os.getenv("BALINA_EVENT_RETENTION_HOURS", "168"))
+BALINA_FLOW_MIN_TRADES_1M = int(float(os.getenv("BALINA_FLOW_MIN_TRADES_1M", "20")))
+BALINA_FLOW_MIN_VOLUME_1M_USDT = float(os.getenv("BALINA_FLOW_MIN_VOLUME_1M_USDT", "10000"))
+BALINA_FLOW_MIN_AGE_SEC = float(os.getenv("BALINA_FLOW_MIN_AGE_SEC", "120"))
+BALINA_FLOW_MIN_15S_TRADES = int(float(os.getenv("BALINA_FLOW_MIN_15S_TRADES", "5")))
+BALINA_NO_WHALE_MAX_CONFIDENCE = float(os.getenv("BALINA_NO_WHALE_MAX_CONFIDENCE", "55"))
+BALINA_CLASSIFY_MIN_CONFIDENCE = float(os.getenv("BALINA_CLASSIFY_MIN_CONFIDENCE", "45"))
 
 # === TARAMA ===
 HOT_SCAN_INTERVAL_SEC = float(os.getenv("HOT_SCAN_INTERVAL_SEC", "1.5"))
@@ -1594,7 +1600,7 @@ def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
                 "books": {"bids": {}, "asks": {}},
                 "walls": {}, "spoofs": deque(maxlen=200),
                 "last_price": 0.0, "last_ts": 0.0,
-                "last_book_ts": 0.0, "snapshot": {},
+                "first_ts": 0.0, "last_book_ts": 0.0, "snapshot": {},
             }
             _BALINA_STATE[symbol] = state
         return state
@@ -1681,7 +1687,11 @@ def _balina_process_trade(row: Dict[str, Any]) -> None:
         trade = {"ts": now_ts, "side": side, "price": price, "size": size, "value": value}
         state["trades"].append(trade)
         state["last_price"] = price
-        state["last_ts"] = now_ts
+        state["last_ts"] = max(safe_float(state.get("last_ts")), now_ts)
+        if safe_float(state.get("first_ts")) <= 0:
+            state["first_ts"] = now_ts
+        else:
+            state["first_ts"] = min(safe_float(state.get("first_ts")), now_ts)
         _balina_prune(state, now_ts)
         threshold = _balina_whale_threshold(state)
         if value >= threshold:
@@ -1810,13 +1820,30 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
 
         durum = "BELIRSIZ"
         guven = 0.0
+        akis_yasi = max(0.0, now_ts - safe_float(state.get("first_ts"), now_ts))
+        count_factor = clamp(m60["count"] / max(1, BALINA_FLOW_MIN_TRADES_1M), 0.0, 1.0)
+        volume_factor = clamp(m60["total"] / max(1.0, BALINA_FLOW_MIN_VOLUME_1M_USDT), 0.0, 1.0)
+        age_factor = clamp(akis_yasi / max(1.0, BALINA_FLOW_MIN_AGE_SEC), 0.0, 1.0)
+        short_factor = clamp(m15["count"] / max(1, BALINA_FLOW_MIN_15S_TRADES), 0.0, 1.0)
+        veri_kalitesi = 100.0 * (0.35 * count_factor + 0.35 * volume_factor +
+                                0.20 * age_factor + 0.10 * short_factor)
+        flow_ready = (m60["count"] >= BALINA_FLOW_MIN_TRADES_1M and
+                      m60["total"] >= BALINA_FLOW_MIN_VOLUME_1M_USDT and
+                      akis_yasi >= BALINA_FLOW_MIN_AGE_SEC and
+                      m15["count"] >= BALINA_FLOW_MIN_15S_TRADES)
+        same_flow_sign = (m15["cvd_norm"] * m60["cvd_norm"] > 0 and
+                          abs(m15["cvd_norm"]) >= 0.15)
         if stale:
             durum = "VERI_YETERSIZ"
         else:
-            absorption_sell = m60["cvd_norm"] < -0.25 and m60["price_move_pct"] > -0.15
-            absorption_buy = m60["cvd_norm"] > 0.25 and m60["price_move_pct"] < 0.15
-            accumulation = abs(m300["price_move_pct"]) < 0.8 and m300["cvd_norm"] > 0.18
-            distribution = abs(m300["price_move_pct"]) < 0.8 and m300["cvd_norm"] < -0.18
+            absorption_sell = (flow_ready and same_flow_sign and m60["cvd_norm"] < -0.25 and
+                               m60["price_move_pct"] > -0.15)
+            absorption_buy = (flow_ready and same_flow_sign and m60["cvd_norm"] > 0.25 and
+                              m60["price_move_pct"] < 0.15)
+            accumulation = (flow_ready and same_flow_sign and abs(m300["price_move_pct"]) < 0.8 and
+                            m300["cvd_norm"] > 0.18)
+            distribution = (flow_ready and same_flow_sign and abs(m300["price_move_pct"]) < 0.8 and
+                            m300["cvd_norm"] < -0.18)
             if clustered_buy >= BALINA_CLUSTER_MIN_COUNT and whale_cvd_norm > 0.35:
                 durum = "PARCALI_BALINA_ALIMI"
                 guven = min(95.0, 60.0 + clustered_buy * 5.0 + whale_cvd_norm * 15.0)
@@ -1825,22 +1852,29 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
                 guven = min(95.0, 60.0 + clustered_sell * 5.0 + abs(whale_cvd_norm) * 15.0)
             elif absorption_sell:
                 durum = "SATIS_EMILIMI"
-                guven = min(90.0, 50.0 + abs(m60["cvd_norm"]) * 80.0)
+                guven = min(90.0, (45.0 + abs(m60["cvd_norm"]) * 45.0) * veri_kalitesi / 100.0)
             elif absorption_buy:
                 durum = "ALIS_EMILIMI"
-                guven = min(90.0, 50.0 + abs(m60["cvd_norm"]) * 80.0)
+                guven = min(90.0, (45.0 + abs(m60["cvd_norm"]) * 45.0) * veri_kalitesi / 100.0)
             elif accumulation:
                 durum = "BIRIKIM"
-                guven = min(88.0, 45.0 + m300["cvd_norm"] * 100.0)
+                guven = min(88.0, (45.0 + m300["cvd_norm"] * 60.0) * veri_kalitesi / 100.0)
             elif distribution:
                 durum = "DAGITIM"
-                guven = min(88.0, 45.0 + abs(m300["cvd_norm"]) * 100.0)
+                guven = min(88.0, (45.0 + abs(m300["cvd_norm"]) * 60.0) * veri_kalitesi / 100.0)
             elif whale_cvd_norm > 0.35 and whale_total > 0:
                 durum = "BALINA_ALIMI"
                 guven = min(85.0, 45.0 + whale_cvd_norm * 50.0)
             elif whale_cvd_norm < -0.35 and whale_total > 0:
                 durum = "BALINA_SATISI"
                 guven = min(85.0, 45.0 + abs(whale_cvd_norm) * 50.0)
+            elif not flow_ready:
+                durum = "AKIS_YETERSIZ"
+                guven = min(40.0, veri_kalitesi * 0.4)
+            if whale_total <= 0 and durum not in ("VERI_YETERSIZ", "AKIS_YETERSIZ", "BELIRSIZ"):
+                guven = min(guven, BALINA_NO_WHALE_MAX_CONFIDENCE)
+            if durum not in ("VERI_YETERSIZ", "AKIS_YETERSIZ", "BELIRSIZ") and guven < BALINA_CLASSIFY_MIN_CONFIDENCE:
+                durum = "AKIS_ZAYIF"
         out = {
             "enabled": True, "source": "WEBSOCKET" if _BALINA_WS_STATUS.get("connected") else "REST_YEDEK",
             "status": "BAYAT" if stale else "CANLI", "symbol": symbol,
@@ -1849,6 +1883,10 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
             "cvd_1m": round(m60["cvd"], 2), "cvd_5m": round(m300["cvd"], 2),
             "cvd_norm_1m": round(m60["cvd_norm"], 4),
             "price_move_1m_pct": round(m60["price_move_pct"], 4),
+            "trade_count_15s": int(m15["count"]), "trade_count_1m": int(m60["count"]),
+            "trade_volume_1m_usdt": round(m60["total"], 2),
+            "flow_age_sec": round(akis_yasi, 1), "data_quality": round(veri_kalitesi, 1),
+            "flow_ready": flow_ready,
             "whale_buy_1m": round(whale_buy, 2), "whale_sell_1m": round(whale_sell, 2),
             "whale_count_1m": len(whales), "whale_cvd_norm": round(whale_cvd_norm, 4),
             "book_imbalance": round(book_imb, 4), "active_walls": len(state["walls"]),
@@ -3173,6 +3211,7 @@ def build_v10_message(sig):
         akis = sig.get("balina_akis") or {}
         balina_line = (f"🐋 Balina: {akis.get('durum', 'VERI_YETERSIZ')} | "
                        f"Güven {safe_float(akis.get('guven')):.0f}/100 | "
+                       f"Kalite {safe_float(akis.get('data_quality')):.0f}/100 | "
                        f"CVD1m {safe_float(akis.get('cvd_norm_1m')):+.2f} | "
                        f"W:{int(safe_float(akis.get('whale_count_1m')))} | "
                        f"{akis.get('source', 'REST_YEDEK')}\n")
@@ -4044,7 +4083,8 @@ async def cmd_stoportak(update, context):
 
 def _balina_snapshot_satiri(s: Dict[str, Any]) -> str:
     return (f"{_base_of(str(s.get('symbol', '')))} | {s.get('durum', 'VERI_YETERSIZ')} "
-            f"{safe_float(s.get('guven')):.0f}/100 | CVD1m {safe_float(s.get('cvd_norm_1m')):+.2f} | "
+            f"{safe_float(s.get('guven')):.0f}/100 | Kalite {safe_float(s.get('data_quality')):.0f} | "
+            f"CVD1m {safe_float(s.get('cvd_norm_1m')):+.2f} | "
             f"Balina A/S {safe_float(s.get('whale_buy_1m'))/1000:.0f}K/"
             f"{safe_float(s.get('whale_sell_1m'))/1000:.0f}K | OB {safe_float(s.get('book_imbalance')):+.2f}")
 
@@ -4065,6 +4105,9 @@ async def cmd_balina(update, context):
                  f"Balina işlem: {int(safe_float(snap.get('whale_count_1m')))} | "
                  f"Aktif duvar: {int(safe_float(snap.get('active_walls')))} | "
                  f"Spoof 1m: {int(safe_float(snap.get('spoof_1m')))}",
+                 f"Akış: {int(safe_float(snap.get('trade_count_1m')))} işlem | "
+                 f"{safe_float(snap.get('trade_volume_1m_usdt')):,.0f} USDT | "
+                 f"Kalite {safe_float(snap.get('data_quality')):.0f}/100",
                  f"Veri yaşı: {safe_float(snap.get('last_data_age_sec')):.1f} sn"]
     else:
         snaps = [balina_snapshot(sym) for sym in list(_BALINA_STATE)]
