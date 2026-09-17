@@ -62,6 +62,11 @@ BALINA_CLUSTER_MIN_COUNT = int(float(os.getenv("BALINA_CLUSTER_MIN_COUNT", "3"))
 BALINA_WALL_MULT = float(os.getenv("BALINA_WALL_MULT", "3.0"))
 BALINA_WALL_LIFETIME_SEC = float(os.getenv("BALINA_WALL_LIFETIME_SEC", "8"))
 BALINA_SPOOF_CANCEL_RATIO = float(os.getenv("BALINA_SPOOF_CANCEL_RATIO", "0.80"))
+BALINA_SPOOF_ENABLED = os.getenv("BALINA_SPOOF_ENABLED", "true").lower() == "true"
+BALINA_WALL_MIN_USDT = float(os.getenv("BALINA_WALL_MIN_USDT", "25000"))
+BALINA_SPOOF_CONFIRM_SEC = float(os.getenv("BALINA_SPOOF_CONFIRM_SEC", "2.0"))
+BALINA_SPOOF_MIN_MISSING = int(float(os.getenv("BALINA_SPOOF_MIN_MISSING", "3")))
+BALINA_SPOOF_MAX_DISTANCE_PCT = float(os.getenv("BALINA_SPOOF_MAX_DISTANCE_PCT", "0.5"))
 BALINA_SNAPSHOT_SEC = float(os.getenv("BALINA_SNAPSHOT_SEC", "1"))
 BALINA_DB = os.getenv("BALINA_DB", "balina_akis.db").strip()
 BALINA_DB_FLUSH_SEC = float(os.getenv("BALINA_DB_FLUSH_SEC", "2"))
@@ -568,11 +573,11 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         return []
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         rows = conn.execute("""
-            SELECT uid,side,kontrol,durum,r_value,sonuc_tipi,kapi_json
+            SELECT uid,side,kontrol,durum,r_value,mfe_pct,sonuc_tipi,kapi_json
             FROM olcum_pozisyon
         """).fetchall()
     sonuc = []
-    for uid, side, kontrol, durum, r_value, sonuc_tipi, raw_json in rows:
+    for uid, side, kontrol, durum, r_value, mfe_pct, sonuc_tipi, raw_json in rows:
         try:
             payload = json.loads(raw_json or "{}")
         except Exception:
@@ -582,7 +587,8 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         ozellikler.setdefault("kontrol", int(kontrol or 0))
         kapilar = {ad: payload.get(ad) for ad in OLCUM_KAPILARI if payload.get(ad) in ("gecti", "kesti")}
         sonuc.append({"uid": uid, "side": side, "kontrol": int(kontrol or 0),
-                      "durum": durum, "r_value": safe_float(r_value), "sonuc_tipi": sonuc_tipi,
+                      "durum": durum, "r_value": safe_float(r_value), "mfe_pct": safe_float(mfe_pct),
+                      "sonuc_tipi": sonuc_tipi,
                       "hit1": bool(payload.get("_hit1")), "hit2": bool(payload.get("_hit2")),
                       "hit3": bool(payload.get("_hit3")), "hit4": bool(payload.get("_hit4")),
                       "ozellikler": ozellikler,
@@ -1754,24 +1760,57 @@ def _balina_process_book(row: Dict[str, Any]) -> None:
                 wall["price"] = price
                 wall["last_qty"] = qty
                 wall["max_qty"] = max(safe_float(wall.get("max_qty")), qty)
+                wall.pop("missing_since", None)
+                wall.pop("missing_count", None)
         for key in previous_keys - active_keys:
-            wall = state["walls"].pop(key, None)
+            wall = state["walls"].get(key)
             if not wall:
                 continue
-            lifetime = ts - safe_float(wall.get("first_ts"))
             book_side = wall.get("side")
+            visible_prices = list((state["books"].get(book_side) or {}).keys())
+            wall_price = safe_float(wall.get("price"))
+            if not visible_prices or wall_price <= 0:
+                continue
+            band_tol = SPOOF_FIYAT_TOLERANS_PCT / 100.0
+            still_in_visible_band = (min(visible_prices) * (1.0 - band_tol) <= wall_price <=
+                                     max(visible_prices) * (1.0 + band_tol))
+            # books5 dışına kayan seviye kaybolmuş sayılamaz; yalnız görünür bant içindeki iptal ölçülür.
+            if not still_in_visible_band:
+                state["walls"].pop(key, None)
+                continue
+            if "missing_since" not in wall:
+                wall["missing_since"] = ts
+                wall["missing_count"] = 1
+                continue
+            wall["missing_count"] = int(wall.get("missing_count", 0)) + 1
+            missing_for = ts - safe_float(wall.get("missing_since"))
+            if (missing_for < BALINA_SPOOF_CONFIRM_SEC or
+                    int(wall.get("missing_count", 0)) < max(2, BALINA_SPOOF_MIN_MISSING)):
+                continue
+            state["walls"].pop(key, None)
+            if not BALINA_SPOOF_ENABLED:
+                continue
+            lifetime = ts - safe_float(wall.get("first_ts"))
             taker_side = "sell" if book_side == "bids" else "buy"
-            executed = _balina_trade_near(state, taker_side, safe_float(wall.get("price")),
+            executed = _balina_trade_near(state, taker_side, wall_price,
                                           safe_float(wall.get("first_ts")))
-            wall_notional = _balina_contract_value(symbol, safe_float(wall.get("price")),
+            wall_notional = _balina_contract_value(symbol, wall_price,
                                                     safe_float(wall.get("max_qty")))
             executed_ratio = executed / wall_notional if wall_notional > 0 else 0.0
             cancel_ratio = clamp(1.0 - executed_ratio, 0.0, 1.0)
-            if lifetime >= BALINA_WALL_LIFETIME_SEC and cancel_ratio >= BALINA_SPOOF_CANCEL_RATIO:
+            best_bid = max(state["books"].get("bids", {}) or {0.0: 0.0})
+            best_ask = min(state["books"].get("asks", {}) or {0.0: 0.0})
+            mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else safe_float(state.get("last_price"))
+            distance_pct = abs(wall_price - mid) / mid * 100.0 if mid > 0 else 999.0
+            if (lifetime >= BALINA_WALL_LIFETIME_SEC and
+                    wall_notional >= BALINA_WALL_MIN_USDT and
+                    distance_pct <= BALINA_SPOOF_MAX_DISTANCE_PCT and
+                    cancel_ratio >= BALINA_SPOOF_CANCEL_RATIO):
                 event = {"ts": ts, "symbol": symbol, "event_type": "SPOOF_WALL",
                          "side": book_side, "price": wall.get("price"),
                          "value_usdt": wall_notional, "lifetime": lifetime,
-                         "cancel_ratio": cancel_ratio}
+                         "cancel_ratio": cancel_ratio, "missing_for": missing_for,
+                         "distance_pct": distance_pct}
                 state["spoofs"].append(event)
                 stats["balina_spoof"] = int(stats.get("balina_spoof", 0)) + 1
                 _balina_queue_event(event)
@@ -2880,12 +2919,14 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return None
     k = _s_closed(k1h)
     ms = v10_market_structure(k)
-    kontrol = random.random() < clamp(OLCUM_RASTGELE_ORAN, 0.0, 1.0)
     yapisal_yon = "LONG" if ms.get("event_side") == "UP" else "SHORT" if ms.get("event_side") == "DOWN" else None
-    if not yapisal_yon and not kontrol:
+    if not yapisal_yon:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
 
+    # Kontrol grubu da Normal grupla aynı yapısal aday havuzundan seçilir.
+    # Böylece kontrol oranı, yapı bulunmayan coinlerin kestirme yoldan geçmesiyle şişmez.
+    kontrol = random.random() < clamp(OLCUM_RASTGELE_ORAN, 0.0, 1.0)
     side = random.choice(("LONG", "SHORT")) if kontrol else yapisal_yon
     entry_ref = closes(k)[-1]
 
@@ -4205,6 +4246,29 @@ def balina_raporu_uret() -> str:
     lines.extend(f"{t} {s or '-'}: {n} | {safe_float(v):,.0f} USDT" for t, s, n, v in rows)
     lines.append("ANLIK DURUMLAR")
     lines.extend(f"{d}: {n} | Ort.güven {safe_float(g):.1f}" for d, n, g in snaps)
+    lines.append("SİNYAL SONUÇLARI")
+    olcum_rows = olcum_db_ortak_satirlari()
+    for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
+        grup = [r for r in olcum_rows if int(r.get("kontrol", 0)) == kontrol_degeri]
+        durumlar = defaultdict(list)
+        for rec in grup:
+            balina_durum = str((rec.get("ozellikler") or {}).get("balina_durum") or "")
+            if balina_durum and balina_durum != "OLCUMSUZ":
+                durumlar[balina_durum].append(rec)
+        lines.append(grup_adi)
+        if not durumlar:
+            lines.append("Balina etiketi taşıyan pozisyon yok.")
+            continue
+        for durum, kayitlar in sorted(durumlar.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            kapanan = [r for r in kayitlar if r.get("durum") != "ACIK"]
+            temiz = sum(1 for r in kapanan if r.get("sonuc_tipi") == "TEMIZ_STOP")
+            tp_goren = sum(1 for r in kayitlar if r.get("hit1"))
+            ort_r = avg([safe_float(r.get("r_value")) for r in kapanan])
+            ort_mfe = avg([safe_float(r.get("mfe_pct")) for r in kayitlar])
+            lines.append(
+                f"{durum}: n={len(kayitlar)} | kapanan={len(kapanan)} | "
+                f"temiz stop={temiz} | TP1+={tp_goren} | Ort.R {ort_r:+.3f} | Ort.MFE %{ort_mfe:.3f}"
+            )
     return "\n".join(lines)
 
 
