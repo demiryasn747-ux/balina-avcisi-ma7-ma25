@@ -9,6 +9,7 @@ import logging
 import threading
 import random
 import sqlite3
+import hashlib
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -50,6 +51,13 @@ GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
 # === CANLI BALINA AKIŞ MOTORU ===
 BALINA_MOTOR_ENABLED = os.getenv("BALINA_MOTOR_ENABLED", "false").lower() == "true"
 BALINA_MOTOR_BLOCK = os.getenv("BALINA_MOTOR_BLOCK", "false").lower() == "true"
+BALINA_KARLI_KAPI_ENABLED = os.getenv("BALINA_KARLI_KAPI_ENABLED", "true").lower() == "true"
+BALINA_KARLI_DURUMLAR = {
+    x.strip().upper() for x in os.getenv(
+        "BALINA_KARLI_DURUMLAR",
+        "SATIS_EMILIMI,BALINA_ALIMI,BALINA_SATISI",
+    ).split(",") if x.strip()
+}
 BALINA_WS_URL = os.getenv("BALINA_WS_URL", "wss://ws.okx.com:8443/ws/v5/public").strip()
 BALINA_RECONNECT_MAX_SEC = float(os.getenv("BALINA_RECONNECT_MAX_SEC", "60"))
 BALINA_STALE_SEC = float(os.getenv("BALINA_STALE_SEC", "20"))
@@ -405,6 +413,7 @@ stats: Dict[str, Any] = {
     "balina_ws_connect": 0, "balina_ws_disconnect": 0,
     "balina_ws_message": 0, "balina_trade": 0, "balina_whale": 0,
     "balina_spoof": 0, "balina_db_fail": 0, "balina_red_conflict": 0,
+    "balina_red_karli_kapi": 0,
 }
 
 app = None
@@ -502,6 +511,7 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
         "balina_cvd_1m": (pos.get("balina_akis") or {}).get("cvd_norm_1m"),
         "balina_whale_1m": (pos.get("balina_akis") or {}).get("whale_count_1m"),
         "balina_spoof_1m": (pos.get("balina_akis") or {}).get("spoof_1m"),
+        "signal_no": pos.get("signal_no"),
     }
 
 
@@ -691,6 +701,7 @@ def ensure_memory_shape() -> None:
     memory.setdefault("v10_paper", {"open": [], "closed": [], "buckets": {}})
     memory["v10_paper"].setdefault("golge", [])
     memory.setdefault("last_signal_ts", 0.0)
+    memory.setdefault("signal_seq", 0)
     memory.setdefault("runtime", {})
 
 def load_memory() -> None:
@@ -2924,10 +2935,13 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
 
-    # Kontrol grubu da Normal grupla aynı yapısal aday havuzundan seçilir.
-    # Böylece kontrol oranı, yapı bulunmayan coinlerin kestirme yoldan geçmesiyle şişmez.
-    kontrol = random.random() < clamp(OLCUM_RASTGELE_ORAN, 0.0, 1.0)
-    side = random.choice(("LONG", "SHORT")) if kontrol else yapisal_yon
+    # Kontrol seçimi symbol+mum için sabittir. Aynı mum tekrar tarandığında
+    # kontrol/normal veya LONG/SHORT arasında yeniden kura çekilmez.
+    kontrol_anahtari = f"{symbol}|{k[-1][0]}".encode("utf-8")
+    kontrol_ozeti = hashlib.sha256(kontrol_anahtari).digest()
+    kontrol_degeri = int.from_bytes(kontrol_ozeti[:8], "big") / float(1 << 64)
+    kontrol = kontrol_degeri < clamp(OLCUM_RASTGELE_ORAN, 0.0, 1.0)
+    side = ("LONG" if kontrol_ozeti[8] % 2 == 0 else "SHORT") if kontrol else yapisal_yon
     entry_ref = closes(k)[-1]
 
     if kontrol:
@@ -3257,7 +3271,8 @@ def build_v10_message(sig):
                        f"W:{int(safe_float(akis.get('whale_count_1m')))} | "
                        f"{akis.get('source', 'REST_YEDEK')}\n")
 
-    return (f"{trend_line}"
+    signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
+    return (f"{signal_no_line}{trend_line}"
             f"🎯 {VERSION_NAME}\n🆕 V11.5.3 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
@@ -3288,6 +3303,7 @@ def build_v10_close_message(pos, R, outcome, exit_price):
         head = f"🏁 {outcome}"
     return (
         f"🆕 V11.5.3 — POZİSYON KAPANDI\n"
+        + (f"🆔 Sinyal #{int(safe_float(pos.get('signal_no')))}\n" if pos.get("signal_no") else "") +
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
         f"Yön: {pos['side']}\n"
@@ -3337,6 +3353,7 @@ def v10_open_paper(sig):
         "balina_guven": safe_float(sig.get("balina_guven")),
         "balina_veri_kaynagi": sig.get("balina_veri_kaynagi", "REST"),
         "balina_akis": copy.deepcopy(sig.get("balina_akis", {})),
+        "signal_no": int(safe_float(sig.get("signal_no"))),
         "kapi_sonuclari": copy.deepcopy(sig.get("kapi_sonuclari", {})),
         "kontrol": bool(sig.get("kontrol")),
         "mfe_pct": 0.0, "mae_pct": 0.0, "current_r": 0.0,
@@ -3459,8 +3476,10 @@ async def maybe_send_v10_signal(sig):
         return
     symbol = sig["symbol"]
     side = sig["direction"]
-    ckey = f"{symbol}:{side}"
-    if v10_sent_candle.get(ckey) == sig["candle_ts"]:
+    ckey = symbol
+    legacy_ckey = f"{symbol}:{side}"
+    if (v10_sent_candle.get(ckey) == sig["candle_ts"] or
+            v10_sent_candle.get(legacy_ckey) == sig["candle_ts"]):
         return
     if not v10_cooldown_ok(symbol):
         return
@@ -3475,7 +3494,12 @@ async def maybe_send_v10_signal(sig):
         return
 
     balina_signal_ekle(sig)
-    if BALINA_MOTOR_BLOCK:
+    if BALINA_KARLI_KAPI_ENABLED and BALINA_MOTOR_ENABLED:
+        durum = str(sig.get("balina_durum", "VERI_YETERSIZ")).upper()
+        if durum not in BALINA_KARLI_DURUMLAR:
+            stats["balina_red_karli_kapi"] = int(stats.get("balina_red_karli_kapi", 0)) + 1
+            return
+    if BALINA_MOTOR_BLOCK and not BALINA_KARLI_KAPI_ENABLED:
         akis = sig.get("balina_akis") or {}
         durum = str(akis.get("durum", ""))
         guven = safe_float(akis.get("guven"))
@@ -3487,6 +3511,9 @@ async def maybe_send_v10_signal(sig):
             stats["balina_red_conflict"] = int(stats.get("balina_red_conflict", 0)) + 1
             return
 
+    signal_no = max(int(safe_float(memory.get("signal_seq", 0))),
+                    int(stats.get("v10_signals", 0))) + 1
+    sig["signal_no"] = signal_no
     ok = await send_rich_signal(
         build_v10_message(sig), symbol, side,
         entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
@@ -3496,6 +3523,7 @@ async def maybe_send_v10_signal(sig):
               "session_name": sig.get("session_name", ""), "adx": sig.get("adx", 0)},
     )
     if ok:
+        memory["signal_seq"] = signal_no
         v10_last_alert[symbol] = time.time()
         v10_sent_candle[ckey] = sig["candle_ts"]
         v10_open_paper(sig)
@@ -3947,6 +3975,8 @@ async def post_init(application) -> None:
         f"\nÖlçüm kaydı: {olcum_kayit_sayisi} pozisyon"
         f"{olcum_kalici_uyari}"
         f"\n🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}"
+        f"\n🐋 Kârlı durum kapısı: {'AKTİF' if (BALINA_KARLI_KAPI_ENABLED and BALINA_MOTOR_ENABLED) else 'kapalı'}"
+        f" | OR: {', '.join(sorted(BALINA_KARLI_DURUMLAR))}"
     )
     for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop):
         asyncio.create_task(_kur(), name=_kur.__name__)
@@ -4034,6 +4064,7 @@ async def cmd_status(update, context):
         f"  Insider: {stats.get('v112_red_insider', 0)}",
         f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
         f"  OKX timeout: {stats.get('okx_timeout', 0)}",
+        f"  Balina kârlı kapı reddi: {stats.get('balina_red_karli_kapi', 0)}",
         f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
         f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'YEDEK/KAPALI'} | "
         f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
