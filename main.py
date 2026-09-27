@@ -10,6 +10,8 @@ import threading
 import random
 import sqlite3
 import hashlib
+import shutil
+import platform
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -21,8 +23,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V11.5.3 ÖLÇÜM LABORATUVARI (SMC + MTF + VWAP + Session + Manipulation Guard)"
-BOT_BUILD = os.getenv("BOT_BUILD", "V11.5.3")
+VERSION_NAME = "Balina Avcısı V12.0 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.0")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -43,10 +45,41 @@ OLCUM_MIN_HUCRE = int(float(os.getenv("OLCUM_MIN_HUCRE", "100")))
 OLCUM_DB = os.getenv("OLCUM_DB", "balina_olcum.db").strip()
 OLCUM_MAX_OPEN = int(float(os.getenv("OLCUM_MAX_OPEN", "400")))
 ORTAK_MIN_N = int(float(os.getenv("ORTAK_MIN_N", "20")))
+KOMBINASYON_MIN_KAPANIS = int(float(os.getenv("KOMBINASYON_MIN_KAPANIS", "100")))
 GOLGE_IZLEME = os.getenv("GOLGE_IZLEME", "true").lower() == "true"
 GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
 GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
+
+# === V12.0 KURUMSAL ALTYAPI ===
+KURUMSAL_ENABLED = os.getenv("KURUMSAL_ENABLED", "true").lower() == "true"
+DB_SCHEMA_VERSION = 12
+DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
+DB_BACKUP_DIR = os.getenv("DB_BACKUP_DIR", "/data/backups").strip()
+DB_BACKUP_INTERVAL_SEC = int(float(os.getenv("DB_BACKUP_INTERVAL_SEC", "21600")))
+DB_BACKUP_KEEP = int(float(os.getenv("DB_BACKUP_KEEP", "28")))
+DB_INTEGRITY_INTERVAL_SEC = int(float(os.getenv("DB_INTEGRITY_INTERVAL_SEC", "3600")))
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+HEALTH_ALERT_ENABLED = os.getenv("HEALTH_ALERT_ENABLED", "true").lower() == "true"
+HEALTH_CHECK_INTERVAL_SEC = int(float(os.getenv("HEALTH_CHECK_INTERVAL_SEC", "60")))
+HEALTH_ALERT_COOLDOWN_SEC = int(float(os.getenv("HEALTH_ALERT_COOLDOWN_SEC", "1800")))
+SCAN_STALE_SEC = float(os.getenv("SCAN_STALE_SEC", "180"))
+PAPER_STALE_SEC = float(os.getenv("PAPER_STALE_SEC", "180"))
+DATA_MAX_AGE_SEC = float(os.getenv("DATA_MAX_AGE_SEC", "30"))
+DATA_QUALITY_BLOCK_ENABLED = os.getenv("DATA_QUALITY_BLOCK_ENABLED", "false").lower() == "true"
+SIM_FEE_RATE_PCT = float(os.getenv("SIM_FEE_RATE_PCT", "0.05"))
+SIM_SLIPPAGE_PCT = float(os.getenv("SIM_SLIPPAGE_PCT", "0.03"))
+SIM_FUNDING_COST_PCT = float(os.getenv("SIM_FUNDING_COST_PCT", "0.0"))
+SIM_AMBIGUOUS_BAR_POLICY = os.getenv("SIM_AMBIGUOUS_BAR_POLICY", "STOP_FIRST").strip().upper()
+RISK_ENGINE_ENABLED = os.getenv("RISK_ENGINE_ENABLED", "false").lower() == "true"
+RISK_KILL_SWITCH = os.getenv("RISK_KILL_SWITCH", "false").lower() == "true"
+RISK_MAX_DAILY_R = float(os.getenv("RISK_MAX_DAILY_R", "5.0"))
+RISK_MAX_WEEKLY_R = float(os.getenv("RISK_MAX_WEEKLY_R", "12.0"))
+RISK_MAX_CONSECUTIVE_STOPS = int(float(os.getenv("RISK_MAX_CONSECUTIVE_STOPS", "5")))
+RISK_MAX_TOTAL_OPEN = int(float(os.getenv("RISK_MAX_TOTAL_OPEN", "20")))
+RISK_MAX_SAME_SIDE = int(float(os.getenv("RISK_MAX_SAME_SIDE", "12")))
+RISK_MAX_GROUP = int(float(os.getenv("RISK_MAX_GROUP", "4")))
+VALIDATION_MIN_CLOSED = int(float(os.getenv("VALIDATION_MIN_CLOSED", "100")))
 
 # === CANLI BALINA AKIŞ MOTORU ===
 BALINA_MOTOR_ENABLED = os.getenv("BALINA_MOTOR_ENABLED", "false").lower() == "true"
@@ -414,6 +447,8 @@ stats: Dict[str, Any] = {
     "balina_ws_message": 0, "balina_trade": 0, "balina_whale": 0,
     "balina_spoof": 0, "balina_db_fail": 0, "balina_red_conflict": 0,
     "balina_red_karli_kapi": 0,
+    "risk_reject": 0, "data_quality_reject": 0, "db_integrity_fail": 0,
+    "backup_success": 0, "backup_fail": 0, "health_alert": 0,
 }
 
 app = None
@@ -427,6 +462,12 @@ _V106_BTC_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 _BALINA_LOCK = threading.RLock()
 _BALINA_STATE: Dict[str, Dict[str, Any]] = {}
 _BALINA_DB_QUEUE: Optional[asyncio.Queue] = None
+_RUNTIME_HEALTH: Dict[str, Any] = {
+    "started_ts": time.time(), "scan_heartbeat": 0.0, "paper_heartbeat": 0.0,
+    "shadow_heartbeat": 0.0, "save_heartbeat": 0.0, "last_backup_ts": 0.0,
+    "last_integrity_ts": 0.0, "last_health_alert_ts": 0.0,
+    "db_integrity": "BILINMIYOR", "emergency_stop": False,
+}
 _BALINA_WS_STATUS: Dict[str, Any] = {
     "connected": False, "last_message_ts": 0.0, "last_error": "",
     "connected_ts": 0.0, "subscriptions": 0,
@@ -440,9 +481,40 @@ OLCUM_KAPILARI = (
 _OLCUM_DB_LOCK = threading.Lock()
 
 
+def config_fingerprint() -> str:
+    anahtarlar = sorted(k for k in os.environ if k.startswith((
+        "V10_", "V106_", "V107_", "V109_", "V11_", "TP", "SABIT_", "OLCUM_",
+        "BALINA_", "RISK_", "SIM_", "GOLGE_", "ADX_", "VWAP_", "MTF_",
+    )))
+    guvenli = {k: os.environ.get(k, "") for k in anahtarlar
+               if "TOKEN" not in k and "SECRET" not in k and "KEY" not in k}
+    return hashlib.sha256(json.dumps(guvenli, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def audit_yaz(event_type: str, uid: str = "", symbol: str = "",
+              payload: Optional[Dict[str, Any]] = None) -> None:
+    if not AUDIT_ENABLED or not os.path.exists(OLCUM_DB):
+        return
+    try:
+        with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+            conn.execute(
+                "INSERT INTO audit_event(ts,event_type,uid,symbol,build,config_hash,payload_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (time.time(), str(event_type), str(uid), str(symbol), BOT_BUILD,
+                 config_fingerprint(), json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)),
+            )
+    except Exception as e:
+        logger.warning("Audit yazılamadı: %s", e)
+
+
 def olcum_db_init() -> None:
+    db_dizin = os.path.dirname(os.path.abspath(OLCUM_DB))
+    os.makedirs(db_dizin, exist_ok=True)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS olcum_pozisyon (
                 uid TEXT PRIMARY KEY,
@@ -466,13 +538,33 @@ def olcum_db_init() -> None:
             "golge_mfe_pct": "REAL",
             "golge_mae_pct": "REAL",
             "golge_tp1_dk": "REAL",
+            "golge_tp2_dk": "REAL",
+            "golge_tp3_dk": "REAL",
+            "golge_tp4_dk": "REAL",
             "golge_bitis_ts": "REAL",
+            "stop_neden_json": "TEXT",
+            "net_r_value": "REAL",
+            "cost_r": "REAL",
+            "build": "TEXT",
+            "config_hash": "TEXT",
         }
         for kolon, tur in yeni_kolonlar.items():
             if kolon not in mevcut_kolonlar:
                 conn.execute(f"ALTER TABLE olcum_pozisyon ADD COLUMN {kolon} {tur}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_durum ON olcum_pozisyon(durum)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_sonuc_tipi ON olcum_pozisyon(sonuc_tipi)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_olcum_open_ts ON olcum_pozisyon(open_ts)")
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)",
+                     (str(DB_SCHEMA_VERSION),))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                event_type TEXT NOT NULL, uid TEXT, symbol TEXT,
+                build TEXT, config_hash TEXT, payload_json TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_event(ts)")
         eski_sonuclar = conn.execute(
             "SELECT uid,durum,kapi_json FROM olcum_pozisyon WHERE sonuc_tipi IS NULL AND durum!='ACIK'"
         ).fetchall()
@@ -499,6 +591,7 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
         "1h_trend": pos.get("trend_1h"), "4h_trend": pos.get("trend_4h"),
         "btc_1h": pos.get("btc_1h"), "btc_4h": pos.get("btc_4h"),
         "coin_1h_ema": pos.get("coin_1h_ema"), "session_name": pos.get("session_name"),
+        "piyasa_modu": pos.get("piyasa_modu"),
         "giris_tipi": giris or None, "yon": pos.get("side"),
         "kontrol": int(bool(pos.get("kontrol"))),
         "skor": pos.get("score"), "rsi": pos.get("rsi"), "adx": pos.get("adx"),
@@ -512,6 +605,7 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
         "balina_whale_1m": (pos.get("balina_akis") or {}).get("whale_count_1m"),
         "balina_spoof_1m": (pos.get("balina_akis") or {}).get("spoof_1m"),
         "signal_no": pos.get("signal_no"),
+        "build": BOT_BUILD, "config_hash": config_fingerprint(),
     }
 
 
@@ -524,11 +618,24 @@ def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         conn.execute("""
             INSERT OR REPLACE INTO olcum_pozisyon
-            (uid,symbol,side,kontrol,open_ts,durum,r_value,mfe_pct,mae_pct,kapi_json)
-            VALUES (?,?,?,?,?,'ACIK',?,?,?,?)
+            (uid,symbol,side,kontrol,open_ts,durum,r_value,mfe_pct,mae_pct,kapi_json,build,config_hash)
+            VALUES (?,?,?,?,?,'ACIK',?,?,?,?,?,?)
         """, (v107_pos_uid(pos), pos["symbol"], pos["side"], int(bool(pos.get("kontrol"))),
               safe_float(pos.get("open_ts")), safe_float(pos.get("current_r")),
-              safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")), payload))
+              safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")), payload,
+              BOT_BUILD, config_fingerprint()))
+    audit_yaz("POSITION_OPEN", v107_pos_uid(pos), pos.get("symbol", ""),
+              {"side": pos.get("side"), "signal_no": pos.get("signal_no")})
+
+
+def simulasyon_maliyet_r(pos: Dict[str, Any]) -> float:
+    risk_pct = abs(safe_float(pos.get("entry")) - safe_float(pos.get("orig_stop")))
+    entry = safe_float(pos.get("entry"))
+    if entry <= 0 or risk_pct <= 0:
+        return 0.0
+    risk_pct = risk_pct / entry * 100.0
+    toplam_maliyet_pct = max(0.0, SIM_FEE_RATE_PCT) * 2.0 + max(0.0, SIM_SLIPPAGE_PCT) + max(0.0, SIM_FUNDING_COST_PCT)
+    return round(toplam_maliyet_pct / risk_pct, 6)
 
 
 def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
@@ -548,12 +655,18 @@ def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
             payload[f"_hit{idx}"] = bool(pos.get(f"hit{idx}"))
         if "_ozellikler" not in payload:
             payload["_ozellikler"] = pozisyon_ozellikleri(pos)
+        cost_r = simulasyon_maliyet_r(pos) if durum != "ACIK" else 0.0
+        net_r = rv - cost_r if durum != "ACIK" else rv
         conn.execute("""
-            UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, mfe_pct=?, mae_pct=?, kapi_json=?
+            UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, net_r_value=?, cost_r=?,
+                mfe_pct=?, mae_pct=?, kapi_json=?, build=?, config_hash=?
             WHERE uid=?
-        """, (durum, close_ts, rv, safe_float(pos.get("mfe_pct")),
+        """, (durum, close_ts, rv, net_r, cost_r, safe_float(pos.get("mfe_pct")),
               safe_float(pos.get("mae_pct")), json.dumps(payload, ensure_ascii=False, sort_keys=True),
-              v107_pos_uid(pos)))
+              BOT_BUILD, config_fingerprint(), v107_pos_uid(pos)))
+    if durum != "ACIK":
+        audit_yaz("POSITION_CLOSE", v107_pos_uid(pos), pos.get("symbol", ""),
+                  {"outcome": durum, "gross_r": rv, "net_r": net_r, "cost_r": cost_r})
 
 
 def sonuc_tipi_belirle(outcome: str, kaynak: Dict[str, Any]) -> str:
@@ -583,11 +696,11 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         return []
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         rows = conn.execute("""
-            SELECT uid,side,kontrol,durum,r_value,mfe_pct,sonuc_tipi,kapi_json
+            SELECT uid,side,kontrol,durum,r_value,mfe_pct,mae_pct,sonuc_tipi,kapi_json
             FROM olcum_pozisyon
         """).fetchall()
     sonuc = []
-    for uid, side, kontrol, durum, r_value, mfe_pct, sonuc_tipi, raw_json in rows:
+    for uid, side, kontrol, durum, r_value, mfe_pct, mae_pct, sonuc_tipi, raw_json in rows:
         try:
             payload = json.loads(raw_json or "{}")
         except Exception:
@@ -598,6 +711,7 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         kapilar = {ad: payload.get(ad) for ad in OLCUM_KAPILARI if payload.get(ad) in ("gecti", "kesti")}
         sonuc.append({"uid": uid, "side": side, "kontrol": int(kontrol or 0),
                       "durum": durum, "r_value": safe_float(r_value), "mfe_pct": safe_float(mfe_pct),
+                      "mae_pct": safe_float(mae_pct),
                       "sonuc_tipi": sonuc_tipi,
                       "hit1": bool(payload.get("_hit1")), "hit2": bool(payload.get("_hit2")),
                       "hit3": bool(payload.get("_hit3")), "hit4": bool(payload.get("_hit4")),
@@ -610,12 +724,30 @@ def olcum_db_golge_baslat(pos: Dict[str, Any]) -> None:
     if not GOLGE_IZLEME or not os.path.exists(OLCUM_DB):
         return
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        stop_neden = {
+            "symbol": pos.get("symbol"), "side": pos.get("side"),
+            "entry": pos.get("entry"), "stop": pos.get("orig_stop"),
+            "score": pos.get("score"), "event": pos.get("event"),
+            "trend_1h": pos.get("trend_1h"), "trend_4h": pos.get("trend_4h"),
+            "btc_1h": pos.get("btc_1h"), "btc_4h": pos.get("btc_4h"),
+            "coin_1h_ema": pos.get("coin_1h_ema"), "rsi": pos.get("rsi"),
+            "adx": pos.get("adx"), "vwm": pos.get("vwm"),
+            "oi_pct": pos.get("oi_change_pct"), "fomo_pct": pos.get("fomo_move_pct"),
+            "obimb": pos.get("ob_imbalance"), "funding": pos.get("funding"),
+            "session": pos.get("session_name"), "piyasa_modu": pos.get("piyasa_modu"),
+            "balina_durum": pos.get("balina_durum"), "balina_guven": pos.get("balina_guven"),
+            "kapilar": pos.get("kapi_sonuclari", {}),
+            "mfe_stop_oncesi": pos.get("mfe_pct"), "mae_stop_oncesi": pos.get("mae_pct"),
+        }
         conn.execute("""
             UPDATE olcum_pozisyon
             SET golge_durum='IZLENIYOR', golge_tp=0, golge_mfe_pct=0,
-                golge_mae_pct=0, golge_tp1_dk=NULL, golge_bitis_ts=NULL
+                golge_mae_pct=0, golge_tp1_dk=NULL, golge_tp2_dk=NULL,
+                golge_tp3_dk=NULL, golge_tp4_dk=NULL, golge_bitis_ts=NULL,
+                stop_neden_json=?
             WHERE uid=?
-        """, (v107_pos_uid(pos),))
+        """, (json.dumps(stop_neden, ensure_ascii=False, sort_keys=True), v107_pos_uid(pos)))
+    audit_yaz("SHADOW_START", v107_pos_uid(pos), pos.get("symbol", ""), stop_neden)
 
 
 def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool = False) -> None:
@@ -627,11 +759,16 @@ def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool = False) -> None:
         conn.execute("""
             UPDATE olcum_pozisyon
             SET golge_durum=?, golge_tp=?, golge_mfe_pct=?, golge_mae_pct=?,
-                golge_tp1_dk=?, golge_bitis_ts=?
+                golge_tp1_dk=?, golge_tp2_dk=?, golge_tp3_dk=?, golge_tp4_dk=?, golge_bitis_ts=?
             WHERE uid=?
         """, (durum, int(golge.get("golge_tp", 0)), safe_float(golge.get("golge_mfe_pct")),
-              safe_float(golge.get("golge_mae_pct")), golge.get("golge_tp1_dk"), bitis_ts,
+              safe_float(golge.get("golge_mae_pct")), golge.get("golge_tp1_dk"),
+              golge.get("golge_tp2_dk"), golge.get("golge_tp3_dk"), golge.get("golge_tp4_dk"), bitis_ts,
               str(golge.get("uid", ""))))
+    if bitti:
+        audit_yaz("SHADOW_FINISH", str(golge.get("uid", "")), str(golge.get("symbol", "")),
+                  {"tp": golge.get("golge_tp"), "mfe": golge.get("golge_mfe_pct"),
+                   "mae": golge.get("golge_mae_pct")})
 
 
 def olcum_db_tp_satirlari() -> List[Tuple[Any, ...]]:
@@ -1616,6 +1753,7 @@ def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
                 "whales": deque(maxlen=2000),
                 "books": {"bids": {}, "asks": {}},
                 "walls": {}, "spoofs": deque(maxlen=200),
+                "trade_ids": deque(), "trade_id_set": set(),
                 "last_price": 0.0, "last_ts": 0.0,
                 "first_ts": 0.0, "last_book_ts": 0.0, "snapshot": {},
             }
@@ -1626,6 +1764,7 @@ def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
 def balina_db_init() -> None:
     if not BALINA_MOTOR_ENABLED:
         return
+    os.makedirs(os.path.dirname(os.path.abspath(BALINA_DB)), exist_ok=True)
     with sqlite3.connect(BALINA_DB, timeout=10) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
@@ -1701,6 +1840,15 @@ def _balina_process_trade(row: Dict[str, Any]) -> None:
     value = _balina_contract_value(symbol, price, size)
     state = _balina_symbol_state(symbol)
     with _BALINA_LOCK:
+        trade_id = str(row.get("tradeId") or f"{row.get('ts')}:{side}:{price:.12g}:{size:.12g}")
+        if trade_id in state["trade_id_set"]:
+            stats["balina_duplicate_trade"] = int(stats.get("balina_duplicate_trade", 0)) + 1
+            return
+        if len(state["trade_ids"]) >= 5000:
+            eski_id = state["trade_ids"].popleft()
+            state["trade_id_set"].discard(eski_id)
+        state["trade_ids"].append(trade_id)
+        state["trade_id_set"].add(trade_id)
         trade = {"ts": now_ts, "side": side, "price": price, "size": size, "value": value}
         state["trades"].append(trade)
         state["last_price"] = price
@@ -1743,6 +1891,10 @@ def _balina_process_book(row: Dict[str, Any]) -> None:
     asks = [(safe_float(x[0]), safe_float(x[1])) for x in row.get("asks", [])[:depth]
             if len(x) >= 2 and safe_float(x[0]) > 0]
     with _BALINA_LOCK:
+        if ts < safe_float(state.get("last_book_ts")):
+            stats["balina_out_of_order_book"] = int(stats.get("balina_out_of_order_book", 0)) + 1
+            return
+        state["last_book_ts"] = ts
         previous_keys = set(state["walls"])
         active_keys = set()
         for book_side, levels in (("bids", bids), ("asks", asks)):
@@ -3273,7 +3425,7 @@ def build_v10_message(sig):
 
     signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
     return (f"{signal_no_line}{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V11.5.3 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V12.0 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -3302,7 +3454,7 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V11.5.3 — POZİSYON KAPANDI\n"
+        f"🆕 V12.0 — POZİSYON KAPANDI\n"
         + (f"🆔 Sinyal #{int(safe_float(pos.get('signal_no')))}\n" if pos.get("signal_no") else "") +
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
@@ -3406,19 +3558,24 @@ def v107_check_paper_bar(pos, hi, lo):
     side = pos["side"]
     stop_lv = safe_float(pos["orig_stop"])
     if side == "LONG":
-        if lo <= stop_lv:
-            return round(_paper_realized_r(pos, True), 3), "STOP"
+        stop_hit = lo <= stop_lv
         reached = lambda level: hi >= safe_float(pos[level])
     else:
-        if hi >= stop_lv:
-            return round(_paper_realized_r(pos, True), 3), "STOP"
+        stop_hit = hi >= stop_lv
         reached = lambda level: lo <= safe_float(pos[level])
+    ayni_mum_tp = any(not pos.get(f"hit{idx}") and reached(f"tp{idx}") for idx in range(1, 5))
+    if stop_hit and ayni_mum_tp:
+        stats["paper_ambiguous_bar"] = int(stats.get("paper_ambiguous_bar", 0)) + 1
+    if stop_hit and SIM_AMBIGUOUS_BAR_POLICY != "TP_FIRST":
+        return round(_paper_realized_r(pos, True), 3), "STOP"
     for idx in range(1, 5):
         if not pos.get(f"hit{idx}") and reached(f"tp{idx}"):
             pos[f"hit{idx}"] = True
             pos.setdefault("pending_hits", []).append(idx)
     if pos.get("hit4"):
         return round(_paper_realized_r(pos, False), 3), "TP4"
+    if stop_hit:
+        return round(_paper_realized_r(pos, True), 3), "STOP"
     return None, None
 
 
@@ -3471,6 +3628,71 @@ def v10_cooldown_ok(symbol):
     return time.time() - v10_last_alert.get(symbol, 0) >= V10_ALERT_COOLDOWN_MIN * 60
 
 
+def risk_durumu() -> Dict[str, Any]:
+    mp = _v10_mem()
+    simdi = time.time()
+    gun_r = hafta_r = 0.0
+    ardisik_stop = 0
+    kapanan = []
+    if os.path.exists(OLCUM_DB):
+        try:
+            with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+                kapanan = conn.execute(
+                    "SELECT close_ts,COALESCE(net_r_value,r_value),sonuc_tipi "
+                    "FROM olcum_pozisyon WHERE durum!='ACIK' ORDER BY close_ts DESC"
+                ).fetchall()
+        except Exception:
+            kapanan = []
+    gun_r = sum(safe_float(r[1]) for r in kapanan if simdi - safe_float(r[0]) <= 86400)
+    hafta_r = sum(safe_float(r[1]) for r in kapanan if simdi - safe_float(r[0]) <= 7 * 86400)
+    for _ts, _r, sonuc in kapanan:
+        if sonuc == "TEMIZ_STOP":
+            ardisik_stop += 1
+        else:
+            break
+    side_counts = {side: sum(1 for p in mp.get("open", []) if p.get("side") == side)
+                   for side in ("LONG", "SHORT")}
+    return {"daily_r": gun_r, "weekly_r": hafta_r, "consecutive_stops": ardisik_stop,
+            "open": len(mp.get("open", [])), "side_counts": side_counts,
+            "kill_switch": bool(RISK_KILL_SWITCH or _RUNTIME_HEALTH.get("emergency_stop"))}
+
+
+def risk_sinyal_uygun(symbol: str, side: str) -> Tuple[bool, str]:
+    durum = risk_durumu()
+    if durum["kill_switch"]:
+        return False, "acil durdurma aktif"
+    if not RISK_ENGINE_ENABLED:
+        return True, "kapalı"
+    if durum["daily_r"] <= -abs(RISK_MAX_DAILY_R):
+        return False, f"günlük zarar limiti ({durum['daily_r']:+.2f}R)"
+    if durum["weekly_r"] <= -abs(RISK_MAX_WEEKLY_R):
+        return False, f"haftalık zarar limiti ({durum['weekly_r']:+.2f}R)"
+    if durum["consecutive_stops"] >= RISK_MAX_CONSECUTIVE_STOPS:
+        return False, f"ardışık temiz stop ({durum['consecutive_stops']})"
+    if durum["open"] >= RISK_MAX_TOTAL_OPEN:
+        return False, f"toplam açık sınırı ({durum['open']})"
+    if durum["side_counts"].get(side, 0) >= RISK_MAX_SAME_SIDE:
+        return False, f"{side} açık sınırı"
+    grup = korelasyon_grubu(symbol)
+    grup_sayi = sum(1 for p in _v10_mem().get("open", [])
+                     if korelasyon_grubu(p.get("symbol", "")) == grup)
+    if grup_sayi >= RISK_MAX_GROUP:
+        return False, f"{grup} grup riski ({grup_sayi})"
+    return True, "uygun"
+
+
+def veri_kalitesi_uygun(sig: Dict[str, Any]) -> Tuple[bool, str]:
+    if not DATA_QUALITY_BLOCK_ENABLED:
+        return True, "ölçüm"
+    if BALINA_MOTOR_ENABLED:
+        akis = sig.get("balina_akis") or {}
+        if akis.get("status") != "CANLI":
+            return False, "balina verisi canlı değil"
+        if safe_float(akis.get("last_data_age_sec"), 9999.0) > DATA_MAX_AGE_SEC:
+            return False, "balina verisi eski"
+    return True, "uygun"
+
+
 async def maybe_send_v10_signal(sig):
     if not sig:
         return
@@ -3491,6 +3713,17 @@ async def maybe_send_v10_signal(sig):
         return
     if V107_ACIKKEN_ENGELLE and any(p.get("symbol") == symbol for p in mp["open"]):
         stats["v107_red_acik_poz"] = int(stats.get("v107_red_acik_poz", 0)) + 1
+        return
+
+    risk_ok, risk_not = risk_sinyal_uygun(symbol, side)
+    if not risk_ok:
+        stats["risk_reject"] = int(stats.get("risk_reject", 0)) + 1
+        audit_yaz("RISK_REJECT", symbol=symbol, payload={"side": side, "reason": risk_not})
+        return
+    veri_ok, veri_not = veri_kalitesi_uygun(sig)
+    if not veri_ok:
+        stats["data_quality_reject"] = int(stats.get("data_quality_reject", 0)) + 1
+        audit_yaz("DATA_REJECT", symbol=symbol, payload={"side": side, "reason": veri_not})
         return
 
     balina_signal_ekle(sig)
@@ -3528,14 +3761,15 @@ async def maybe_send_v10_signal(sig):
         v10_sent_candle[ckey] = sig["candle_ts"]
         v10_open_paper(sig)
         stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
-        stats["last_signal"] = f"V11.5 {side} {symbol} skor {sig['score']}"
-        logger.info("V11.5 SİNYAL %s %s skor=%s session=%s adx=%.1f",
+        stats["last_signal"] = f"V12.0 {side} {symbol} skor {sig['score']}"
+        logger.info("V12.0 SİNYAL %s %s skor=%s session=%s adx=%.1f",
                     side, symbol, sig["score"], sig.get("session_name"), sig.get("adx", 0))
 
 
 async def v10_scan_loop() -> None:
     await asyncio.sleep(4)
     while True:
+        _RUNTIME_HEALTH["scan_heartbeat"] = time.time()
         try:
             if not COINS:
                 await refresh_coin_pool(force=True)
@@ -3561,6 +3795,7 @@ async def v10_scan_loop() -> None:
 async def v10_paper_loop() -> None:
     await asyncio.sleep(12)
     while True:
+        _RUNTIME_HEALTH["paper_heartbeat"] = time.time()
         try:
             mp = _v10_mem()
             kapananlar = set()
@@ -3612,6 +3847,8 @@ async def v10_paper_loop() -> None:
                         "kontrol": bool(pos.get("kontrol")),
                         "golge_tp": 0, "golge_mfe_pct": 0.0,
                         "golge_mae_pct": 0.0, "golge_tp1_dk": None,
+                        "golge_tp2_dk": None, "golge_tp3_dk": None,
+                        "golge_tp4_dk": None,
                     }
                     mp["golge"].append(golge)
                     olcum_db_golge_baslat(pos)
@@ -3651,8 +3888,9 @@ def golge_kaydi_guncelle(golge: Dict[str, Any], barlar: List[List[Any]]) -> None
         ilk_bar = next((r for r in yeni_barlar if degdi(r, seviye)), None)
         if ilk_bar is not None:
             golge["golge_tp"] = max(int(golge.get("golge_tp", 0)), idx)
-            if idx == 1 and golge.get("golge_tp1_dk") is None:
-                golge["golge_tp1_dk"] = round(
+            zaman_anahtari = f"golge_tp{idx}_dk"
+            if golge.get(zaman_anahtari) is None:
+                golge[zaman_anahtari] = round(
                     max(0.0, (safe_float(ilk_bar[0]) / 1000.0 - safe_float(golge.get("stop_ts"))) / 60.0), 3
                 )
     golge["scan_ts"] = max(safe_float(r[0]) for r in yeni_barlar)
@@ -3661,6 +3899,7 @@ def golge_kaydi_guncelle(golge: Dict[str, Any], barlar: List[List[Any]]) -> None
 async def golge_loop() -> None:
     await asyncio.sleep(15)
     while True:
+        _RUNTIME_HEALTH["shadow_heartbeat"] = time.time()
         try:
             if GOLGE_IZLEME:
                 mp = _v10_mem()
@@ -3690,9 +3929,121 @@ async def save_loop() -> None:
     while True:
         try:
             await save_memory_async()
+            _RUNTIME_HEALTH["save_heartbeat"] = time.time()
         except Exception:
             pass
         await asyncio.sleep(max(20, MEMORY_SAVE_INTERVAL_SEC))
+
+
+def db_integrity_kontrol() -> Tuple[bool, str]:
+    sonuclar = []
+    for yol in (OLCUM_DB, BALINA_DB if BALINA_MOTOR_ENABLED else ""):
+        if not yol or not os.path.exists(yol):
+            continue
+        try:
+            with sqlite3.connect(yol, timeout=10) as conn:
+                sonuc = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+            sonuclar.append(f"{os.path.basename(yol)}:{sonuc}")
+            if sonuc.lower() != "ok":
+                return False, " | ".join(sonuclar)
+        except Exception as e:
+            return False, f"{os.path.basename(yol)}:{e}"
+    return True, " | ".join(sonuclar) if sonuclar else "veritabanı yok"
+
+
+def db_yedekle() -> List[str]:
+    if not DB_BACKUP_ENABLED:
+        return []
+    os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+    damga = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    uretilen = []
+    for kaynak in (OLCUM_DB, BALINA_DB if BALINA_MOTOR_ENABLED else ""):
+        if not kaynak or not os.path.exists(kaynak):
+            continue
+        hedef = os.path.join(DB_BACKUP_DIR, f"{os.path.basename(kaynak)}.{damga}.bak")
+        with sqlite3.connect(kaynak, timeout=20) as src, sqlite3.connect(hedef, timeout=20) as dst:
+            src.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            src.backup(dst)
+        uretilen.append(hedef)
+    if os.path.exists(MEMORY_FILE):
+        hedef = os.path.join(DB_BACKUP_DIR, f"{os.path.basename(MEMORY_FILE)}.{damga}.bak")
+        shutil.copy2(MEMORY_FILE, hedef)
+        uretilen.append(hedef)
+    dosyalar = sorted(
+        (os.path.join(DB_BACKUP_DIR, x) for x in os.listdir(DB_BACKUP_DIR) if x.endswith(".bak")),
+        key=lambda x: os.path.getmtime(x), reverse=True,
+    )
+    for eski in dosyalar[max(1, DB_BACKUP_KEEP):]:
+        try:
+            os.remove(eski)
+        except OSError:
+            pass
+    return uretilen
+
+
+def health_raporu_uret() -> str:
+    now = time.time()
+    risk = risk_durumu()
+    disk_yol = os.path.abspath(os.path.dirname(OLCUM_DB) or ".")
+    try:
+        disk = shutil.disk_usage(disk_yol)
+        disk_free = disk.free / (1024 ** 3)
+    except Exception:
+        disk_free = 0.0
+    ws_age = now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"))
+    return (
+        "🏥 V12.0 SİSTEM SAĞLIĞI\n"
+        f"Çalışma süresi: {(now-safe_float(_RUNTIME_HEALTH.get('started_ts')))/3600:.1f} saat\n"
+        f"Tarama yaşı: {now-safe_float(_RUNTIME_HEALTH.get('scan_heartbeat')):.1f} sn\n"
+        f"Paper takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('paper_heartbeat')):.1f} sn\n"
+        f"Gölge takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('shadow_heartbeat')):.1f} sn\n"
+        f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK'} | veri yaşı {ws_age:.1f} sn\n"
+        f"DB integrity: {_RUNTIME_HEALTH.get('db_integrity')}\n"
+        f"Son yedek yaşı: {(now-safe_float(_RUNTIME_HEALTH.get('last_backup_ts')))/3600:.1f} saat\n"
+        f"Boş disk: {disk_free:.2f} GB\n"
+        f"Risk: günlük {risk['daily_r']:+.2f}R | haftalık {risk['weekly_r']:+.2f}R | "
+        f"ardışık stop {risk['consecutive_stops']} | açık {risk['open']}\n"
+        f"Acil durdurma: {'AKTİF' if risk['kill_switch'] else 'kapalı'} | "
+        f"Risk motoru: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}"
+    )
+
+
+async def kurumsal_bakim_loop() -> None:
+    await asyncio.sleep(20)
+    while True:
+        now = time.time()
+        try:
+            if now - safe_float(_RUNTIME_HEALTH.get("last_integrity_ts")) >= DB_INTEGRITY_INTERVAL_SEC:
+                ok, detay = await asyncio.to_thread(db_integrity_kontrol)
+                _RUNTIME_HEALTH["last_integrity_ts"] = now
+                _RUNTIME_HEALTH["db_integrity"] = "OK" if ok else detay
+                if not ok:
+                    stats["db_integrity_fail"] = int(stats.get("db_integrity_fail", 0)) + 1
+            if DB_BACKUP_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_backup_ts")) >= DB_BACKUP_INTERVAL_SEC:
+                try:
+                    await asyncio.to_thread(db_yedekle)
+                    _RUNTIME_HEALTH["last_backup_ts"] = now
+                    stats["backup_success"] = int(stats.get("backup_success", 0)) + 1
+                except Exception as e:
+                    stats["backup_fail"] = int(stats.get("backup_fail", 0)) + 1
+                    logger.exception("DB yedekleme hatası: %s", e)
+            sorunlar = []
+            if now - safe_float(_RUNTIME_HEALTH.get("scan_heartbeat")) > SCAN_STALE_SEC:
+                sorunlar.append("tarama döngüsü gecikti")
+            if now - safe_float(_RUNTIME_HEALTH.get("paper_heartbeat")) > PAPER_STALE_SEC:
+                sorunlar.append("paper takip döngüsü gecikti")
+            if BALINA_MOTOR_ENABLED and (_BALINA_WS_STATUS.get("connected") and
+                    now - safe_float(_BALINA_WS_STATUS.get("last_message_ts")) > DATA_MAX_AGE_SEC):
+                sorunlar.append("WebSocket verisi eski")
+            if _RUNTIME_HEALTH.get("db_integrity") != "OK":
+                sorunlar.append("DB integrity başarısız")
+            if sorunlar and HEALTH_ALERT_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_health_alert_ts")) >= HEALTH_ALERT_COOLDOWN_SEC:
+                _RUNTIME_HEALTH["last_health_alert_ts"] = now
+                stats["health_alert"] = int(stats.get("health_alert", 0)) + 1
+                await safe_send_telegram("🚨 V12.0 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
+        except Exception as e:
+            logger.exception("kurumsal_bakim_loop hata: %s", e)
+        await asyncio.sleep(max(15, HEALTH_CHECK_INTERVAL_SEC))
 
 
 def kapi_raporu_uret() -> str:
@@ -3921,8 +4272,250 @@ def ortak_rapor_uret(ters: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _kombinasyon_kosullari(rec: Dict[str, Any]) -> Dict[str, bool]:
+    oz = rec.get("ozellikler") or {}
+    kapilar = rec.get("kapilar") or {}
+    return {
+        "oi": safe_float(oz.get("oi_pct")) > 1.0,
+        "coin_ema": kapilar.get("coin_1h_ema") == "gecti",
+        "range": kapilar.get("range") == "gecti",
+        "kapanis": str(oz.get("giris_tipi") or "").lower() == "kapanis",
+        "spoof": kapilar.get("spoof") == "gecti",
+    }
+
+
+def _kombinasyon_metrik(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    kapanan = [r for r in rows if r.get("durum") != "ACIK"]
+    toplam = len(rows)
+    kap_n = len(kapanan)
+    temiz = sum(1 for r in kapanan if r.get("sonuc_tipi") == "TEMIZ_STOP")
+    return {
+        "toplam": toplam,
+        "kapanan": kap_n,
+        "temiz_pct": temiz / kap_n * 100.0 if kap_n else 0.0,
+        "tp1_pct": sum(1 for r in rows if r.get("hit1")) / toplam * 100.0 if toplam else 0.0,
+        "tp2_pct": sum(1 for r in rows if r.get("hit2")) / toplam * 100.0 if toplam else 0.0,
+        "tp3_pct": sum(1 for r in rows if r.get("hit3")) / toplam * 100.0 if toplam else 0.0,
+        "tp4_pct": sum(1 for r in rows if r.get("hit4")) / toplam * 100.0 if toplam else 0.0,
+        "r": avg([safe_float(r.get("r_value")) for r in kapanan]),
+        "mfe": avg([safe_float(r.get("mfe_pct")) for r in rows]),
+        "mae": avg([safe_float(r.get("mae_pct")) for r in rows]),
+    }
+
+
+def _kombinasyon_metrik_satiri(ad: str, m: Dict[str, float]) -> str:
+    return (
+        f"{ad}: toplam {int(m['toplam'])} | kapanan {int(m['kapanan'])} | "
+        f"temiz stop %{m['temiz_pct']:.1f} | TP %{m['tp1_pct']:.1f}/"
+        f"%{m['tp2_pct']:.1f}/%{m['tp3_pct']:.1f}/%{m['tp4_pct']:.1f} | "
+        f"Ort.R {m['r']:+.3f} | MFE/MAE %{m['mfe']:.3f}/%{m['mae']:.3f}"
+    )
+
+
+def kombinasyon_raporu_uret() -> str:
+    rows = olcum_db_ortak_satirlari()
+    if not rows:
+        return "🧪 KOMBİNASYON LABORATUVARI\nHenüz ölçüm kaydı yok."
+
+    kombinasyonlar = (
+        ("OI > %1", ("oi",)),
+        ("Coin EMA uyumlu", ("coin_ema",)),
+        ("RANGE geçti", ("range",)),
+        ("Giriş kapanış", ("kapanis",)),
+        ("Spoof geçti", ("spoof",)),
+        ("OI + Coin EMA", ("oi", "coin_ema")),
+        ("OI + kapanış", ("oi", "kapanis")),
+        ("OI + Coin EMA + RANGE", ("oi", "coin_ema", "range")),
+        ("Beş şart", ("oi", "coin_ema", "range", "kapanis", "spoof")),
+    )
+    lines = [
+        f"🧪 KOMBİNASYON LABORATUVARI | Min kapanan hücre: {KOMBINASYON_MIN_KAPANIS}",
+        "TP oranları ve MFE/MAE açık+kapalı toplamdan; temiz stop ve Ort.R kapananlardan.",
+        "Bu rapor yalnız ölçer; hiçbir koşul sinyal kesmez.",
+    ]
+    for kontrol, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
+        grup = [r for r in rows if int(r.get("kontrol", 0)) == kontrol]
+        for yon in ("TÜM", "LONG", "SHORT"):
+            taban = grup if yon == "TÜM" else [r for r in grup if str(r.get("side")) == yon]
+            lines.append(f"\n{grup_adi} / {yon} | n={len(taban)}")
+            for ad, anahtarlar in kombinasyonlar:
+                gecen = [r for r in taban if all(_kombinasyon_kosullari(r)[k] for k in anahtarlar)]
+                kalan = [r for r in taban if r not in gecen]
+                mg = _kombinasyon_metrik(gecen)
+                mk = _kombinasyon_metrik(kalan)
+                lines.append(f"\n• {ad}")
+                lines.append("  " + _kombinasyon_metrik_satiri("Geçen", mg))
+                lines.append("  " + _kombinasyon_metrik_satiri("Geçmeyen", mk))
+                lines.append(
+                    f"  Fark: Δtemiz stop {mg['temiz_pct']-mk['temiz_pct']:+.1f} puan | "
+                    f"ΔTP1 {mg['tp1_pct']-mk['tp1_pct']:+.1f} puan | "
+                    f"ΔR {mg['r']-mk['r']:+.3f} | ΔMFE %{mg['mfe']-mk['mfe']:+.3f} | "
+                    f"ΔMAE %{mg['mae']-mk['mae']:+.3f}"
+                )
+                if mg["kapanan"] < KOMBINASYON_MIN_KAPANIS or mk["kapanan"] < KOMBINASYON_MIN_KAPANIS:
+                    lines.append(
+                        f"  KARAR YOK: kapanan geçen={int(mg['kapanan'])}, "
+                        f"geçmeyen={int(mk['kapanan'])}"
+                    )
+                else:
+                    lines.append("  ÖLÇÜLEBİLİR: iki hücre de minimum kapanış sayısına ulaştı")
+
+        lines.append(f"\n{grup_adi} / BALİNA DURUMU + YÖN")
+        durumlar = sorted({str((r.get("ozellikler") or {}).get("balina_durum") or "OLCUMSUZ")
+                           for r in grup})
+        for yon in ("LONG", "SHORT"):
+            yon_rows = [r for r in grup if str(r.get("side")) == yon]
+            for durum in durumlar:
+                gecen = [r for r in yon_rows
+                          if str((r.get("ozellikler") or {}).get("balina_durum") or "OLCUMSUZ") == durum]
+                if not gecen:
+                    continue
+                kalan = [r for r in yon_rows if r not in gecen]
+                mg = _kombinasyon_metrik(gecen)
+                mk = _kombinasyon_metrik(kalan)
+                lines.append("\n• " + durum + " / " + yon)
+                lines.append("  " + _kombinasyon_metrik_satiri("Durum", mg))
+                lines.append("  " + _kombinasyon_metrik_satiri("Diğer durumlar", mk))
+                lines.append(
+                    f"  Fark: Δtemiz stop {mg['temiz_pct']-mk['temiz_pct']:+.1f} puan | "
+                    f"ΔTP1 {mg['tp1_pct']-mk['tp1_pct']:+.1f} puan | "
+                    f"ΔR {mg['r']-mk['r']:+.3f} | ΔMFE %{mg['mfe']-mk['mfe']:+.3f} | "
+                    f"ΔMAE %{mg['mae']-mk['mae']:+.3f}"
+                )
+                if mg["kapanan"] < KOMBINASYON_MIN_KAPANIS or mk["kapanan"] < KOMBINASYON_MIN_KAPANIS:
+                    lines.append(
+                        f"  KARAR YOK: kapanan durum={int(mg['kapanan'])}, "
+                        f"diğer={int(mk['kapanan'])}"
+                    )
+                else:
+                    lines.append("  ÖLÇÜLEBİLİR: iki hücre de minimum kapanış sayısına ulaştı")
+    return "\n".join(lines)
+
+
+def dogrulama_raporu_uret() -> str:
+    if not os.path.exists(OLCUM_DB):
+        return "📐 V12.0 DOĞRULAMA\nKayıt yok."
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        rows = conn.execute(
+            "SELECT side,kontrol,open_ts,close_ts,r_value,COALESCE(net_r_value,r_value),"
+            "mfe_pct,mae_pct,kapi_json FROM olcum_pozisyon "
+            "WHERE durum!='ACIK' ORDER BY open_ts"
+        ).fetchall()
+    lines = [
+        "📐 V12.0 İLERİ DOĞRULAMA",
+        f"Maliyet: çift yön komisyon %{SIM_FEE_RATE_PCT*2:.3f} + kayma %{SIM_SLIPPAGE_PCT:.3f} "
+        f"+ funding %{SIM_FUNDING_COST_PCT:.3f}",
+        f"Minimum kapanış: {VALIDATION_MIN_CLOSED}",
+    ]
+    for kontrol, grup_ad in ((0, "NORMAL"), (1, "KONTROL")):
+        grup = [r for r in rows if int(r[1] or 0) == kontrol]
+        kesim = int(len(grup) * 0.70)
+        donemler = (("Geliştirme %70", grup[:kesim]), ("İleri doğrulama %30", grup[kesim:]))
+        lines.append(f"\n{grup_ad} | kapanan={len(grup)}")
+        for ad, veri in donemler:
+            gross = avg([safe_float(r[4]) for r in veri])
+            net = avg([safe_float(r[5]) for r in veri])
+            karar = "ölçülebilir" if len(veri) >= VALIDATION_MIN_CLOSED else "karar yok"
+            lines.append(f"{ad}: n={len(veri)} | Brüt EV {gross:+.3f}R | Net EV {net:+.3f}R | {karar}")
+        for side in ("LONG", "SHORT"):
+            veri = [r for r in grup if r[0] == side]
+            lines.append(
+                f"{side}: n={len(veri)} | Net EV {avg([safe_float(r[5]) for r in veri]):+.3f}R | "
+                f"MFE/MAE %{avg([safe_float(r[6]) for r in veri]):.3f}/%{avg([safe_float(r[7]) for r in veri]):.3f}"
+            )
+        rejimler: Dict[str, List[Tuple[Any, ...]]] = defaultdict(list)
+        for r in grup:
+            try:
+                payload = json.loads(r[8] or "{}")
+                rejim = str((payload.get("_ozellikler") or {}).get("piyasa_modu") or "OLCUMSUZ")
+            except Exception:
+                rejim = "OLCUMSUZ"
+            rejimler[rejim].append(r)
+        for rejim, veri in sorted(rejimler.items(), key=lambda x: (-len(x[1]), x[0])):
+            lines.append(f"Rejim {rejim}: n={len(veri)} | Net EV {avg([safe_float(r[5]) for r in veri]):+.3f}R")
+    lines.append("\n⚠️ İleri doğrulama bölümü minimum örneğe ulaşmadan kapı kararı verilmez.")
+    return "\n".join(lines)
+
+
+def golge_neden_raporu_uret() -> str:
+    if not os.path.exists(OLCUM_DB):
+        return "👻 STOP SONRASI ANALİZ\nKayıt yok."
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        rows = conn.execute(
+            "SELECT kontrol,golge_durum,COALESCE(golge_tp,0),golge_mfe_pct,golge_mae_pct,"
+            "golge_tp1_dk,golge_tp2_dk,golge_tp3_dk,golge_tp4_dk,stop_neden_json "
+            "FROM olcum_pozisyon WHERE sonuc_tipi IN ('TEMIZ_STOP','TP1_STOP','TP2_STOP','TP3_STOP')"
+        ).fetchall()
+    lines = ["👻 STOP SONRASI TP VE NEDEN ANALİZİ", f"İzleme: {GOLGE_SAAT:g} saat | TF {GOLGE_TF}"]
+    for kontrol, grup_ad in ((0, "NORMAL"), (1, "KONTROL")):
+        grup = [r for r in rows if int(r[0] or 0) == kontrol]
+        biten = [r for r in grup if r[1] == "BITTI"]
+        lines.append(f"\n{grup_ad}: stop={len(grup)} | biten={len(biten)} | izleniyor={len(grup)-len(biten)}")
+        for idx in range(1, 5):
+            ulasan = [r for r in grup if int(r[2] or 0) >= idx]
+            sureler = [safe_float(r[4 + idx]) for r in ulasan if r[4 + idx] is not None]
+            lines.append(
+                f"Stop sonrası TP{idx}: {len(ulasan)} (%{len(ulasan)/len(grup)*100 if grup else 0:.1f}) | "
+                f"medyan süre {yuzdelik(sureler, 0.5):.1f} dk"
+            )
+        lines.append(
+            f"Gölge MFE/MAE ort: %{avg([safe_float(r[3]) for r in grup]):.3f}/"
+            f"%{avg([safe_float(r[4]) for r in grup]):.3f}"
+        )
+        kurtulan = [r for r in grup if int(r[2] or 0) >= 1]
+        kurtulmayan = [r for r in biten if int(r[2] or 0) == 0]
+        alanlar = ("side", "event", "trend_1h", "trend_4h", "coin_1h_ema",
+                   "session", "piyasa_modu", "balina_durum")
+        farklar = []
+        def payload(row):
+            try:
+                return json.loads(row[9] or "{}")
+            except Exception:
+                return {}
+        for alan in alanlar:
+            degerler = {str(payload(r).get(alan)) for r in kurtulan + kurtulmayan if payload(r).get(alan) is not None}
+            for deger in degerler:
+                na = sum(1 for r in kurtulan if str(payload(r).get(alan)) == deger)
+                nb = sum(1 for r in kurtulmayan if str(payload(r).get(alan)) == deger)
+                pa = na / len(kurtulan) * 100 if kurtulan else 0.0
+                pb = nb / len(kurtulmayan) * 100 if kurtulmayan else 0.0
+                farklar.append((abs(pa-pb), alan, deger, na, nb, pa-pb))
+        lines.append("Stop sonrası TP1 gören / görmeyen en büyük özellik farkları:")
+        for _absf, alan, deger, na, nb, fark in sorted(farklar, reverse=True)[:8]:
+            lines.append(f"• {alan}={deger}: nTP={na} nYok={nb} | fark {fark:+.1f} puan")
+    lines.append("\nBu bölüm stop nedenini nedensel olarak kanıtlamaz; stop anı ile sonraki toparlanma farklarını kaydeder.")
+    return "\n".join(lines)
+
+
+def selftest_raporu_uret() -> str:
+    testler = []
+    def test(ad: str, kosul: bool) -> None:
+        testler.append((ad, bool(kosul)))
+    test("safe_float", safe_float("1.25") == 1.25 and safe_float("x") == 0.0)
+    test("yüzdelik", yuzdelik([1, 2, 3, 4], 0.5) == 2.5)
+    test("TP ağırlıkları", abs(sum(_tp_weights()) - 1.0) < 1e-9)
+    ornek = {"entry": 100, "orig_stop": 98}
+    test("maliyet R", simulasyon_maliyet_r(ornek) >= 0)
+    test("sembol", normalize_symbol("BTCUSDT") == "BTC-USDT-SWAP")
+    test("DB mevcut", os.path.exists(OLCUM_DB))
+    ok, detay = db_integrity_kontrol()
+    test("DB integrity", ok)
+    lines = ["🧪 V12.0 ÖZ TEST"]
+    lines.extend(f"{'✅' if sonuc else '❌'} {ad}" for ad, sonuc in testler)
+    lines.append(f"Sonuç: {sum(1 for _, x in testler if x)}/{len(testler)} geçti")
+    lines.append(f"DB: {detay}")
+    return "\n".join(lines)
+
+
 async def post_init(application) -> None:
     olcum_db_init()
+    now = time.time()
+    _RUNTIME_HEALTH.update({
+        "started_ts": now, "scan_heartbeat": now, "paper_heartbeat": now,
+        "shadow_heartbeat": now, "save_heartbeat": now,
+        "emergency_stop": bool(memory.get("emergency_stop", False)),
+    })
+    audit_yaz("BOT_START", payload={"python": platform.python_version(), "schema": DB_SCHEMA_VERSION})
     if BALINA_MOTOR_ENABLED:
         await asyncio.to_thread(balina_db_init)
     if OLCUM_MODU:
@@ -3977,8 +4570,15 @@ async def post_init(application) -> None:
         f"\n🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}"
         f"\n🐋 Kârlı durum kapısı: {'AKTİF' if (BALINA_KARLI_KAPI_ENABLED and BALINA_MOTOR_ENABLED) else 'kapalı'}"
         f" | OR: {', '.join(sorted(BALINA_KARLI_DURUMLAR))}"
+        f"\n🏢 Kurumsal izleme: {'AKTİF' if KURUMSAL_ENABLED else 'kapalı'}"
+        f" | Risk motoru: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}"
+        f"\n💾 DB şema: v{DB_SCHEMA_VERSION} | Yedek: {'AKTİF' if DB_BACKUP_ENABLED else 'kapalı'}"
+        f" | Config: {config_fingerprint()}"
     )
-    for _kur in (symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop):
+    temel_looplar = [symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop]
+    if KURUMSAL_ENABLED:
+        temel_looplar.append(kurumsal_bakim_loop)
+    for _kur in temel_looplar:
         asyncio.create_task(_kur(), name=_kur.__name__)
     if BALINA_MOTOR_ENABLED:
         asyncio.create_task(balina_db_loop(), name="balina_db_loop")
@@ -3992,6 +4592,12 @@ async def cmd_start(update, context):
         f"{VERSION_NAME} aktif.\n"
         "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
+        "/kombinasyon - koşul ve kombinasyon laboratuvarı\n"
+        "/dogrulama - ileri doğrulama ve net maliyet raporu\n"
+        "/golge - stop sonrası TP ve neden analizi\n"
+        "/health - sistem ve veri sağlığı\n/risk - portföy risk durumu\n"
+        "/durdur - yeni sinyalleri acil durdur\n/devam - sinyalleri yeniden aç\n"
+        "/selftest - dahili doğrulama testleri\n/backup - manuel DB yedeği\n"
         "/tportak - TP ortak özellikleri\n/stoportak - temiz stop ortak özellikleri\n"
         "/balina [COIN] - balina akış durumu\n/akis COIN - büyük işlemler\n"
         "/birikim - birikim adayları\n/dagitim - dağıtım adayları\n"
@@ -4011,6 +4617,14 @@ async def cmd_status(update, context):
     cl = mp["closed"]; n = len(cl)
     wins = sum(1 for x in cl if x["R"] > 0)
     ev = (sum(x["R"] for x in cl) / n) if n else 0
+    try:
+        with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+            net_values = [safe_float(x[0]) for x in conn.execute(
+                "SELECT COALESCE(net_r_value,r_value) FROM olcum_pozisyon WHERE durum!='ACIK'"
+            ).fetchall()]
+    except Exception:
+        net_values = []
+    net_ev = avg(net_values)
     tum_rows = olcum_db_ortak_satirlari()
     sonuc_rows = [r for r in tum_rows if r.get("durum") != "ACIK"]
     acik_rows = [r for r in tum_rows if r.get("durum") == "ACIK"]
@@ -4030,11 +4644,12 @@ async def cmd_status(update, context):
     acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
     acik_tpsiz = len(acik_rows) - acik_tp
     lines = [
-        f"📊 V11.5.3 ULTRA DURUM",
+        f"📊 V12.0 ULTRA DURUM",
         f"Saat: {tr_str()}",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
+        f"Maliyet sonrası Net EV: {net_ev:+.3f}R | Kayıt: {len(net_values)}",
         f"Tüm sinyallerde TP teması: TP1 {toplam_tp1} | TP2 {toplam_tp2} | TP3 {toplam_tp3} | TP4 {toplam_tp4}",
         f"Açık pozisyon: TP gören {acik_tp} | Henüz TP görmeyen {acik_tpsiz}",
         f"TP görmeden stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TEMIZ_STOP')}",
@@ -4065,6 +4680,8 @@ async def cmd_status(update, context):
         f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
         f"  OKX timeout: {stats.get('okx_timeout', 0)}",
         f"  Balina kârlı kapı reddi: {stats.get('balina_red_karli_kapi', 0)}",
+        f"🏢 Risk reddi: {stats.get('risk_reject', 0)} | Veri kalitesi reddi: {stats.get('data_quality_reject', 0)}",
+        f"💾 DB: {_RUNTIME_HEALTH.get('db_integrity')} | Yedek: {stats.get('backup_success', 0)} başarılı / {stats.get('backup_fail', 0)} hata",
         f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
         f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'YEDEK/KAPALI'} | "
         f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
@@ -4080,7 +4697,7 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V11.5.3 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için V12.0 sinyali yok.")
         return
     await update.message.reply_text(build_v10_message(res))
 
@@ -4089,7 +4706,7 @@ async def cmd_v10(update, context):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V11.5.3 ULTRA motor durumu",
+        f"🆕 V12.0 ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
@@ -4151,6 +4768,96 @@ async def cmd_stoportak(update, context):
     except Exception as e:
         logger.exception("/stoportak rapor hatası: %s", e)
         await update.message.reply_text("STOP ortak özellik raporu hazırlanamadı.")
+
+
+async def cmd_kombinasyon(update, context):
+    if not telegram_yetkili(update):
+        return
+    try:
+        rapor = await asyncio.to_thread(kombinasyon_raporu_uret)
+        for parca in telegram_parcala(rapor, 4000):
+            await update.message.reply_text(parca)
+    except Exception as e:
+        logger.exception("/kombinasyon rapor hatası: %s", e)
+        await update.message.reply_text("Kombinasyon raporu hazırlanamadı.")
+
+
+async def cmd_health(update, context):
+    if not telegram_yetkili(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(health_raporu_uret))
+
+
+async def cmd_risk(update, context):
+    if not telegram_yetkili(update):
+        return
+    d = await asyncio.to_thread(risk_durumu)
+    await update.message.reply_text(
+        "🛡 V12.0 RİSK MOTORU\n"
+        f"Motor: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}\n"
+        f"Acil durdurma: {'AKTİF' if d['kill_switch'] else 'kapalı'}\n"
+        f"Günlük: {d['daily_r']:+.2f}R / -{abs(RISK_MAX_DAILY_R):.2f}R\n"
+        f"Haftalık: {d['weekly_r']:+.2f}R / -{abs(RISK_MAX_WEEKLY_R):.2f}R\n"
+        f"Ardışık temiz stop: {d['consecutive_stops']}/{RISK_MAX_CONSECUTIVE_STOPS}\n"
+        f"Açık: {d['open']}/{RISK_MAX_TOTAL_OPEN} | LONG {d['side_counts']['LONG']} | SHORT {d['side_counts']['SHORT']}"
+    )
+
+
+async def cmd_durdur(update, context):
+    if not telegram_yetkili(update):
+        return
+    _RUNTIME_HEALTH["emergency_stop"] = True
+    memory["emergency_stop"] = True
+    audit_yaz("EMERGENCY_STOP", payload={"chat_id": str(update.effective_chat.id)})
+    await save_memory_async()
+    await update.message.reply_text("🛑 Yeni sinyal üretimi acil olarak durduruldu. Açık paper pozisyonlar izlenmeye devam ediyor.")
+
+
+async def cmd_devam(update, context):
+    if not telegram_yetkili(update):
+        return
+    if RISK_KILL_SWITCH:
+        await update.message.reply_text("RISK_KILL_SWITCH env aktif; Railway ayarından false yapılmadan devam edemez.")
+        return
+    _RUNTIME_HEALTH["emergency_stop"] = False
+    memory["emergency_stop"] = False
+    audit_yaz("EMERGENCY_RESUME", payload={"chat_id": str(update.effective_chat.id)})
+    await save_memory_async()
+    await update.message.reply_text("▶️ Yeni sinyal üretimi yeniden açıldı.")
+
+
+async def cmd_dogrulama(update, context):
+    if not telegram_yetkili(update):
+        return
+    rapor = await asyncio.to_thread(dogrulama_raporu_uret)
+    for parca in telegram_parcala(rapor, 4000):
+        await update.message.reply_text(parca)
+
+
+async def cmd_golge(update, context):
+    if not telegram_yetkili(update):
+        return
+    rapor = await asyncio.to_thread(golge_neden_raporu_uret)
+    for parca in telegram_parcala(rapor, 4000):
+        await update.message.reply_text(parca)
+
+
+async def cmd_selftest(update, context):
+    if not telegram_yetkili(update):
+        return
+    await update.message.reply_text(await asyncio.to_thread(selftest_raporu_uret))
+
+
+async def cmd_backup(update, context):
+    if not telegram_yetkili(update):
+        return
+    try:
+        dosyalar = await asyncio.to_thread(db_yedekle)
+        _RUNTIME_HEALTH["last_backup_ts"] = time.time()
+        await update.message.reply_text(f"💾 Yedek tamamlandı: {len(dosyalar)} veritabanı")
+    except Exception as e:
+        logger.exception("Manuel yedek hatası: %s", e)
+        await update.message.reply_text("Yedekleme başarısız.")
 
 
 def _balina_snapshot_satiri(s: Dict[str, Any]) -> str:
@@ -4327,6 +5034,15 @@ def build_app():
     app.add_handler(CommandHandler("tp", cmd_tp))
     app.add_handler(CommandHandler("tportak", cmd_tportak))
     app.add_handler(CommandHandler("stoportak", cmd_stoportak))
+    app.add_handler(CommandHandler("kombinasyon", cmd_kombinasyon))
+    app.add_handler(CommandHandler("dogrulama", cmd_dogrulama))
+    app.add_handler(CommandHandler("golge", cmd_golge))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("durdur", cmd_durdur))
+    app.add_handler(CommandHandler("devam", cmd_devam))
+    app.add_handler(CommandHandler("selftest", cmd_selftest))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("balina", cmd_balina))
     app.add_handler(CommandHandler("akis", cmd_akis))
     app.add_handler(CommandHandler("birikim", cmd_birikim))
@@ -4344,6 +5060,19 @@ def validate_config() -> None:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         raise RuntimeError(f"Eksik env: {', '.join(missing)}")
+    if not OKX_BASE_URL.startswith("https://"):
+        raise RuntimeError("OKX_BASE_URL HTTPS olmalı")
+    if SIM_AMBIGUOUS_BAR_POLICY not in ("STOP_FIRST", "TP_FIRST"):
+        raise RuntimeError("SIM_AMBIGUOUS_BAR_POLICY STOP_FIRST veya TP_FIRST olmalı")
+    if not (0.0 <= OLCUM_RASTGELE_ORAN <= 1.0):
+        raise RuntimeError("OLCUM_RASTGELE_ORAN 0 ile 1 arasında olmalı")
+    if min(SABIT_STOP_PCT, TP1_RR, TP2_RR, TP3_RR, TP4_RR) <= 0:
+        raise RuntimeError("Stop ve TP R değerleri pozitif olmalı")
+    db_dizin = os.path.dirname(os.path.abspath(OLCUM_DB))
+    try:
+        os.makedirs(db_dizin, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(f"OLCUM_DB dizini oluşturulamadı: {db_dizin}: {e}") from e
 
 
 def main() -> None:
