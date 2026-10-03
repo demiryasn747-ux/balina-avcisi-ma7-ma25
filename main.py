@@ -12,6 +12,9 @@ import sqlite3
 import hashlib
 import shutil
 import platform
+import math
+import functools
+import itertools
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -23,8 +26,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V12.0 KURUMSAL ÖLÇÜM PLATFORMU"
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.0")
+VERSION_NAME = "Balina Avcısı V12.0.1 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.0.1")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -51,9 +54,9 @@ GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
 GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
 
-# === V12.0 KURUMSAL ALTYAPI ===
+# === V12.0.1 KURUMSAL ALTYAPI ===
 KURUMSAL_ENABLED = os.getenv("KURUMSAL_ENABLED", "true").lower() == "true"
-DB_SCHEMA_VERSION = 12
+DB_SCHEMA_VERSION = 13
 DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
 DB_BACKUP_DIR = os.getenv("DB_BACKUP_DIR", "/data/backups").strip()
 DB_BACKUP_INTERVAL_SEC = int(float(os.getenv("DB_BACKUP_INTERVAL_SEC", "21600")))
@@ -81,10 +84,26 @@ RISK_MAX_SAME_SIDE = int(float(os.getenv("RISK_MAX_SAME_SIDE", "12")))
 RISK_MAX_GROUP = int(float(os.getenv("RISK_MAX_GROUP", "4")))
 VALIDATION_MIN_CLOSED = int(float(os.getenv("VALIDATION_MIN_CLOSED", "100")))
 
+# === V12.0.1 ÖLÇÜM BÜTÜNLÜĞÜ ===
+# Eski veri aynı dosyada korunur; yeni ölçümler build/config ile ayrılır.
+RSI_METHOD = os.getenv("RSI_METHOD", "LEGACY").strip().upper()
+ENTRY_MAX_AGE_SEC = float(os.getenv("ENTRY_MAX_AGE_SEC", "5"))
+BALINA_WS_BOOK_CHANNEL = os.getenv("BALINA_WS_BOOK_CHANNEL", "books").strip()
+BALINA_THRESHOLD_REFRESH_SEC = float(os.getenv("BALINA_THRESHOLD_REFRESH_SEC", "1"))
+BALINA_RETENTION_INTERVAL_SEC = float(os.getenv("BALINA_RETENTION_INTERVAL_SEC", "3600"))
+BALINA_WS_FAIL_POLICY = os.getenv("BALINA_WS_FAIL_POLICY", "REST").strip().upper()
+REPORT_REQUIRE_COMPLETE = os.getenv("REPORT_REQUIRE_COMPLETE", "true").lower() == "true"
+CORRELATION_UNKNOWN_SHARED = os.getenv("CORRELATION_UNKNOWN_SHARED", "false").lower() == "true"
+REPORT_CURRENT_COHORT_ONLY = os.getenv("REPORT_CURRENT_COHORT_ONLY", "true").lower() == "true"
+VALIDATION_START_TS = float(os.getenv("VALIDATION_START_TS", "0"))
+PAPER_HISTORY_MAX_PAGES = int(os.getenv("PAPER_HISTORY_MAX_PAGES", "24"))
+PAPER_SECOND_BARS = os.getenv("PAPER_SECOND_BARS", "true").lower() == "true"
+NOTIFICATION_INTERVAL_SEC = float(os.getenv("NOTIFICATION_INTERVAL_SEC", "1.1"))
+
 # === CANLI BALINA AKIŞ MOTORU ===
 BALINA_MOTOR_ENABLED = os.getenv("BALINA_MOTOR_ENABLED", "false").lower() == "true"
 BALINA_MOTOR_BLOCK = os.getenv("BALINA_MOTOR_BLOCK", "false").lower() == "true"
-BALINA_KARLI_KAPI_ENABLED = os.getenv("BALINA_KARLI_KAPI_ENABLED", "true").lower() == "true"
+BALINA_KARLI_KAPI_ENABLED = os.getenv("BALINA_KARLI_KAPI_ENABLED", "false").lower() == "true"
 BALINA_KARLI_DURUMLAR = {
     x.strip().upper() for x in os.getenv(
         "BALINA_KARLI_DURUMLAR",
@@ -363,12 +382,13 @@ class _AsyncTokenBucket:
         while True:
             async with self._lock:
                 simdi = time.monotonic()
+                penalty = max(0.0, _OKX_CEZA["kadar"] - simdi)
                 self._tokens = min(self.burst, self._tokens + (simdi - self._last) * self._etkin_rate())
                 self._last = simdi
-                if self._tokens >= 1.0:
+                if self._tokens >= 1.0 and penalty <= 0:
                     self._tokens -= 1.0
                     return
-                eksik = (1.0 - self._tokens) / self._etkin_rate()
+                eksik = max(penalty, (1.0 - self._tokens) / self._etkin_rate())
             await asyncio.sleep(min(max(eksik, 0.005), 1.0))
 
     def _etkin_rate(self) -> float:
@@ -396,15 +416,30 @@ OKX_EXECUTOR = ThreadPoolExecutor(max_workers=OKX_EXECUTOR_WORKERS, thread_name_
 
 async def _okx_get_async(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Any:
     loop = asyncio.get_running_loop()
-    await _okx_kova(path).acquire()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(OKX_EXECUTOR, _okx_get, path, params, max_retries),
-            timeout=max(1.0, OKX_CALL_BUDGET_SEC),
-        )
-    except asyncio.TimeoutError:
-        stats["okx_timeout"] = int(stats.get("okx_timeout", 0)) + 1
-        raise
+    remaining = max(1.0, OKX_CALL_BUDGET_SEC)
+    for attempt in range(max(0, max_retries) + 1):
+        # Kuyruk/bucket beklemesi network bütçesine dahil değildir.
+        await _okx_kova(path).acquire()
+        await _OKX_SLOTS.acquire()
+        began = loop.time()
+        future = loop.run_in_executor(OKX_EXECUTOR, _okx_get, path, params, 0)
+        # wait_for thread'i durdurmaz: slot gerçek iş bitene kadar tutulur.
+        def completed(f):
+            _OKX_SLOTS.release()
+            if not f.cancelled():
+                f.exception()  # Timeout sonrasında gelen hata da tüketilir.
+        future.add_done_callback(completed)
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+        except asyncio.TimeoutError:
+            stats["okx_timeout"] = int(stats.get("okx_timeout", 0)) + 1
+            raise
+        except (OKXRequestError, requests.RequestException, ValueError) as exc:
+            remaining -= loop.time() - began
+            retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or getattr(exc, "retryable", False)
+            if not retryable or attempt >= max_retries or remaining <= 0:
+                raise
+            await asyncio.sleep(max(0.5 * (attempt + 1), getattr(exc, "retry_after", 0)))
 
 
 _CHART_LOCK = threading.Lock()
@@ -478,17 +513,24 @@ OLCUM_KAPILARI = (
     "coin_1h_ema", "pullback", "session", "vwap", "mtf", "vwm",
     "spoof", "rsi", "oi_yorum", "kayma", "korelasyon",
 )
-_OLCUM_DB_LOCK = threading.Lock()
+_OLCUM_DB_LOCK = threading.RLock()
 
 
 def config_fingerprint() -> str:
-    anahtarlar = sorted(k for k in os.environ if k.startswith((
-        "V10_", "V106_", "V107_", "V109_", "V11_", "TP", "SABIT_", "OLCUM_",
-        "BALINA_", "RISK_", "SIM_", "GOLGE_", "ADX_", "VWAP_", "MTF_",
-    )))
-    guvenli = {k: os.environ.get(k, "") for k in anahtarlar
-               if "TOKEN" not in k and "SECRET" not in k and "KEY" not in k}
-    return hashlib.sha256(json.dumps(guvenli, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    prefixes = ('V10_', 'V106_', 'V107_', 'V109_', 'TP', 'SABIT_', 'OLCUM_',
+                'BALINA_', 'RISK_', 'SIM_', 'GOLGE_', 'ADX_', 'VWAP_', 'MTF_',
+                'RSI_', 'ENTRY_', 'PAPER_', 'CORRELATION_', 'SESSION_', 'SPOOF_',
+                'WASH_', 'PUMP_', 'INSIDER_', 'VWM_', 'TIME_EXIT_', 'COIN_',
+                'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_')
+    values = {}
+    for key,value in list(globals().items()):
+        if not key.startswith(prefixes) or any(x in key for x in ('TOKEN','SECRET','KEY','URL','DB')):
+            continue
+        if isinstance(value,(str,int,float,bool)):
+            values[key] = value
+        elif isinstance(value,(tuple,list,set)) and all(isinstance(x,(str,int,float,bool)) for x in value):
+            values[key] = sorted(value) if isinstance(value,set) else list(value)
+    return hashlib.sha256(json.dumps(values,sort_keys=True).encode()).hexdigest()[:16]
 
 
 def audit_yaz(event_type: str, uid: str = "", symbol: str = "",
@@ -533,6 +575,7 @@ def olcum_db_init() -> None:
         mevcut_kolonlar = {row[1] for row in conn.execute("PRAGMA table_info(olcum_pozisyon)")}
         yeni_kolonlar = {
             "sonuc_tipi": "TEXT",
+            "position_json": "TEXT", "shadow_json": "TEXT", "cohort": "TEXT",
             "golge_durum": "TEXT",
             "golge_tp": "INTEGER",
             "golge_mfe_pct": "REAL",
@@ -565,6 +608,13 @@ def olcum_db_init() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_event(ts)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS notification_outbox (
+            event_id TEXT PRIMARY KEY, uid TEXT NOT NULL, kind TEXT NOT NULL,
+            payload TEXT NOT NULL, created_ts REAL NOT NULL, sent_ts REAL,
+            attempts INTEGER NOT NULL DEFAULT 0, next_ts REAL NOT NULL DEFAULT 0,
+            last_error TEXT, part_index INTEGER NOT NULL DEFAULT 0)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox(sent_ts,next_ts,created_ts)")
+        conn.execute("INSERT OR IGNORE INTO schema_meta VALUES('v12_0_1_started',?)", (str(time.time()),))
         eski_sonuclar = conn.execute(
             "SELECT uid,durum,kapi_json FROM olcum_pozisyon WHERE sonuc_tipi IS NULL AND durum!='ACIK'"
         ).fetchall()
@@ -597,7 +647,7 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
         "skor": pos.get("score"), "rsi": pos.get("rsi"), "adx": pos.get("adx"),
         "vwm": pos.get("vwm"), "oi_pct": pos.get("oi_change_pct"),
         "fomo_pct": pos.get("fomo_move_pct"), "obimb": pos.get("ob_imbalance"),
-        "funding": pos.get("funding"),
+        "funding": None if pos.get("funding") is None else safe_float(pos.get("funding"))*100,
         "balina_durum": pos.get("balina_durum"),
         "balina_guven": pos.get("balina_guven"),
         "balina_veri_kaynagi": pos.get("balina_veri_kaynagi"),
@@ -610,25 +660,13 @@ def pozisyon_ozellikleri(pos: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def olcum_db_pozisyon_ac(pos: Dict[str, Any]) -> None:
-    if not OLCUM_MODU and not GOLGE_IZLEME and not BALINA_MOTOR_ENABLED:
-        return
-    payload_dict = copy.deepcopy(pos.get("kapi_sonuclari", {}))
-    payload_dict["_ozellikler"] = pozisyon_ozellikleri(pos)
-    payload = json.dumps(payload_dict, ensure_ascii=False, sort_keys=True)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO olcum_pozisyon
-            (uid,symbol,side,kontrol,open_ts,durum,r_value,mfe_pct,mae_pct,kapi_json,build,config_hash)
-            VALUES (?,?,?,?,?,'ACIK',?,?,?,?,?,?)
-        """, (v107_pos_uid(pos), pos["symbol"], pos["side"], int(bool(pos.get("kontrol"))),
-              safe_float(pos.get("open_ts")), safe_float(pos.get("current_r")),
-              safe_float(pos.get("mfe_pct")), safe_float(pos.get("mae_pct")), payload,
-              BOT_BUILD, config_fingerprint()))
-    audit_yaz("POSITION_OPEN", v107_pos_uid(pos), pos.get("symbol", ""),
-              {"side": pos.get("side"), "signal_no": pos.get("signal_no")})
+        _db_insert_position(conn, pos)
 
 
 def simulasyon_maliyet_r(pos: Dict[str, Any]) -> float:
+    if "cost_r_frozen" in pos:
+        return max(0.0, safe_float(pos["cost_r_frozen"]))
     risk_pct = abs(safe_float(pos.get("entry")) - safe_float(pos.get("orig_stop")))
     entry = safe_float(pos.get("entry"))
     if entry <= 0 or risk_pct <= 0:
@@ -640,33 +678,8 @@ def simulasyon_maliyet_r(pos: Dict[str, Any]) -> float:
 
 def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
                                r_value: Optional[float] = None) -> None:
-    if not OLCUM_MODU and not GOLGE_IZLEME and not BALINA_MOTOR_ENABLED:
-        return
-    close_ts = time.time() if durum != "ACIK" else None
-    rv = safe_float(pos.get("current_r")) if r_value is None else safe_float(r_value)
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        mevcut = conn.execute("SELECT kapi_json FROM olcum_pozisyon WHERE uid=?",
-                              (v107_pos_uid(pos),)).fetchone()
-        try:
-            payload = json.loads(mevcut[0] or "{}") if mevcut else {}
-        except Exception:
-            payload = {}
-        for idx in range(1, 5):
-            payload[f"_hit{idx}"] = bool(pos.get(f"hit{idx}"))
-        if "_ozellikler" not in payload:
-            payload["_ozellikler"] = pozisyon_ozellikleri(pos)
-        cost_r = simulasyon_maliyet_r(pos) if durum != "ACIK" else 0.0
-        net_r = rv - cost_r if durum != "ACIK" else rv
-        conn.execute("""
-            UPDATE olcum_pozisyon SET durum=?, close_ts=?, r_value=?, net_r_value=?, cost_r=?,
-                mfe_pct=?, mae_pct=?, kapi_json=?, build=?, config_hash=?
-            WHERE uid=?
-        """, (durum, close_ts, rv, net_r, cost_r, safe_float(pos.get("mfe_pct")),
-              safe_float(pos.get("mae_pct")), json.dumps(payload, ensure_ascii=False, sort_keys=True),
-              BOT_BUILD, config_fingerprint(), v107_pos_uid(pos)))
-    if durum != "ACIK":
-        audit_yaz("POSITION_CLOSE", v107_pos_uid(pos), pos.get("symbol", ""),
-                  {"outcome": durum, "gross_r": rv, "net_r": net_r, "cost_r": cost_r})
+        _db_update_position(conn, pos, durum, r_value)
 
 
 def sonuc_tipi_belirle(outcome: str, kaynak: Dict[str, Any]) -> str:
@@ -696,11 +709,11 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
         return []
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         rows = conn.execute("""
-            SELECT uid,side,kontrol,durum,r_value,mfe_pct,mae_pct,sonuc_tipi,kapi_json
+            SELECT uid,side,kontrol,durum,r_value,mfe_pct,mae_pct,sonuc_tipi,kapi_json,cohort,net_r_value,open_ts,close_ts
             FROM olcum_pozisyon
         """).fetchall()
     sonuc = []
-    for uid, side, kontrol, durum, r_value, mfe_pct, mae_pct, sonuc_tipi, raw_json in rows:
+    for uid, side, kontrol, durum, r_value, mfe_pct, mae_pct, sonuc_tipi, raw_json, cohort, net_r, open_ts, close_ts in rows:
         try:
             payload = json.loads(raw_json or "{}")
         except Exception:
@@ -716,7 +729,8 @@ def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
                       "hit1": bool(payload.get("_hit1")), "hit2": bool(payload.get("_hit2")),
                       "hit3": bool(payload.get("_hit3")), "hit4": bool(payload.get("_hit4")),
                       "ozellikler": ozellikler,
-                      "kapilar": kapilar})
+                      "kapilar": kapilar, "cohort": cohort or "LEGACY", "net_r_value": net_r,
+                      "open_ts": open_ts, "close_ts": close_ts, "coverage": payload.get("_coverage","LEGACY_UNVERIFIED")})
     return sonuc
 
 
@@ -750,25 +764,18 @@ def olcum_db_golge_baslat(pos: Dict[str, Any]) -> None:
     audit_yaz("SHADOW_START", v107_pos_uid(pos), pos.get("symbol", ""), stop_neden)
 
 
-def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool = False) -> None:
-    if not GOLGE_IZLEME or not os.path.exists(OLCUM_DB):
-        return
-    durum = "BITTI" if bitti else "IZLENIYOR"
-    bitis_ts = time.time() if bitti else None
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        conn.execute("""
-            UPDATE olcum_pozisyon
-            SET golge_durum=?, golge_tp=?, golge_mfe_pct=?, golge_mae_pct=?,
-                golge_tp1_dk=?, golge_tp2_dk=?, golge_tp3_dk=?, golge_tp4_dk=?, golge_bitis_ts=?
-            WHERE uid=?
-        """, (durum, int(golge.get("golge_tp", 0)), safe_float(golge.get("golge_mfe_pct")),
-              safe_float(golge.get("golge_mae_pct")), golge.get("golge_tp1_dk"),
-              golge.get("golge_tp2_dk"), golge.get("golge_tp3_dk"), golge.get("golge_tp4_dk"), bitis_ts,
-              str(golge.get("uid", ""))))
-    if bitti:
-        audit_yaz("SHADOW_FINISH", str(golge.get("uid", "")), str(golge.get("symbol", "")),
-                  {"tp": golge.get("golge_tp"), "mfe": golge.get("golge_mfe_pct"),
-                   "mae": golge.get("golge_mae_pct")})
+def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool=False) -> None:
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute("""UPDATE olcum_pozisyon SET golge_durum=?,
+            golge_tp=MAX(COALESCE(golge_tp,0),?),golge_mfe_pct=MAX(COALESCE(golge_mfe_pct,0),?),
+            golge_mae_pct=MAX(COALESCE(golge_mae_pct,0),?),
+            golge_tp1_dk=COALESCE(golge_tp1_dk,?),golge_tp2_dk=COALESCE(golge_tp2_dk,?),
+            golge_tp3_dk=COALESCE(golge_tp3_dk,?),golge_tp4_dk=COALESCE(golge_tp4_dk,?),
+            golge_bitis_ts=?,shadow_json=? WHERE uid=? AND COALESCE(golge_durum,'')!='BITTI'""",
+            ('BITTI' if bitti else 'IZLENIYOR',int(golge.get('golge_tp',0)),
+             safe_float(golge.get('golge_mfe_pct')),safe_float(golge.get('golge_mae_pct')),
+             *(golge.get(f'golge_tp{i}_dk') for i in range(1,5)),
+             golge.get('end_ts') if bitti else None,_json(golge),golge['uid']))
 
 
 def olcum_db_tp_satirlari() -> List[Tuple[Any, ...]]:
@@ -810,8 +817,9 @@ def tr_str(ts: Optional[float] = None) -> str:
 
 def safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        return float(v)
-    except Exception:
+        result = float(v)
+        return result if math.isfinite(result) else default
+    except (ValueError, TypeError, OverflowError):
         return default
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -864,18 +872,18 @@ def load_memory() -> None:
         ensure_memory_shape()
 
 def _write_memory_snapshot(snapshot: Dict[str, Any]) -> None:
-    for _ in range(3):
-        try:
-            tmp_path = MEMORY_FILE + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(snapshot, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, MEMORY_FILE)
-            return
-        except RuntimeError:
-            time.sleep(0.05)
-        except Exception as e:
-            logger.exception("Memory yazılamadı: %s", e)
-            return
+    target = os.path.abspath(MEMORY_FILE)
+    os.makedirs(os.path.dirname(target),exist_ok=True)
+    temp = target+'.'+uuid.uuid4().hex+'.tmp'
+    try:
+        with open(temp,'w',encoding='utf-8') as stream:
+            json.dump(snapshot,stream,ensure_ascii=False,indent=2,allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp,target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 def save_memory() -> None:
     try:
@@ -900,15 +908,8 @@ async def save_memory_async() -> None:
 
 
 def json_memory_snapshot() -> Dict[str, Any]:
-    """Ölçüm alanlarını JSON'dan ayırır; ana kayıt yalnız SQLite'ta kalır."""
-    snapshot = copy.deepcopy(memory)
-    measurement_keys = {"kapi_sonuclari", "kontrol", "mfe_pct", "mae_pct", "current_r"}
-    paper = snapshot.get("v10_paper", {})
-    for bucket in (paper.get("open", []), paper.get("closed", [])):
-        for rec in bucket:
-            for key in measurement_keys:
-                rec.pop(key, None)
-    return snapshot
+    """JSON ve SQLite birlikte kurtarma sağlar; ölçüm alanları asla atılmaz."""
+    return copy.deepcopy(memory)
 
 def cleanup_symbol_fail_state() -> None:
     now_ts = time.time()
@@ -957,22 +958,27 @@ def get_blocked_symbol_count() -> int:
 
 def _telegram_api_send(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    resp = SESSION.post(url, data=payload, timeout=HTTP_TIMEOUT)
-    return resp.status_code == 200 and resp.json().get("ok") is True
+        raise TelegramDeliveryError(401)
+    response = _http_session().post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=HTTP_TIMEOUT)
+    data = response.json()
+    if response.status_code != 200 or data.get("ok") is not True:
+        raise TelegramDeliveryError(int(data.get("error_code", response.status_code)),
+                                    (data.get("parameters") or {}).get("retry_after", 0))
+    return True
 
 async def safe_send_telegram(text: str, retry: int = 3, delay_sec: float = 1.5) -> bool:
-    for i in range(1, retry + 1):
-        try:
-            if await asyncio.to_thread(_telegram_api_send, text):
-                return True
-        except Exception:
-            pass
-        await asyncio.sleep(delay_sec * i)
-    stats["telegram_fail"] += 1
-    return False
+    for part in telegram_parcala(text):
+        for attempt in range(retry):
+            try:
+                await asyncio.to_thread(_telegram_api_send, part)
+                break
+            except Exception as exc:
+                if getattr(exc, "permanent", False) or attempt+1 == retry:
+                    stats["telegram_fail"] += 1
+                    return False
+                await asyncio.sleep(max(delay_sec*(attempt+1), getattr(exc, "retry_after", 0)))
+    return True
 
 import io as _io
 
@@ -1322,32 +1328,26 @@ def normalize_symbol(symbol: str) -> str:
     return s
 
 
-def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 1) -> Any:
-    url = f"{OKX_BASE_URL}{path}"
-    last_err: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            resp = SESSION.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = RuntimeError(f"HTTP {resp.status_code}")
-                if resp.status_code == 429:
-                    _okx_429_kaydet()
-                if attempt < max_retries:
-                    continue
-                resp.raise_for_status()
-            resp.raise_for_status()
-            data = resp.json()
-            if str(data.get("code", "1")) != "0":
-                raise RuntimeError(f"OKX hata: code={data.get('code')}")
-            return data.get("data", [])
-        except (requests.RequestException, ValueError) as e:
-            last_err = e
-            if attempt < max_retries:
-                continue
-            raise
-    if last_err:
-        raise last_err
-    return []
+def _okx_get(path: str, params: Optional[Dict[str, Any]] = None, max_retries: int = 0) -> Any:
+    """Tek network denemesi. Rate limit, retry ve bekleme event loop'tadır."""
+    response = _http_session().get(f"{OKX_BASE_URL}{path}", params=params or {},
+                                   timeout=(min(HTTP_TIMEOUT, 5), HTTP_TIMEOUT))
+    if response.status_code == 429:
+        _okx_429_kaydet()
+        raise OKXRequestError("HTTP 429", retryable=True,
+                              retry_after=safe_float(response.headers.get("Retry-After"), OKX_429_CEZA_SEC))
+    if response.status_code >= 500:
+        raise OKXRequestError(f"HTTP {response.status_code}", retryable=True)
+    response.raise_for_status()
+    data = response.json()
+    code = str(data.get("code", "1"))
+    if code != "0":
+        if code in ("50011", "50040"):
+            _okx_429_kaydet()
+        raise OKXRequestError(f"OKX code={code}", code=code,
+                              retryable=code in ("50011", "50040", "50013", "50004"),
+                              retry_after=OKX_429_CEZA_SEC if code in ("50011", "50040") else 0)
+    return data.get("data", [])
 
 
 def _okx_to_kline(row: List[Any]) -> List[Any]:
@@ -1449,7 +1449,7 @@ async def get_klines(symbol: str, interval: str, limit: int = 120, ttl: Optional
         rows = [_okx_to_kline(x) for x in reversed(data)]
         if not rows:
             stats["api_fail"] += 1
-            note_symbol_fail(symbol, f"{interval}:empty")
+            stats["empty_kline"] = int(stats.get("empty_kline", 0)) + 1
             return []
         note_symbol_success(symbol)
         kline_cache[cache_key] = (now_ts, rows)
@@ -1457,7 +1457,9 @@ async def get_klines(symbol: str, interval: str, limit: int = 120, ttl: Optional
         return rows
     except Exception as e:
         stats["api_fail"] += 1
-        note_symbol_fail(symbol, f"{interval}:{e}")
+        # Geçici timeout/429 bütün coin'i, özellikle BTC'yi, bloke etmez.
+        if isinstance(e, OKXRequestError) and e.code in ("51001", "51008"):
+            note_symbol_fail(symbol, f"{interval}:{e}")
         return []
 
 
@@ -1663,6 +1665,8 @@ def ema(values: List[float], period: int) -> List[float]:
 
 
 def rsi(values: List[float], period: int = 14) -> List[float]:
+    if RSI_METHOD == "WILDER":
+        return _rsi_wilder(values, period)
     if len(values) < period + 1:
         return [50.0 for _ in values]
     rsis = [50.0] * len(values)
@@ -1734,13 +1738,7 @@ def _v10_fmt(x):
 # ============================================================================
 
 def _balina_yuzdelik(values: List[float], q: float) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    p = (len(s) - 1) * clamp(q, 0.0, 1.0)
-    lo = int(p)
-    hi = min(lo + 1, len(s) - 1)
-    return s[lo] * (hi - p) + s[hi] * (p - lo)
+    return yuzdelik(values,q)
 
 
 def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
@@ -1751,7 +1749,7 @@ def _balina_symbol_state(symbol: str) -> Dict[str, Any]:
             state = {
                 "trades": deque(maxlen=12000),
                 "whales": deque(maxlen=2000),
-                "books": {"bids": {}, "asks": {}},
+                "books": {"bids": {}, "asks": {}}, "book_full": {"bids": {}, "asks": {}}, "book_seq": None,
                 "walls": {}, "spoofs": deque(maxlen=200),
                 "trade_ids": deque(), "trade_id_set": set(),
                 "last_price": 0.0, "last_ts": 0.0,
@@ -1788,6 +1786,7 @@ def balina_db_init() -> None:
                 payload_json TEXT NOT NULL
             )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balina_event_ts ON balina_event(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_balina_event_symbol_ts ON balina_event(symbol,ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_balina_event_type_ts ON balina_event(event_type,ts)")
 
@@ -1803,13 +1802,16 @@ def _balina_queue_event(event: Dict[str, Any]) -> None:
 
 
 def _balina_contract_value(symbol: str, price: float, size: float) -> float:
-    inst = okx_live_symbols.get(symbol, {})
-    ct_val = safe_float(inst.get("ctVal"), 0.0)
-    ct_ccy = str(inst.get("ctValCcy", "")).upper()
-    base = _base_of(symbol)
-    if ct_val > 0 and (not ct_ccy or ct_ccy == base):
-        return price * size * ct_val
-    return price * size
+    inst = okx_live_symbols.get(symbol,{})
+    ct = safe_float(inst.get('ctVal'))*safe_float(inst.get('ctMult'),1.0)
+    currency = str(inst.get('ctValCcy','')).upper()
+    if ct<=0 or size<=0 or price<=0:
+        return 0.0
+    if currency==_base_of(symbol):
+        return price*size*ct
+    if currency in ('USD','USDT','USDC'):
+        return size*ct
+    return 0.0
 
 
 def _balina_prune(state: Dict[str, Any], now_ts: float) -> None:
@@ -1821,11 +1823,13 @@ def _balina_prune(state: Dict[str, Any], now_ts: float) -> None:
 
 
 def _balina_whale_threshold(state: Dict[str, Any]) -> float:
-    values = [safe_float(x.get("value")) for x in state["trades"]]
-    if len(values) < 30:
-        return BALINA_WHALE_MIN_USDT
-    dynamic = _balina_yuzdelik(values[-2000:], BALINA_WHALE_PERCENTILE / 100.0)
-    return max(BALINA_WHALE_MIN_USDT, dynamic)
+    now = time.monotonic()
+    if now-safe_float(state.get('threshold_ts'),-1e20)<BALINA_THRESHOLD_REFRESH_SEC:
+        return state['threshold']
+    values = [safe_float(x.get('value')) for x in itertools.islice(reversed(state['trades']),2000)]
+    threshold = max(BALINA_WHALE_MIN_USDT,_balina_yuzdelik(values,BALINA_WHALE_PERCENTILE/100)) if len(values)>=30 else BALINA_WHALE_MIN_USDT
+    state.update(threshold_ts=now,threshold=threshold)
+    return threshold
 
 
 def _balina_process_trade(row: Dict[str, Any]) -> None:
@@ -1838,8 +1842,16 @@ def _balina_process_trade(row: Dict[str, Any]) -> None:
         return
     now_ts = ts if ts > 0 else time.time()
     value = _balina_contract_value(symbol, price, size)
+    if value<=0:
+        stats['balina_missing_contract'] = int(stats.get('balina_missing_contract',0))+1
+        return
     state = _balina_symbol_state(symbol)
     with _BALINA_LOCK:
+        if now_ts<safe_float(state.get('last_ts')):
+            stats['balina_out_of_order_trade'] = int(stats.get('balina_out_of_order_trade',0))+1
+            return
+        if len(state['trades'])==state['trades'].maxlen and state['trades'][0]['ts']>now_ts-300:
+            state['truncated_until'] = now_ts+300
         trade_id = str(row.get("tradeId") or f"{row.get('ts')}:{side}:{price:.12g}:{size:.12g}")
         if trade_id in state["trade_id_set"]:
             stats["balina_duplicate_trade"] = int(stats.get("balina_duplicate_trade", 0)) + 1
@@ -1879,117 +1891,112 @@ def _balina_trade_near(state: Dict[str, Any], side: str, price: float,
                and abs(safe_float(t.get("price")) - price) / price <= tol)
 
 
-def _balina_process_book(row: Dict[str, Any]) -> None:
-    symbol = normalize_symbol(str(row.get("instId", "")))
-    ts = safe_float(row.get("ts")) / 1000.0 or time.time()
-    if not symbol:
+def _balina_process_book(row: Dict[str, Any], action: str='snapshot') -> None:
+    symbol = normalize_symbol(str(row.get('instId','')))
+    ts = safe_float(row.get('ts'))/1000
+    if not symbol or ts<=0:
         return
     state = _balina_symbol_state(symbol)
-    depth = max(5, BALINA_BOOK_DEPTH)
-    bids = [(safe_float(x[0]), safe_float(x[1])) for x in row.get("bids", [])[:depth]
-            if len(x) >= 2 and safe_float(x[0]) > 0]
-    asks = [(safe_float(x[0]), safe_float(x[1])) for x in row.get("asks", [])[:depth]
-            if len(x) >= 2 and safe_float(x[0]) > 0]
     with _BALINA_LOCK:
-        if ts < safe_float(state.get("last_book_ts")):
-            stats["balina_out_of_order_book"] = int(stats.get("balina_out_of_order_book", 0)) + 1
+        if ts<safe_float(state.get('last_book_ts')):
+            stats['balina_out_of_order_book'] = int(stats.get('balina_out_of_order_book',0))+1
             return
-        state["last_book_ts"] = ts
-        previous_keys = set(state["walls"])
-        active_keys = set()
-        for book_side, levels in (("bids", bids), ("asks", asks)):
-            mean_qty = avg([q for _, q in levels])
-            state["books"][book_side] = {p: q for p, q in levels}
-            if mean_qty <= 0:
-                continue
-            for price, qty in levels:
-                if qty < mean_qty * BALINA_WALL_MULT:
+        seq,prev = row.get('seqId'),row.get('prevSeqId')
+        if action=='update' and (state.get('book_seq') is None or prev!=state.get('book_seq')):
+            stats['balina_book_gap'] = int(stats.get('balina_book_gap',0))+1
+            raise ValueError('Orderbook sequence gap: yeni snapshot gerekli')
+        if action=='snapshot':
+            state['book_full'] = {'bids':{},'asks':{}}
+            if BALINA_WS_BOOK_CHANNEL=='books':
+                state['walls'].clear()
+        state['book_seq'] = seq
+        for side in ('bids','asks'):
+            full = state['book_full'][side]
+            for level in row.get(side,[]):
+                p,q = safe_float(level[0]),safe_float(level[1])
+                if p<=0 or q<0:
                     continue
-                key = ""
-                for old_key, old_wall in state["walls"].items():
-                    old_price = safe_float(old_wall.get("price"))
-                    if (old_wall.get("side") == book_side and old_price > 0 and
-                            abs(price - old_price) / old_price <= SPOOF_FIYAT_TOLERANS_PCT / 100.0):
-                        key = old_key
-                        break
-                if not key:
-                    key = f"{book_side}:{price:.12g}"
-                active_keys.add(key)
-                wall = state["walls"].setdefault(key, {
-                    "side": book_side, "price": price, "first_ts": ts,
-                    "last_ts": ts, "first_qty": qty, "max_qty": qty,
-                })
-                wall["last_ts"] = ts
-                wall["price"] = price
-                wall["last_qty"] = qty
-                wall["max_qty"] = max(safe_float(wall.get("max_qty")), qty)
-                wall.pop("missing_since", None)
-                wall.pop("missing_count", None)
-        for key in previous_keys - active_keys:
-            wall = state["walls"].get(key)
-            if not wall:
+                if q==0:
+                    full.pop(p,None)
+                else:
+                    full[p] = q
+            ordered = sorted(full.items(),reverse=side=='bids')[:400]
+            state['book_full'][side] = dict(ordered)
+            depth = min(BALINA_BOOK_DEPTH,5) if BALINA_WS_BOOK_CHANNEL=='books5' else BALINA_BOOK_DEPTH
+            state['books'][side] = dict(ordered[:max(1,depth)])
+        state['last_book_ts'] = ts
+        tol = max(0,SPOOF_FIYAT_TOLERANS_PCT)/100
+        for key,wall in list(state['walls'].items()):
+            side,p = wall['side'],wall['price']
+            levels = state['books'][side]
+            # Görünür aralık DIŞINDA kalan duvar için iptal kanıtı yoktur.
+            if not levels or not min(levels)<=p<=max(levels):
+                state['walls'].pop(key,None)
                 continue
-            book_side = wall.get("side")
-            visible_prices = list((state["books"].get(book_side) or {}).keys())
-            wall_price = safe_float(wall.get("price"))
-            if not visible_prices or wall_price <= 0:
+            qty = sum(q for px,q in levels.items() if abs(px-p)/p<=tol)
+            peak = max(safe_float(wall.get('max_qty')),qty)
+            wall.update(last_qty=qty,max_qty=peak,last_ts=ts)
+            drop = 1-qty/peak if peak else 0
+            if drop<BALINA_SPOOF_CANCEL_RATIO:
+                wall.pop('missing_since',None)
+                wall.pop('missing_count',None)
                 continue
-            band_tol = SPOOF_FIYAT_TOLERANS_PCT / 100.0
-            still_in_visible_band = (min(visible_prices) * (1.0 - band_tol) <= wall_price <=
-                                     max(visible_prices) * (1.0 + band_tol))
-            # books5 dışına kayan seviye kaybolmuş sayılamaz; yalnız görünür bant içindeki iptal ölçülür.
-            if not still_in_visible_band:
-                state["walls"].pop(key, None)
+            wall.setdefault('missing_since',ts)
+            wall['missing_count'] = int(wall.get('missing_count',0))+1
+            if ts-wall['missing_since']<BALINA_SPOOF_CONFIRM_SEC or wall['missing_count']<max(2,BALINA_SPOOF_MIN_MISSING):
                 continue
-            if "missing_since" not in wall:
-                wall["missing_since"] = ts
-                wall["missing_count"] = 1
-                continue
-            wall["missing_count"] = int(wall.get("missing_count", 0)) + 1
-            missing_for = ts - safe_float(wall.get("missing_since"))
-            if (missing_for < BALINA_SPOOF_CONFIRM_SEC or
-                    int(wall.get("missing_count", 0)) < max(2, BALINA_SPOOF_MIN_MISSING)):
-                continue
-            state["walls"].pop(key, None)
-            if not BALINA_SPOOF_ENABLED:
-                continue
-            lifetime = ts - safe_float(wall.get("first_ts"))
-            taker_side = "sell" if book_side == "bids" else "buy"
-            executed = _balina_trade_near(state, taker_side, wall_price,
-                                          safe_float(wall.get("first_ts")))
-            wall_notional = _balina_contract_value(symbol, wall_price,
-                                                    safe_float(wall.get("max_qty")))
-            executed_ratio = executed / wall_notional if wall_notional > 0 else 0.0
-            cancel_ratio = clamp(1.0 - executed_ratio, 0.0, 1.0)
-            best_bid = max(state["books"].get("bids", {}) or {0.0: 0.0})
-            best_ask = min(state["books"].get("asks", {}) or {0.0: 0.0})
-            mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else safe_float(state.get("last_price"))
-            distance_pct = abs(wall_price - mid) / mid * 100.0 if mid > 0 else 999.0
-            if (lifetime >= BALINA_WALL_LIFETIME_SEC and
-                    wall_notional >= BALINA_WALL_MIN_USDT and
-                    distance_pct <= BALINA_SPOOF_MAX_DISTANCE_PCT and
-                    cancel_ratio >= BALINA_SPOOF_CANCEL_RATIO):
-                event = {"ts": ts, "symbol": symbol, "event_type": "SPOOF_WALL",
-                         "side": book_side, "price": wall.get("price"),
-                         "value_usdt": wall_notional, "lifetime": lifetime,
-                         "cancel_ratio": cancel_ratio, "missing_for": missing_for,
-                         "distance_pct": distance_pct}
-                state["spoofs"].append(event)
-                stats["balina_spoof"] = int(stats.get("balina_spoof", 0)) + 1
+            state['walls'].pop(key,None)
+            value = _balina_contract_value(symbol,p,peak)
+            executed = _balina_trade_near(state,'sell' if side=='bids' else 'buy',p,wall['first_ts'])
+            unexplained = clamp(drop-executed/value,0,1) if value>0 else 0
+            bid = max(state['books']['bids'] or {0:0})
+            ask = min(state['books']['asks'] or {0:0})
+            mid = (bid+ask)/2 if bid>0 and ask>0 else 0
+            distance = abs(p-mid)/mid*100 if mid else 999
+            life = wall['missing_since']-wall['first_ts']
+            if (BALINA_SPOOF_ENABLED and life>=BALINA_WALL_LIFETIME_SEC and value>=BALINA_WALL_MIN_USDT
+                    and distance<=BALINA_SPOOF_MAX_DISTANCE_PCT and unexplained>=BALINA_SPOOF_CANCEL_RATIO):
+                event = {'ts':ts,'symbol':symbol,'event_type':'SPOOF_WALL','side':side,'price':p,
+                         'value_usdt':value,'lifetime':life,'cancel_ratio':unexplained,
+                         'interpretation':'unexplained_depth_reduction_not_proof'}
+                state['spoofs'].append(event)
+                stats['balina_spoof'] = int(stats.get('balina_spoof',0))+1
                 _balina_queue_event(event)
-        state["last_book_ts"] = ts
+        # Ortalama eşiği SADECE yeni duvar tespitinde; mevcut duvarı silmez.
+        for side,levels in state['books'].items():
+            mean = avg(list(levels.values()))
+            for p,q in levels.items():
+                if mean<=0 or q<mean*BALINA_WALL_MULT:
+                    continue
+                if any(w['side']==side and abs(w['price']-p)/p<=tol for w in state['walls'].values()):
+                    continue
+                band_qty = sum(qty for px,qty in levels.items() if abs(px-p)/p<=tol)
+                state['walls'][f'{side}:{p:.12g}'] = dict(side=side,price=p,first_ts=ts,last_ts=ts,max_qty=band_qty,last_qty=band_qty)
 
 
 def _balina_window_metrics(state: Dict[str, Any], seconds: float, now_ts: float) -> Dict[str, float]:
-    rows = [t for t in state["trades"] if safe_float(t.get("ts")) >= now_ts - seconds]
-    buy = sum(safe_float(t.get("value")) for t in rows if t.get("side") == "buy")
-    sell = sum(safe_float(t.get("value")) for t in rows if t.get("side") == "sell")
-    total = buy + sell
-    prices = [safe_float(t.get("price")) for t in rows if safe_float(t.get("price")) > 0]
-    move = pct_change(prices[0], prices[-1]) if len(prices) >= 2 else 0.0
-    return {"buy": buy, "sell": sell, "total": total, "cvd": buy - sell,
-            "cvd_norm": (buy - sell) / total if total > 0 else 0.0,
-            "price_move_pct": move, "count": float(len(rows))}
+    windows = tuple(sorted(set((5,15,60,300,seconds))))
+    cached = state.get('_window_cache')
+    if not cached or cached[0]!=now_ts or seconds not in cached[1]:
+        data = {s:dict(buy=0.0,sell=0.0,count=0,first=None,last=None) for s in windows}
+        for trade in reversed(state['trades']):
+            age = now_ts-safe_float(trade.get('ts'))
+            if age>max(windows):
+                break
+            if age<0:
+                continue
+            for s,m in data.items():
+                if age<=s:
+                    m[trade['side']]+=trade['value']; m['count']+=1
+                    m['first']=trade['price']
+                    if m['last'] is None:
+                        m['last']=trade['price']
+        for m in data.values():
+            total=m['buy']+m['sell']; cvd=m['buy']-m['sell']
+            m.update(total=total,cvd=cvd,cvd_norm=cvd/total if total else 0,
+                     price_move_pct=pct_change(m['first'],m['last']) if m['first'] else 0)
+        state['_window_cache']=(now_ts,data)
+    return state['_window_cache'][1][seconds]
 
 
 def balina_snapshot(symbol: str) -> Dict[str, Any]:
@@ -2000,7 +2007,13 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
     now_ts = time.time()
     state = _balina_symbol_state(symbol)
     with _BALINA_LOCK:
-        stale = now_ts - safe_float(state.get("last_ts")) > BALINA_STALE_SEC
+        stale = (not _BALINA_WS_STATUS.get('connected') or
+                 now_ts-safe_float(state.get('last_ts'))>BALINA_STALE_SEC or
+                 now_ts-safe_float(state.get('last_book_ts'))>BALINA_STALE_SEC or
+                 safe_float(state.get('truncated_until'))>now_ts)
+        cached = state.get('snapshot') or {}
+        if cached and now_ts-safe_float(cached.get('ts'))<BALINA_SNAPSHOT_SEC and not stale:
+            return copy.deepcopy(cached)
         m5 = _balina_window_metrics(state, 5, now_ts)
         m15 = _balina_window_metrics(state, 15, now_ts)
         m60 = _balina_window_metrics(state, 60, now_ts)
@@ -2078,7 +2091,7 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
             if durum not in ("VERI_YETERSIZ", "AKIS_YETERSIZ", "BELIRSIZ") and guven < BALINA_CLASSIFY_MIN_CONFIDENCE:
                 durum = "AKIS_ZAYIF"
         out = {
-            "enabled": True, "source": "WEBSOCKET" if _BALINA_WS_STATUS.get("connected") else "REST_YEDEK",
+            "enabled": True, "source": "WEBSOCKET" if _BALINA_WS_STATUS.get("connected") else "WS_YOK",
             "status": "BAYAT" if stale else "CANLI", "symbol": symbol,
             "ts": now_ts, "durum": durum, "guven": round(guven, 1),
             "cvd_5s": round(m5["cvd"], 2), "cvd_15s": round(m15["cvd"], 2),
@@ -2087,18 +2100,19 @@ def balina_snapshot(symbol: str) -> Dict[str, Any]:
             "price_move_1m_pct": round(m60["price_move_pct"], 4),
             "trade_count_15s": int(m15["count"]), "trade_count_1m": int(m60["count"]),
             "trade_volume_1m_usdt": round(m60["total"], 2),
-            "flow_age_sec": round(akis_yasi, 1), "data_quality": round(veri_kalitesi, 1),
+            "flow_age_sec": round(akis_yasi, 1), "data_quality": 0.0 if stale else round(veri_kalitesi, 1),
             "flow_ready": flow_ready,
             "whale_buy_1m": round(whale_buy, 2), "whale_sell_1m": round(whale_sell, 2),
             "whale_count_1m": len(whales), "whale_cvd_norm": round(whale_cvd_norm, 4),
             "book_imbalance": round(book_imb, 4), "active_walls": len(state["walls"]),
-            "spoof_1m": len(recent_spoof), "last_data_age_sec": round(now_ts - safe_float(state.get("last_ts")), 2),
+            "spoof_1m": len(recent_spoof), "last_data_age_sec": round(max(0.0,now_ts - safe_float(state.get("last_ts"))), 2),
         }
         state["snapshot"] = out
         return copy.deepcopy(out)
 
 
 def _balina_db_flush_sync(events: List[Dict[str, Any]], snapshots: List[Dict[str, Any]]) -> None:
+    global _BALINA_LAST_RETENTION
     if not events and not snapshots:
         return
     with sqlite3.connect(BALINA_DB, timeout=10) as conn:
@@ -2116,34 +2130,48 @@ def _balina_db_flush_sync(events: List[Dict[str, Any]], snapshots: List[Dict[str
                 ts=excluded.ts,durum=excluded.durum,guven=excluded.guven,payload_json=excluded.payload_json
             """, (str(snap.get("symbol", "")), safe_float(snap.get("ts")), str(snap.get("durum", "")),
                   safe_float(snap.get("guven")), json.dumps(snap, ensure_ascii=False, separators=(",", ":"))))
-        cutoff = time.time() - max(1.0, BALINA_EVENT_RETENTION_HOURS) * 3600.0
-        conn.execute("DELETE FROM balina_event WHERE ts < ?", (cutoff,))
+        now = time.time()
+        retention = now-_BALINA_LAST_RETENTION>=BALINA_RETENTION_INTERVAL_SEC
+        if retention:
+            cutoff = now-max(1.0,BALINA_EVENT_RETENTION_HOURS)*3600
+            conn.execute('DELETE FROM balina_event WHERE ts < ?',(cutoff,))
+    if retention:
+        _BALINA_LAST_RETENTION = now
 
 
 async def balina_db_loop() -> None:
     global _BALINA_DB_QUEUE
-    _BALINA_DB_QUEUE = asyncio.Queue(maxsize=20000)
-    while True:
-        await asyncio.sleep(max(0.5, BALINA_DB_FLUSH_SEC))
-        events = []
-        try:
-            while len(events) < 2000:
-                events.append(_BALINA_DB_QUEUE.get_nowait())
-        except asyncio.QueueEmpty:
-            pass
-        snapshots = [balina_snapshot(sym) for sym in list(_BALINA_STATE)]
-        try:
-            await asyncio.to_thread(_balina_db_flush_sync, events, snapshots)
-        except Exception as exc:
-            stats["balina_db_fail"] = int(stats.get("balina_db_fail", 0)) + 1
-            logger.warning("Balina DB yazma hatası: %s", exc)
+    if _BALINA_DB_QUEUE is None:
+        _BALINA_DB_QUEUE = asyncio.Queue(maxsize=20000)
+    pending = []
+    try:
+        while True:
+            await asyncio.sleep(max(0.5,BALINA_DB_FLUSH_SEC))
+            try:
+                while len(pending)<2000:
+                    pending.append(_BALINA_DB_QUEUE.get_nowait())
+            except asyncio.QueueEmpty:
+                pass
+            snapshots = []
+            for symbol in list(_BALINA_STATE):
+                snapshots.append(balina_snapshot(symbol))
+                await asyncio.sleep(0)
+            try:
+                await asyncio.to_thread(_balina_db_flush_sync,pending,snapshots)
+                pending.clear()
+            except Exception:
+                stats['balina_db_fail'] = int(stats.get('balina_db_fail',0))+1
+                logger.exception('Balina DB yazılamadı; batch yeniden denenecek')
+    finally:
+        for event in pending:
+            _balina_queue_event(event)
 
 
 async def _balina_ws_subscribe(ws, symbols: List[str]) -> None:
     args = []
     for symbol in symbols:
         args.append({"channel": "trades", "instId": symbol})
-        args.append({"channel": "books5", "instId": symbol})
+        args.append({"channel": BALINA_WS_BOOK_CHANNEL, "instId": symbol})
     for i in range(0, len(args), 40):
         await ws.send(json.dumps({"op": "subscribe", "args": args[i:i + 40]}, separators=(",", ":")))
         await asyncio.sleep(0.2)
@@ -2156,10 +2184,12 @@ async def _balina_ws_change_symbols(ws, old_symbols: set, new_symbols: set) -> N
         args = []
         for symbol in symbols:
             args.extend(({"channel": "trades", "instId": symbol},
-                         {"channel": "books5", "instId": symbol}))
+                         {"channel": BALINA_WS_BOOK_CHANNEL, "instId": symbol}))
         for i in range(0, len(args), 40):
             await ws.send(json.dumps({"op": op, "args": args[i:i + 40]}, separators=(",", ":")))
             await asyncio.sleep(0.2)
+    for symbol in old_symbols-new_symbols:
+        _BALINA_STATE.pop(symbol,None)
     _BALINA_WS_STATUS["subscriptions"] = len(new_symbols) * 2
 
 
@@ -2171,13 +2201,14 @@ async def balina_ws_loop() -> None:
     except Exception:
         _BALINA_WS_STATUS["last_error"] = "websockets paketi kurulu değil"
         logger.error("Balina motoru için 'websockets' paketi gerekli")
-        return
+        raise
     backoff = 1.0
     while True:
         try:
             symbols = [normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]]
             async with websockets.connect(BALINA_WS_URL, ping_interval=15, ping_timeout=10,
                                           close_timeout=5, max_queue=20000) as ws:
+                _BALINA_STATE.clear()  # Kopuk aralık için yeni ısınma/snapshot gerekir.
                 _BALINA_WS_STATUS.update({"connected": True, "connected_ts": time.time(),
                                           "last_error": "", "last_message_ts": time.time()})
                 stats["balina_ws_connect"] = int(stats.get("balina_ws_connect", 0)) + 1
@@ -2185,7 +2216,12 @@ async def balina_ws_loop() -> None:
                 subscribed = set(symbols)
                 last_symbol_check = time.time()
                 backoff = 1.0
-                async for raw in ws:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(),timeout=20)
+                    except asyncio.TimeoutError:
+                        await ws.send('ping')
+                        raw = await asyncio.wait_for(ws.recv(),timeout=10)
                     _BALINA_WS_STATUS["last_message_ts"] = time.time()
                     stats["balina_ws_message"] = int(stats.get("balina_ws_message", 0)) + 1
                     if raw == "pong":
@@ -2194,6 +2230,8 @@ async def balina_ws_loop() -> None:
                         msg = json.loads(raw)
                     except Exception:
                         continue
+                    if msg.get('event')=='error':
+                        raise RuntimeError('OKX WS error '+str(msg.get('code')))
                     channel = str((msg.get("arg") or {}).get("channel", ""))
                     inst_id = str((msg.get("arg") or {}).get("instId", ""))
                     for row in msg.get("data", []):
@@ -2201,8 +2239,8 @@ async def balina_ws_loop() -> None:
                             row["instId"] = inst_id
                         if channel == "trades":
                             _balina_process_trade(row)
-                        elif channel == "books5":
-                            _balina_process_book(row)
+                        elif channel == BALINA_WS_BOOK_CHANNEL:
+                            _balina_process_book(row,msg.get("action","snapshot"))
                     if time.time() - last_symbol_check >= 30.0:
                         current = {normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]}
                         if current != subscribed:
@@ -2210,6 +2248,7 @@ async def balina_ws_loop() -> None:
                             subscribed = current
                         last_symbol_check = time.time()
         except asyncio.CancelledError:
+            _BALINA_WS_STATUS["connected"] = False
             raise
         except Exception as exc:
             stats["balina_ws_disconnect"] = int(stats.get("balina_ws_disconnect", 0)) + 1
@@ -2226,7 +2265,7 @@ def balina_signal_ekle(sig: Dict[str, Any]) -> Dict[str, Any]:
     sig["balina_akis"] = snap
     sig["balina_durum"] = snap.get("durum", "VERI_YETERSIZ")
     sig["balina_guven"] = snap.get("guven", 0.0)
-    sig["balina_veri_kaynagi"] = snap.get("source", "REST_YEDEK")
+    sig["balina_veri_kaynagi"] = snap.get("source", "WS_YOK")
     return sig
 
 
@@ -2412,10 +2451,12 @@ async def mtf_confluence_async(symbol: str, side: str, force: bool = False) -> T
         else:
             detay.append(f"{tf}▫️")
     if olculen == 0:
-        stats["v113_red_mtf"] = int(stats.get("v113_red_mtf", 0)) + 1
+        key = "v113_would_mtf" if OLCUM_MODU else "v113_red_mtf"
+        stats[key] = int(stats.get(key,0))+1
         return False, "MTF veri yok", 0
     if onay < MTF_MIN_AGREE:
-        stats["v113_red_mtf"] = int(stats.get("v113_red_mtf", 0)) + 1
+        key = "v113_would_mtf" if OLCUM_MODU else "v113_red_mtf"
+        stats[key] = int(stats.get(key,0))+1
         return False, f"MTF onay yok ({onay}/{olculen})", onay
     return True, " ".join(detay), onay
 
@@ -2425,7 +2466,7 @@ def korelasyon_grubu(symbol: str) -> str:
     base = _base_of(symbol)
     if base in _correlation_group_cache:
         return _correlation_group_cache[base]
-    grup = "diğer"
+    grup = "diğer" if CORRELATION_UNKNOWN_SHARED else f"sınıflanmamış:{base}"
     if base in ("BTC", "ETH"):
         grup = "majors"
     elif base in ("SOL", "AVAX", "NEAR", "SUI", "APT", "SEI", "TIA", "DOT", "ATOM", "INJ"):
@@ -2449,7 +2490,8 @@ def korelasyon_kilidi(symbol: str, side: str, force: bool = False) -> Tuple[bool
     ayni = [p for p in mp.get("open", []) if korelasyon_grubu(p.get("symbol", "")) == grup
             and p.get("side") == side]
     if len(ayni) >= CORRELATION_MAX_SAME_DIR:
-        stats["v113_red_correlation"] = int(stats.get("v113_red_correlation", 0)) + 1
+        key = "v113_would_correlation" if OLCUM_MODU else "v113_red_correlation"
+        stats[key] = int(stats.get(key,0))+1
         return True, f"{grup} grubunda {len(ayni)} açık {side} pozisyon"
     return False, "ok"
 
@@ -2543,10 +2585,10 @@ def v10_market_structure(k):
     lc = cls[-1]
     recent_start = max(1, len(cls) - V10_PULLBACK_WAIT - 2)
     up_break_idx = next((i for i in range(len(cls) - 1, recent_start - 1, -1)
-                         if cls[i - 1] <= res["last_sh"] < cls[i]), -1) if res["last_sh"] > 0 else -1
+                         if i > res["last_sh_idx"] + V10_SWING_RIGHT and cls[i - 1] <= res["last_sh"] < cls[i]), -1) if res["last_sh"] > 0 else -1
     down_break_idx = next((i for i in range(len(cls) - 1, recent_start - 1, -1)
-                           if cls[i - 1] >= res["last_sl"] > cls[i]), -1) if res["last_sl"] > 0 else -1
-    if up_break_idx >= 0:
+                           if i > res["last_sl_idx"] + V10_SWING_RIGHT and cls[i - 1] >= res["last_sl"] > cls[i]), -1) if res["last_sl"] > 0 else -1
+    if up_break_idx >= 0 and up_break_idx > down_break_idx:
         res["event"] = "CHoCH" if res["trend"] == "DOWN" else "BOS"
         res["event_side"] = "UP"
         res["event_level"] = res["last_sh"]
@@ -2900,7 +2942,7 @@ def v112_wash_tespit(symbol: str, klines, force: bool = False) -> Tuple[bool, st
             return False, "normal"
         fiyat_degisim = abs(pct_change(safe_float(klines[-11][4]), safe_float(klines[-1][4])))
         if fiyat_degisim < WASH_MAX_PRICE_MOVE:
-            return True, f"wash trading (hacim {son_vol/ort_vol:.1f}x, fiyat %{fiyat_degisim:.2f})"
+            return True, f"hacim/fiyat anomalisi (hacim {son_vol/ort_vol:.1f}x, fiyat %{fiyat_degisim:.2f})"
         return False, "normal"
     except Exception:
         return False, "hata"
@@ -2961,20 +3003,13 @@ def v112_stop_hunt_tespit(klines) -> Tuple[bool, str]:
 
 
 def v107_canli_giris(k1h, ob, referans):
-    if not V107_CANLI_GIRIS:
-        return referans, "kapanis"
-    ref = safe_float(referans)
+    """Analiz fiyatı; kesin paper giriş ayrıca taze bid/ask ile alınır."""
     mid = safe_float((ob or {}).get("mid"))
-    max_gap_ratio = max(0.0, V107_MAX_GIRIS_KAYMA) / 100.0
-    if mid > 0 and ref > 0 and abs(mid - ref) / ref <= max_gap_ratio:
+    if mid > 0:
         return mid, "orderbook"
-    try:
-        forming = safe_float(k1h[-1][4])
-    except Exception:
-        forming = 0.0
-    if forming > 0 and ref > 0 and abs(forming - ref) / ref <= max_gap_ratio:
-        return forming, "canli mum"
-    return ref, "kapanis"
+    if k1h and safe_float(k1h[-1][4]) > 0:
+        return safe_float(k1h[-1][4]), "canli mum"
+    return 0.0, "veri yok"
 
 
 def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
@@ -2982,6 +3017,9 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
     if len(k) < 40:
         return None
     ms = v10_market_structure(k)
+    if not ms.get('event_side'):
+        stats['v10_red_yapi'] = int(stats.get('v10_red_yapi',0))+1
+        return None
     trend4 = "FLAT"
     if V10_USE_4H_FILTER and k4h and len(k4h) >= 52:
         c4 = closes(_s_closed(k4h))
@@ -2999,8 +3037,10 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
             continue
         if V10_USE_4H_FILTER and trend4 != "FLAT":
             if side == "LONG" and trend4 != "UP":
+                stats["v10_red_4h"] = int(stats.get("v10_red_4h",0))+1
                 continue
             if side == "SHORT" and trend4 != "DOWN":
+                stats["v10_red_4h"] = int(stats.get("v10_red_4h",0))+1
                 continue
         blk, mv = v10_fomo_block(side, k)
         if blk:
@@ -3013,6 +3053,7 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
                 continue
         pb, note = v10_pullback(side, k, ms)
         if not pb:
+            stats["v10_red_pullback"] = int(stats.get("v10_red_pullback",0))+1
             continue
         return {"side": side, "ms": ms, "why": why, "trend4": trend4,
                 "fomo": round(mv, 2), "pullback": note, "k": k,
@@ -3083,9 +3124,6 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     k = _s_closed(k1h)
     ms = v10_market_structure(k)
     yapisal_yon = "LONG" if ms.get("event_side") == "UP" else "SHORT" if ms.get("event_side") == "DOWN" else None
-    if not yapisal_yon:
-        stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
-        return None
 
     # Kontrol seçimi symbol+mum için sabittir. Aynı mum tekrar tarandığında
     # kontrol/normal veya LONG/SHORT arasında yeniden kura çekilmez.
@@ -3093,37 +3131,19 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     kontrol_ozeti = hashlib.sha256(kontrol_anahtari).digest()
     kontrol_degeri = int.from_bytes(kontrol_ozeti[:8], "big") / float(1 << 64)
     kontrol = kontrol_degeri < clamp(OLCUM_RASTGELE_ORAN, 0.0, 1.0)
+    if not kontrol and not yapisal_yon:
+        stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
+        return None
     side = ("LONG" if kontrol_ozeti[8] % 2 == 0 else "SHORT") if kontrol else yapisal_yon
     entry_ref = closes(k)[-1]
-
-    if kontrol:
-        entry = entry_ref
-        tgt = v10_targets(side, entry)
-        kapilar = kapi_olc(symbol, side, k, {"ms": ms})
-        size = _olcum_pozisyon_boyutu(50.0, k, entry, 1)
-        return {"symbol": symbol, "direction": side, "entry": entry, "strategy": "V11.5_KONTROL",
-                "entry_ref": entry_ref, "entry_kaynak": "kontrol", "entry_kayma_pct": 0.0,
-                "event": "CONTROL", "structure": "Rastgele kontrol grubu", "range_break": False,
-                "trend_1h": ms.get("trend", "RANGE"), "trend_4h": "FLAT", "fomo_move_pct": 0.0,
-                "pullback": "ölçümsüz", "score": 50.0, "score_parts": {}, "bayrak": {},
-                "rsi": round(rsi(closes(k))[-1], 1), "candle_ts": str(k[-1][0]),
-                "oi_change_pct": 0.0, "oi_yorum": "ölçümsüz", "coin_1h_ema": "-",
-                "funding": None, "ob_imbalance": 0.0, "btc_4h": "-", "btc_1h": "-",
-                "trend_uyum": False, "spoof_guard": "ölçümsüz", "wash_guard": "ölçümsüz",
-                "pump_guard": "ölçümsüz", "insider_uyari": "", "stop_hunt": "",
-                "adx": round(adx_hesapla(k, ADX_PERIOD), 2), "piyasa_modu": "KONTROL",
-                "session_name": session_belirle()[0], "session_weight": 1, "vwap": 0.0,
-                "mtf_note": "ölçümsüz", "mtf_count": 0, "vwm": 0.0, "liq_map": {},
-                "liq_note": "ölçümsüz", "kapi_sonuclari": kapilar, "kontrol": True,
-                **size, **tgt}
 
     bt = await v106_btc_trend()
     btc_1h, btc_4h = bt.get("dir_1h", "FLAT"), bt.get("dir_4h", "FLAT")
     allowed_side = bt.get("allow")
-    wash_hit, wash_note = v112_wash_tespit(symbol, k1h, force=True)
+    wash_hit, wash_note = v112_wash_tespit(symbol, k, force=True)
     tickers24 = await get_24h_tickers()
-    pump_hit, pump_note = v112_pump_dump_tespit(symbol, k1h, tickers24, force=True)
-    k4h = await get_klines(symbol, "4H", 120, ttl=180) if V10_USE_4H_FILTER else None
+    pump_hit, pump_note = v112_pump_dump_tespit(symbol, k, tickers24, force=True)
+    k4h = await get_klines(symbol, "4H", 120, ttl=180)
     trend4 = _olcum_trend4(k4h)
     fomo_hit, fomo_mv = v10_fomo_block(side, k)
     pb_ok, pb_note = v10_pullback(side, k, ms)
@@ -3139,6 +3159,9 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     ob = await v10_fetch_orderbook(symbol)
     spoof_hit, spoof_note = await v112_spoof_tespit(symbol, force=True)
     entry, giris_kaynak = v107_canli_giris(k1h, ob, entry_ref)
+    if entry <= 0:
+        stats["v10_red_veri"] += 1
+        return None
     kayma = abs(entry - entry_ref) / entry_ref * 100.0 if entry_ref > 0 else 0.0
     kor_block, _ = korelasyon_kilidi(symbol, side, force=True)
     ext = {"oi_change_pct": oi if oi is not None else 0.0, "funding": funding,
@@ -3171,21 +3194,21 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     size = _olcum_pozisyon_boyutu(score, k, entry, session_weight)
     return {"symbol": symbol, "direction": side, "entry": entry, "strategy": "V11.5_OLCUM",
             "entry_ref": entry_ref, "entry_kaynak": giris_kaynak, "entry_kayma_pct": round(kayma, 3),
-            "event": ms.get("event"), "structure": v10_structure_allows(side, ms)[1],
+            "event": ms.get("event"), "structure": "Rastgele kontrol grubu" if kontrol else v10_structure_allows(side, ms)[1],
             "range_break": bool(ms.get("range_break")), "trend_1h": ms.get("trend", "RANGE"),
             "trend_4h": trend4, "fomo_move_pct": round(fomo_mv, 2), "pullback": pb_note or "yok",
             "score": score, "score_parts": parts, "bayrak": bayrak, "rsi": r_value,
-            "candle_ts": str(k[-1][0]), "oi_change_pct": ext["oi_change_pct"], "oi_yorum": oi_yorum,
+            "candle_ts": str(k[-1][0]), "oi_change_pct": oi, "oi_yorum": oi_yorum,
             "coin_1h_ema": coin_yon, "funding": funding, "ob_imbalance": ob.get("imbalance", 0),
             "btc_4h": btc_4h, "btc_1h": btc_1h, "trend_uyum": allowed_side == side,
             "spoof_guard": spoof_note, "wash_guard": wash_note, "pump_guard": pump_note,
             "insider_uyari": insider_note if insider_hit else "", "stop_hunt": stop_hunt_note if stop_hunt_hit else "",
-            "adx": round(adx_hesapla(k, ADX_PERIOD), 2), "piyasa_modu": "OLCUM",
+            "adx": round(adx_hesapla(k, ADX_PERIOD), 2), "piyasa_modu": _adx_regime(adx_hesapla(k, ADX_PERIOD)),
             "session_name": session_name, "session_weight": session_weight,
             "vwap": round(vwap_v, 8) if vwap_v else 0.0, "mtf_note": mtf_note,
             "mtf_count": mtf_count, "vwm": round(vwm_val, 3), "liq_map": liq_map,
             "liq_note": "tahmini — bilgi amaçlı", "kapi_sonuclari": kapilar,
-            "kontrol": False, **size, **tgt}
+            "kontrol": kontrol, **size, **tgt}
 
 
 async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
@@ -3218,13 +3241,13 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     # V11.2 savunmaları
-    wash_hit, wash_note = v112_wash_tespit(symbol, k1h)
+    wash_hit, wash_note = v112_wash_tespit(symbol, _s_closed(k1h))
     if wash_hit:
         stats["v112_red_wash"] = int(stats.get("v112_red_wash", 0)) + 1
         return None
 
     tickers24 = await get_24h_tickers()
-    pump_hit, pump_note = v112_pump_dump_tespit(symbol, k1h, tickers24)
+    pump_hit, pump_note = v112_pump_dump_tespit(symbol, _s_closed(k1h), tickers24)
     if pump_hit:
         stats["v112_red_pump_dump"] = int(stats.get("v112_red_pump_dump", 0)) + 1
         return None
@@ -3232,7 +3255,6 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     k4h = await get_klines(symbol, "4H", 120, ttl=180) if V10_USE_4H_FILTER else None
     gate = v10_structure_gate(symbol, k1h, k4h, allowed_side)
     if not gate:
-        stats["v10_red_yapi"] = int(stats.get("v10_red_yapi", 0)) + 1
         return None
 
     side = gate["side"]
@@ -3359,7 +3381,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "coin_1h_ema": gate.get("coin_1h_ema", "-"),
             "funding": funding, "ob_imbalance": ob.get("imbalance", 0),
             "btc_4h": btc_4h, "btc_1h": btc_1h,
-            "trend_uyum": True,
+            "trend_uyum": ((side == "LONG" and btc_1h == btc_4h == "UP") or (side == "SHORT" and btc_1h == btc_4h == "DOWN")),
             "spoof_guard": spoof_note,
             "wash_guard": wash_note,
             "pump_guard": pump_note,
@@ -3389,7 +3411,7 @@ def build_v10_message(sig):
     p = sig["score_parts"]
     tag = lambda key, lbl: f"{lbl}{'✅' if b.get(key, p.get(key, 0) > 0) else '▫️'}"
     conf = " ".join([tag("order_block", "OB"), tag("fvg", "FVG"), tag("volume_profile", "VP"),
-                     tag("cvd", "CVD"), tag("sweep", "Sweep"), tag("orderbook", "OBflow")])
+                     tag("cvd", "CVD-proxy"), tag("sweep", "Sweep"), tag("orderbook", "OBflow")])
     fund = safe_float(sig.get("funding"))
     trend_line = ("🎲 KONTROL GRUBU — yön rastgele\n" if sig.get("kontrol") else
                   ("Trend Uyumu: BTC ile AYNI YÖN ✅\n" if sig.get("trend_uyum") else
@@ -3398,9 +3420,11 @@ def build_v10_message(sig):
     kayma_mark = f" (mum kapanışından %{_kay:+.2f})" if abs(_kay) >= 0.05 else ""
 
     # V11.5 ek bilgiler
-    savunma_lines = ["🛡 Spoof✅ Wash✅ Pump✅"]
+    savunma_lines = ["🛡 " + " | ".join(
+        f"{label}: {sig.get(key, 'ölçümsüz')}" for label, key in
+        (("Duvar anomalisi", "spoof_guard"), ("Hacim/fiyat", "wash_guard"), ("Ani hareket", "pump_guard")))]
     if sig.get("insider_uyari"):
-        savunma_lines.append(f"⚠️ Insider: {sig['insider_uyari']}")
+        savunma_lines.append(f"⚠️ Hacim anomalisi: {sig['insider_uyari']}")
     if sig.get("stop_hunt"):
         savunma_lines.append(f"🎯 {sig['stop_hunt']}")
     vwap_line = f"📊 VWAP: {_v10_fmt(sig.get('vwap', 0))}" if sig.get('vwap') else ""
@@ -3425,7 +3449,7 @@ def build_v10_message(sig):
 
     signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
     return (f"{signal_no_line}{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V12.0 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V12.0.1 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -3434,6 +3458,7 @@ def build_v10_message(sig):
                         savunma_lines[1:]) + "\n"
             f"{olcum_line}"
             f"{balina_line}"
+            f"Paper kayıt saati: {tr_str(sig.get('accepted_ts'))}\n"
             f"Giriş: {_v10_fmt(sig['entry'])} [{sig.get('entry_kaynak','-')}]{kayma_mark}\n"
             f"Stop: {_v10_fmt(sig['stop'])} (%{sig['stop_pct']} sabit)\n"
             f"TP1 {_v10_fmt(sig['tp1'])} ({sig.get('tp1_rr', TP1_RR)}R) | TP2 {_v10_fmt(sig['tp2'])} ({sig.get('tp2_rr', TP2_RR)}R) | "
@@ -3450,11 +3475,11 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     elif outcome == "TP4":
         head = "✅ TP4 GELDİ — kademeli çıkış tamamlandı"
     elif outcome == "TIME_EXIT":
-        head = "⏱ SÜRE DOLDU — kâr realize"
+        head = "⏱ SÜRE DOLDU — kalan pay kapandı"
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V12.0 — POZİSYON KAPANDI\n"
+        f"🆕 V12.0.1 — POZİSYON KAPANDI\n"
         + (f"🆔 Sinyal #{int(safe_float(pos.get('signal_no')))}\n" if pos.get("signal_no") else "") +
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
@@ -3480,7 +3505,7 @@ def v107_pos_uid(pos):
     return uid
 
 
-def v10_open_paper(sig):
+def v10_open_paper(sig, persist=True):
     mp = _v10_mem()
     poz = {
         "uid": f"{sig['symbol']}|{sig['direction']}|{time.time():.3f}|{uuid.uuid4().hex[:6]}",
@@ -3498,7 +3523,7 @@ def v10_open_paper(sig):
         "oi_change_pct": sig.get("oi_change_pct"), "fomo_move_pct": sig.get("fomo_move_pct"),
         "ob_imbalance": sig.get("ob_imbalance"), "funding": sig.get("funding"),
         "entry_kaynak": sig.get("entry_kaynak", "-"),
-        "open_ts": time.time(), "scan_ts": 0.0, "candle_ts": sig["candle_ts"],
+        "open_ts": safe_float(sig.get("accepted_ts"), time.time()), "scan_ts": 0.0, "candle_ts": sig["candle_ts"],
         "session_name": sig.get("session_name", "-"),
         "piyasa_modu": sig.get("piyasa_modu", "-"),
         "balina_durum": sig.get("balina_durum", "OLCUMSUZ"),
@@ -3510,25 +3535,58 @@ def v10_open_paper(sig):
         "kontrol": bool(sig.get("kontrol")),
         "mfe_pct": 0.0, "mae_pct": 0.0, "current_r": 0.0,
     }
-    mp["open"].append(poz)
-    olcum_db_pozisyon_ac(poz)
+    poz["tp_weights"] = _tp_weights()
+    poz["tp_rrs"] = [safe_float(sig.get(f"tp{i}_rr"), rr) for i, rr in enumerate((TP1_RR, TP2_RR, TP3_RR, TP4_RR), 1)]
+    poz["cost_r_frozen"] = simulasyon_maliyet_r(poz)
+    poz["config_hash"] = config_fingerprint()
+    poz["build"] = BOT_BUILD
+    poz["cohort"] = _cohort()
+    poz["coverage"] = "COMPLETE"
+    poz["entry_ref"] = sig.get("entry_ref")
+    if persist:
+        olcum_db_pozisyon_ac(poz)
+        mp["open"].append(poz)
     return poz
 
 
 async def v107_takip_barlari(pos):
-    sym = pos["symbol"]
-    open_ms = safe_float(pos.get("open_ts", 0)) * 1000.0
-    scan_ms = safe_float(pos.get("scan_ts", 0))
-    baslangic = max(open_ms, scan_ms)
-    k = await get_klines(sym, V107_TAKIP_TF, V107_TAKIP_LIMIT, ttl=V107_TAKIP_CACHE_SEC)
-    if not k:
-        return [], "veri yok"
-    barlar = [r for r in k if safe_float(r[0]) >= baslangic]
-    if barlar:
-        pos["scan_ts"] = safe_float(barlar[-1][0])
-        return barlar, V107_TAKIP_TF
-    son = safe_float(k[-1][4])
-    return [[safe_float(k[-1][0]), son, son, son, son, 0]], "son fiyat"
+    step = interval_minutes(V107_TAKIP_TF)*60000
+    end = int(time.time()*1000)//step*step
+    start = max(int(pos['open_ts']*1000), int(safe_float(pos.get('scan_ts'))))
+    if start >= end:
+        return [], "kapalı mum bekleniyor"
+    first_full = ((start+step-1)//step)*step
+    end = min(end,first_full+max(1,PAPER_HISTORY_MAX_PAGES)*300*step)
+    if start%1000 and pos.get('coverage')=='COMPLETE':
+        pos['coverage']='SUBSECOND_ENTRY_OMITTED' 
+    bars = []
+    if first_full > start:
+        if PAPER_SECOND_BARS:
+            partial, ok = await _history_range(pos['symbol'], '1s', ((start+999)//1000)*1000, min(first_full,end), 1000)
+            bars.extend(partial)
+            if not ok:
+                pos['coverage'] = 'INCOMPLETE_ENTRY'
+        else:
+            pos['coverage'] = 'INCOMPLETE_ENTRY'
+    if first_full < end:
+        full, ok = await _history_range(pos['symbol'], V107_TAKIP_TF, first_full, end, step)
+        bars.extend(full)
+        if not ok:
+            pos['coverage'] = 'INCOMPLETE_HISTORY'
+    refined = []
+    for row in bars:
+        hi, lo = safe_float(row[2]), safe_float(row[3])
+        stop = lo <= pos['orig_stop'] if pos['side']=='LONG' else hi >= pos['orig_stop']
+        target = any((hi >= pos[f'tp{i}'] if pos['side']=='LONG' else lo <= pos[f'tp{i}'])
+                     and not pos.get(f'hit{i}') for i in range(1,5))
+        if row[9] > 1000 and PAPER_SECOND_BARS and (stop or target):
+            seconds, ok = await _history_range(pos['symbol'], '1s', int(row[0]), int(row[0])+row[9], 1000)
+            if ok and seconds:
+                refined.extend(seconds)
+                continue
+            pos['coverage'] = 'COARSE_EXIT_BAR'
+        refined.append(row)
+    return sorted(refined,key=lambda r:int(r[0])), V107_TAKIP_TF
 
 
 def _tp_weights() -> List[float]:
@@ -3539,16 +3597,16 @@ def _tp_weights() -> List[float]:
 
 
 def _paper_realized_r(pos, stop_remaining: bool) -> float:
-    weights = _tp_weights()
-    rrs = [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
+    weights = pos.get("tp_weights") or _tp_weights()
+    rrs = pos.get("tp_rrs") or [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
     realized = sum(weights[i] * rrs[i] for i in range(4) if pos.get(f"hit{i + 1}"))
     remaining = sum(weights[i] for i in range(4) if not pos.get(f"hit{i + 1}"))
     return realized - remaining if stop_remaining else realized
 
 
 def _paper_time_exit_r(pos, current_r: float) -> float:
-    weights = _tp_weights()
-    rrs = [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
+    weights = pos.get("tp_weights") or _tp_weights()
+    rrs = pos.get("tp_rrs") or [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
     realized = sum(weights[i] * rrs[i] for i in range(4) if pos.get(f"hit{i + 1}"))
     remaining = sum(weights[i] for i in range(4) if not pos.get(f"hit{i + 1}"))
     return realized + remaining * current_r
@@ -3605,21 +3663,13 @@ def v10_update_excursions(pos: Dict[str, Any], barlar: List[List[Any]]) -> None:
         move = entry - last
     pos["mfe_pct"] = round(max(safe_float(pos.get("mfe_pct")), favorable), 6)
     pos["mae_pct"] = round(max(safe_float(pos.get("mae_pct")), adverse), 6)
-    pos["current_r"] = round(move / risk, 6) if risk > 0 else 0.0
-    olcum_db_pozisyon_guncelle(pos)
+    pos["current_r"] = round(_paper_time_exit_r(pos, move / risk), 6) if risk > 0 else 0.0
 
 
 def v10_record_closed(pos, R, outcome):
-    mp = _v10_mem()
-    mp["closed"].append({"symbol": pos["symbol"], "side": pos["side"], "R": round(R, 3),
-                         "outcome": outcome, "hit1": bool(pos.get("hit1")),
-                         "hit2": bool(pos.get("hit2")), "hit3": bool(pos.get("hit3")),
-                         "hit4": bool(pos.get("hit4")),
-                         "score": pos["score"], "event": pos["event"],
-                         "range_break": bool(pos.get("range_break")),
-                         "tutma_dk": round((time.time() - safe_float(pos.get("open_ts", 0))) / 60.0, 1),
-                         "close_ts": time.time()})
-    olcum_db_pozisyon_guncelle(pos, outcome, R)
+    closed = _v10_mem()['closed']
+    if not any(p.get('uid')==pos['uid'] for p in closed):
+        closed.append(_closed_record(pos,R,outcome))
 
 
 def v10_cooldown_ok(symbol):
@@ -3696,74 +3746,73 @@ def veri_kalitesi_uygun(sig: Dict[str, Any]) -> Tuple[bool, str]:
 async def maybe_send_v10_signal(sig):
     if not sig:
         return
-    symbol = sig["symbol"]
-    side = sig["direction"]
-    ckey = symbol
-    legacy_ckey = f"{symbol}:{side}"
-    if (v10_sent_candle.get(ckey) == sig["candle_ts"] or
-            v10_sent_candle.get(legacy_ckey) == sig["candle_ts"]):
-        return
-    if not v10_cooldown_ok(symbol):
-        return
-
-    mp = _v10_mem()
-    limit = OLCUM_MAX_OPEN if OLCUM_MODU else V10_MAX_OPEN
-    if len(mp["open"]) >= limit:
-        stats["v107_red_defter_dolu"] = int(stats.get("v107_red_defter_dolu", 0)) + 1
-        return
-    if V107_ACIKKEN_ENGELLE and any(p.get("symbol") == symbol for p in mp["open"]):
-        stats["v107_red_acik_poz"] = int(stats.get("v107_red_acik_poz", 0)) + 1
-        return
-
-    risk_ok, risk_not = risk_sinyal_uygun(symbol, side)
-    if not risk_ok:
-        stats["risk_reject"] = int(stats.get("risk_reject", 0)) + 1
-        audit_yaz("RISK_REJECT", symbol=symbol, payload={"side": side, "reason": risk_not})
-        return
-    veri_ok, veri_not = veri_kalitesi_uygun(sig)
-    if not veri_ok:
-        stats["data_quality_reject"] = int(stats.get("data_quality_reject", 0)) + 1
-        audit_yaz("DATA_REJECT", symbol=symbol, payload={"side": side, "reason": veri_not})
-        return
-
-    balina_signal_ekle(sig)
-    if BALINA_KARLI_KAPI_ENABLED and BALINA_MOTOR_ENABLED:
-        durum = str(sig.get("balina_durum", "VERI_YETERSIZ")).upper()
-        if durum not in BALINA_KARLI_DURUMLAR:
-            stats["balina_red_karli_kapi"] = int(stats.get("balina_red_karli_kapi", 0)) + 1
+    async with _SIGNAL_LOCK:
+        symbol, side = sig["symbol"], sig["direction"]
+        if any(v10_sent_candle.get(key) == sig["candle_ts"] for key in (symbol, f"{symbol}:{side}")):
+            stats["duplicate_signal_skip"] = int(stats.get("duplicate_signal_skip", 0)) + 1
             return
-    if BALINA_MOTOR_BLOCK and not BALINA_KARLI_KAPI_ENABLED:
-        akis = sig.get("balina_akis") or {}
-        durum = str(akis.get("durum", ""))
-        guven = safe_float(akis.get("guven"))
-        long_conflicts = {"DAGITIM", "ALIS_EMILIMI", "BALINA_SATISI", "PARCALI_BALINA_SATISI"}
-        short_conflicts = {"BIRIKIM", "SATIS_EMILIMI", "BALINA_ALIMI", "PARCALI_BALINA_ALIMI"}
-        conflict = ((side == "LONG" and durum in long_conflicts) or
-                    (side == "SHORT" and durum in short_conflicts))
-        if akis.get("status") == "CANLI" and guven >= 70.0 and conflict:
-            stats["balina_red_conflict"] = int(stats.get("balina_red_conflict", 0)) + 1
+        if not v10_cooldown_ok(symbol):
+            stats["cooldown_skip"] = int(stats.get("cooldown_skip", 0)) + 1
             return
-
-    signal_no = max(int(safe_float(memory.get("signal_seq", 0))),
-                    int(stats.get("v10_signals", 0))) + 1
-    sig["signal_no"] = signal_no
-    ok = await send_rich_signal(
-        build_v10_message(sig), symbol, side,
-        entry=safe_float(sig.get("entry")), stop=safe_float(sig.get("stop")),
-        tps={"TP1": sig.get("tp1"), "TP2": sig.get("tp2"), "TP3": sig.get("tp3"), "TP4": sig.get("tp4")},
-        meta={"score": sig.get("score"), "rsi": sig.get("rsi"),
-              "funding": sig.get("funding"), "oi": sig.get("oi_change_pct"),
-              "session_name": sig.get("session_name", ""), "adx": sig.get("adx", 0)},
-    )
-    if ok:
-        memory["signal_seq"] = signal_no
-        v10_last_alert[symbol] = time.time()
-        v10_sent_candle[ckey] = sig["candle_ts"]
-        v10_open_paper(sig)
-        stats["v10_signals"] = int(stats.get("v10_signals", 0)) + 1
-        stats["last_signal"] = f"V12.0 {side} {symbol} skor {sig['score']}"
-        logger.info("V12.0 SİNYAL %s %s skor=%s session=%s adx=%.1f",
-                    side, symbol, sig["score"], sig.get("session_name"), sig.get("adx", 0))
+        mp = _v10_mem()
+        if any(p.get('symbol')==symbol for p in mp.get('recovery_pending',[])):
+            stats['recovery_symbol_block'] = int(stats.get('recovery_symbol_block',0))+1
+            return
+        if len(mp["open"]) >= (OLCUM_MAX_OPEN if OLCUM_MODU else V10_MAX_OPEN):
+            stats["v107_red_defter_dolu"] += 1
+            return
+        if V107_ACIKKEN_ENGELLE and any(p.get("symbol") == symbol for p in mp["open"]):
+            stats["v107_red_acik_poz"] += 1
+            return
+        risk_ok, risk_note = await _db_call(risk_sinyal_uygun, symbol, side)
+        if not risk_ok:
+            stats["risk_reject"] += 1
+            await _db_call(audit_yaz, "RISK_REJECT", "", symbol, {"reason": risk_note})
+            return
+        # Filtrelerden önce taze snapshot; veri kalitesi boş sözlüğe bakmaz.
+        balina_signal_ekle(sig)
+        data_ok, data_note = veri_kalitesi_uygun(sig)
+        if not data_ok:
+            stats["data_quality_reject"] += 1
+            return
+        whale_ok, whale_note = _balina_gate(sig)
+        sig["balina_gate"] = whale_note
+        if not whale_ok and not OLCUM_MODU:
+            stats["balina_red_karli_kapi"] += 1
+            return
+        if not whale_ok:
+            stats["balina_would_reject"] = int(stats.get("balina_would_reject", 0)) + 1
+        try:
+            quote = await _live_entry_quote(symbol, side)
+        except Exception:
+            stats["entry_quote_fail"] = int(stats.get("entry_quote_fail", 0)) + 1
+            logger.warning("Güncel giriş verisi yok: %s", symbol)
+            return
+        ref = safe_float(sig.get("entry_ref"))
+        slip = abs(quote["price"]-ref)/ref*100 if ref > 0 else 0
+        if not OLCUM_MODU and V107_MAX_GIRIS_KAYMA > 0 and slip > V107_MAX_GIRIS_KAYMA:
+            stats["v107_red_kayma"] += 1
+            return
+        sig = copy.deepcopy(sig)
+        sig.update(entry=quote["price"], entry_kaynak=quote["source"], accepted_ts=time.time(),
+                   entry_quote_ts=quote["ts"], entry_kayma_pct=round(slip, 4))
+        sig.update(v10_targets(side, sig["entry"]))
+        sig.setdefault("kapi_sonuclari", {})["kayma"] = _kapi_durum(V107_MAX_GIRIS_KAYMA <= 0 or slip <= V107_MAX_GIRIS_KAYMA)
+        pos = v10_open_paper(sig, persist=False)
+        # Commit + outbox tek transaction: Telegram sonucu defteri belirlemez.
+        try:
+            pos = await _db_call(_persist_open, pos, sig)
+        except Exception:
+            stats["ledger_write_fail"] = int(stats.get("ledger_write_fail", 0)) + 1
+            logger.exception("Sinyal kaydedilemedi: %s", symbol)
+            return
+        mp["open"].append(pos)
+        memory["signal_seq"] = pos["signal_no"]
+        v10_last_alert[symbol] = pos["open_ts"]
+        v10_sent_candle[symbol] = sig["candle_ts"]
+        stats["v10_signals"] += 1
+        stats["last_signal"] = f"{BOT_BUILD} #{pos['signal_no']} {side} {symbol}"
+        logger.info("Paper sinyal kaydedildi #%s %s %s", pos["signal_no"], side, symbol)
 
 
 async def v10_scan_loop() -> None:
@@ -3779,8 +3828,11 @@ async def v10_scan_loop() -> None:
                 batch = coins[i:i + batch_size]
                 tasks = [analyze_v10_symbol(sym) for sym in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                for res in results:
+                for symbol, res in zip(batch, results):
+                    _RUNTIME_HEALTH["scan_heartbeat"] = time.time()
                     if isinstance(res, Exception):
+                        stats["analysis_error"] = int(stats.get("analysis_error", 0)) + 1
+                        logger.error("Analiz hatası %s: %s", symbol, type(res).__name__, exc_info=(type(res), res, res.__traceback__))
                         continue
                     stats["v10_analyzed"] = int(stats.get("v10_analyzed", 0)) + 1
                     if res:
@@ -3793,136 +3845,46 @@ async def v10_scan_loop() -> None:
 
 
 async def v10_paper_loop() -> None:
-    await asyncio.sleep(12)
     while True:
-        _RUNTIME_HEALTH["paper_heartbeat"] = time.time()
-        try:
-            mp = _v10_mem()
-            kapananlar = set()
-            for pos in list(mp["open"]):
-                uid = v107_pos_uid(pos)
-                barlar, _ = await v107_takip_barlari(pos)
-                if not barlar:
-                    continue
-                v10_update_excursions(pos, barlar)
-                R, oc = v107_check_paper_barlar(pos, barlar)
-                pending_hits = list(pos.pop("pending_hits", []))
-                if pending_hits:
-                    olcum_db_pozisyon_guncelle(pos)
-                notified = pos.setdefault("notified_hits", [])
-                for idx in pending_hits:
-                    if idx in notified:
-                        continue
-                    notified.append(idx)
-                    await safe_send_telegram(
-                        f"✅ TP{idx} GELDİ | {pos['side']} | {pos['symbol']}\n"
-                        f"Seviye: {_v10_fmt(pos.get(f'tp{idx}'))} | Saat: {tr_str()}"
-                    )
-
-                # Time-based exit
-                if not oc and TIME_EXIT_ENABLED:
-                    yas_saat = (time.time() - safe_float(pos.get("open_ts", 0))) / 3600.0
-                    if yas_saat >= TIME_EXIT_HOURS:
-                        son = safe_float(barlar[-1][4])
-                        risk = abs(safe_float(pos["entry"]) - safe_float(pos["orig_stop"]))
-                        if risk > 0:
-                            kâr_move = (son - safe_float(pos["entry"])) if pos["side"] == "LONG" else (safe_float(pos["entry"]) - son)
-                            kâr_r = kâr_move / risk
-                            # Süre dolduğunda sonuç ne olursa olsun pozisyon kapanır.
-                            R, oc = round(_paper_time_exit_r(pos, kâr_r), 3), "TIME_EXIT"
-
-                if not oc:
-                    continue
-                v10_record_closed(pos, R, oc)
-                olcum_db_sonuc_tipi_yaz(pos, oc)
-                if oc == "STOP" and GOLGE_IZLEME:
-                    stop_ts = time.time()
-                    golge = {
-                        "uid": uid,
-                        "symbol": pos["symbol"], "side": pos["side"],
-                        "entry": pos["entry"],
-                        "tp1": pos["tp1"], "tp2": pos["tp2"],
-                        "tp3": pos["tp3"], "tp4": pos["tp4"],
-                        "stop_ts": stop_ts, "scan_ts": 0.0,
-                        "kontrol": bool(pos.get("kontrol")),
-                        "golge_tp": 0, "golge_mfe_pct": 0.0,
-                        "golge_mae_pct": 0.0, "golge_tp1_dk": None,
-                        "golge_tp2_dk": None, "golge_tp3_dk": None,
-                        "golge_tp4_dk": None,
-                    }
-                    mp["golge"].append(golge)
-                    olcum_db_golge_baslat(pos)
-                exit_price = pos["orig_stop"] if oc == "STOP" else (pos["tp4"] if oc == "TP4" else safe_float(barlar[-1][4]))
-                await safe_send_telegram(build_v10_close_message(pos, R, oc, exit_price))
-                kapananlar.add(uid)
-            if kapananlar:
-                mp["open"] = [p for p in mp["open"] if v107_pos_uid(p) not in kapananlar]
-        except Exception as e:
-            logger.exception("v10_paper_loop hata: %s", e)
-        await asyncio.sleep(max(V107_TAKIP_ARALIK_SEC, 20))
+        await paper_tur()
+        _RUNTIME_HEALTH['paper_heartbeat'] = time.time()
+        await asyncio.sleep(max(1,V107_TAKIP_ARALIK_SEC))
 
 
 def golge_kaydi_guncelle(golge: Dict[str, Any], barlar: List[List[Any]]) -> None:
-    entry = safe_float(golge.get("entry"))
-    stop_ms = safe_float(golge.get("stop_ts")) * 1000.0
-    scan_ms = safe_float(golge.get("scan_ts"))
-    yeni_barlar = [r for r in barlar if safe_float(r[0]) > stop_ms and safe_float(r[0]) > scan_ms]
-    if entry <= 0 or not yeni_barlar:
+    entry = safe_float(golge.get('entry'))
+    stop = safe_float(golge.get('stop_ts'))*1000
+    end = safe_float(golge.get('end_ts'),golge['stop_ts']+GOLGE_SAAT*3600)*1000
+    scan = safe_float(golge.get('scan_ts'))
+    if entry<=0:
         return
-    max_hi = max(safe_float(r[2]) for r in yeni_barlar)
-    min_lo = min(safe_float(r[3]) for r in yeni_barlar)
-    if golge.get("side") == "LONG":
-        lehe = max(0.0, (max_hi - entry) / entry * 100.0)
-        aleyhe = max(0.0, (entry - min_lo) / entry * 100.0)
-        degdi = lambda r, seviye: safe_float(r[2]) >= seviye
-    else:
-        lehe = max(0.0, (entry - min_lo) / entry * 100.0)
-        aleyhe = max(0.0, (max_hi - entry) / entry * 100.0)
-        degdi = lambda r, seviye: safe_float(r[3]) <= seviye
-    golge["golge_mfe_pct"] = round(max(safe_float(golge.get("golge_mfe_pct")), lehe), 6)
-    golge["golge_mae_pct"] = round(max(safe_float(golge.get("golge_mae_pct")), aleyhe), 6)
-    for idx in range(1, 5):
-        seviye = safe_float(golge.get(f"tp{idx}"))
-        if seviye <= 0:
+    for r in sorted(barlar,key=lambda r:safe_float(r[0])):
+        ts = safe_float(r[0])
+        duration = safe_float(r[9]) if len(r)>9 else interval_minutes(GOLGE_TF)*60000
+        if ts<stop or ts<scan or ts+duration>end:
             continue
-        ilk_bar = next((r for r in yeni_barlar if degdi(r, seviye)), None)
-        if ilk_bar is not None:
-            golge["golge_tp"] = max(int(golge.get("golge_tp", 0)), idx)
-            zaman_anahtari = f"golge_tp{idx}_dk"
-            if golge.get(zaman_anahtari) is None:
-                golge[zaman_anahtari] = round(
-                    max(0.0, (safe_float(ilk_bar[0]) / 1000.0 - safe_float(golge.get("stop_ts"))) / 60.0), 3
-                )
-    golge["scan_ts"] = max(safe_float(r[0]) for r in yeni_barlar)
+        hi,lo = safe_float(r[2]),safe_float(r[3])
+        long = golge['side']=='LONG'
+        favorable = max(0,(hi-entry)/entry*100 if long else (entry-lo)/entry*100)
+        adverse = max(0,(entry-lo)/entry*100 if long else (hi-entry)/entry*100)
+        golge['golge_mfe_pct'] = max(safe_float(golge.get('golge_mfe_pct')),favorable)
+        golge['golge_mae_pct'] = max(safe_float(golge.get('golge_mae_pct')),adverse)
+        for i in range(1,5):
+            level = safe_float(golge.get(f'tp{i}'))
+            if level>0 and (hi>=level if long else lo<=level):
+                golge['golge_tp'] = max(int(golge.get('golge_tp',0)),i)
+                if golge.get(f'golge_tp{i}_dk') is None:
+                    golge[f'golge_tp{i}_dk'] = max(0,(ts+duration-stop)/60000)
+        # Forming bar aynı timestamp ile yeniden okunur, sadece confirm=1 ilerletir.
+        golge['scan_ts'] = ts+duration if len(r)>8 and str(r[8])=='1' else ts
 
 
 async def golge_loop() -> None:
-    await asyncio.sleep(15)
     while True:
-        _RUNTIME_HEALTH["shadow_heartbeat"] = time.time()
-        try:
-            if GOLGE_IZLEME:
-                mp = _v10_mem()
-                gruplar: Dict[str, List[Dict[str, Any]]] = {}
-                for golge in list(mp.get("golge", [])):
-                    gruplar.setdefault(str(golge.get("symbol", "")), []).append(golge)
-                biten_uidler = set()
-                simdi = time.time()
-                for symbol, kayitlar in gruplar.items():
-                    barlar = await get_klines(symbol, GOLGE_TF, 300, ttl=max(10.0, GOLGE_ARALIK_SEC * 0.8))
-                    for golge in kayitlar:
-                        if barlar:
-                            golge_kaydi_guncelle(golge, barlar)
-                        bitti = simdi >= safe_float(golge.get("stop_ts")) + max(0.0, GOLGE_SAAT) * 3600.0
-                        olcum_db_golge_guncelle(golge, bitti)
-                        if bitti:
-                            biten_uidler.add(str(golge.get("uid", "")))
-                if biten_uidler:
-                    mp["golge"] = [g for g in mp.get("golge", [])
-                                   if str(g.get("uid", "")) not in biten_uidler]
-        except Exception as e:
-            logger.exception("golge_loop hata: %s", e)
-        await asyncio.sleep(max(1, GOLGE_ARALIK_SEC))
+        _RUNTIME_HEALTH['shadow_heartbeat']=time.time()
+        if GOLGE_IZLEME:
+            await golge_tur()
+        await asyncio.sleep(max(1,GOLGE_ARALIK_SEC))
 
 
 async def save_loop() -> None:
@@ -3931,7 +3893,8 @@ async def save_loop() -> None:
             await save_memory_async()
             _RUNTIME_HEALTH["save_heartbeat"] = time.time()
         except Exception:
-            pass
+            stats["memory_save_fail"] = int(stats.get("memory_save_fail",0))+1
+            logger.exception("JSON snapshot yazılamadı")
         await asyncio.sleep(max(20, MEMORY_SAVE_INTERVAL_SEC))
 
 
@@ -3973,7 +3936,10 @@ def db_yedekle() -> List[str]:
         (os.path.join(DB_BACKUP_DIR, x) for x in os.listdir(DB_BACKUP_DIR) if x.endswith(".bak")),
         key=lambda x: os.path.getmtime(x), reverse=True,
     )
-    for eski in dosyalar[max(1, DB_BACKUP_KEEP):]:
+    # KEEP dosya değil, aynı zaman damgalı tam yedek seti sayısıdır.
+    stamps = sorted({p.rsplit('.',2)[-2] for p in dosyalar},reverse=True)
+    keep = set(stamps[:max(1,DB_BACKUP_KEEP)])
+    for eski in [p for p in dosyalar if p.rsplit('.',2)[-2] not in keep]:
         try:
             os.remove(eski)
         except OSError:
@@ -3990,15 +3956,17 @@ def health_raporu_uret() -> str:
         disk_free = disk.free / (1024 ** 3)
     except Exception:
         disk_free = 0.0
-    ws_age = now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"))
+    ws_age = max(0.0, now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"), now))
     return (
-        "🏥 V12.0 SİSTEM SAĞLIĞI\n"
+        "🏥 V12.0.1 SİSTEM SAĞLIĞI\n"
         f"Çalışma süresi: {(now-safe_float(_RUNTIME_HEALTH.get('started_ts')))/3600:.1f} saat\n"
         f"Tarama yaşı: {now-safe_float(_RUNTIME_HEALTH.get('scan_heartbeat')):.1f} sn\n"
         f"Paper takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('paper_heartbeat')):.1f} sn\n"
         f"Gölge takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('shadow_heartbeat')):.1f} sn\n"
         f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK'} | veri yaşı {ws_age:.1f} sn\n"
         f"DB integrity: {_RUNTIME_HEALTH.get('db_integrity')}\n"
+        f"Gözetilen döngü: {len(_BACKGROUND_TASKS)} | Yeniden başlatma: {stats.get('task_restart',0)}\n"
+        f"Kurtarma bekleyen: {stats.get('recovery_missing_position',0)} | Paper hata: {stats.get('paper_position_error',0)}\n"
         f"Son yedek yaşı: {(now-safe_float(_RUNTIME_HEALTH.get('last_backup_ts')))/3600:.1f} saat\n"
         f"Boş disk: {disk_free:.2f} GB\n"
         f"Risk: günlük {risk['daily_r']:+.2f}R | haftalık {risk['weekly_r']:+.2f}R | "
@@ -4028,60 +3996,48 @@ async def kurumsal_bakim_loop() -> None:
                     stats["backup_fail"] = int(stats.get("backup_fail", 0)) + 1
                     logger.exception("DB yedekleme hatası: %s", e)
             sorunlar = []
+            if stats.get('recovery_missing_position',0):
+                sorunlar.append('açık kayıtlar için eski JSON yedeğinden kurtarma gerekiyor')
             if now - safe_float(_RUNTIME_HEALTH.get("scan_heartbeat")) > SCAN_STALE_SEC:
                 sorunlar.append("tarama döngüsü gecikti")
             if now - safe_float(_RUNTIME_HEALTH.get("paper_heartbeat")) > PAPER_STALE_SEC:
                 sorunlar.append("paper takip döngüsü gecikti")
-            if BALINA_MOTOR_ENABLED and (_BALINA_WS_STATUS.get("connected") and
+            if BALINA_MOTOR_ENABLED and (not _BALINA_WS_STATUS.get("connected") or
                     now - safe_float(_BALINA_WS_STATUS.get("last_message_ts")) > DATA_MAX_AGE_SEC):
-                sorunlar.append("WebSocket verisi eski")
+                sorunlar.append("WebSocket bağlı değil veya verisi eski")
             if _RUNTIME_HEALTH.get("db_integrity") != "OK":
                 sorunlar.append("DB integrity başarısız")
             if sorunlar and HEALTH_ALERT_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_health_alert_ts")) >= HEALTH_ALERT_COOLDOWN_SEC:
                 _RUNTIME_HEALTH["last_health_alert_ts"] = now
                 stats["health_alert"] = int(stats.get("health_alert", 0)) + 1
-                await safe_send_telegram("🚨 V12.0 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
+                await safe_send_telegram("🚨 V12.0.1 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
         except Exception as e:
             logger.exception("kurumsal_bakim_loop hata: %s", e)
         await asyncio.sleep(max(15, HEALTH_CHECK_INTERVAL_SEC))
 
 
 def kapi_raporu_uret() -> str:
-    rows = olcum_db_satirlari()
-    if not rows:
-        return "🧪 KAPI LABORATUVARI\nHenüz ölçüm kaydı yok."
-    lines = [f"🧪 KAPI LABORATUVARI | Toplam örnek: {len(rows)} | Min hücre: {OLCUM_MIN_HUCRE}"]
-    kontrol_rows = [(safe_float(r[1]), safe_float(r[2])) for r in rows if int(r[0] or 0) == 1]
-    if len(kontrol_rows) >= OLCUM_MIN_HUCRE:
-        lines.append(f"🎲 Kontrol n={len(kontrol_rows)} | Ort.R {avg([x[0] for x in kontrol_rows]):+.3f} | Ort.MFE %{avg([x[1] for x in kontrol_rows]):.3f}")
-    else:
-        lines.append(f"🎲 Kontrol: ölçülemez (n={len(kontrol_rows)})")
+    rows = _report_rows()
+    lines = [f'🧪 KAPI LABORATUVARI | Toplam örnek: {len(rows)} | Min hücre: {OLCUM_MIN_HUCRE}',_report_scope(),
+             'R: kapanmış; MFE: açık+kapalı. Eksik kapılar ölçümsüzdür.']
     for gate in OLCUM_KAPILARI:
-        lines.append(f"\n• {gate}")
-        for kontrol_degeri, grup_adi in ((0, "Normal"), (1, "Kontrol")):
-            cells: Dict[str, List[Tuple[float, float]]] = {"gecti": [], "kesti": []}
-            for kontrol, rv, mfe, _mae, raw_json, _durum in rows:
-                if int(kontrol or 0) != kontrol_degeri:
-                    continue
-                try:
-                    durum = json.loads(raw_json or "{}").get(gate, "olcumsuz")
-                except Exception:
-                    durum = "olcumsuz"
-                if durum in cells:
-                    cells[durum].append((safe_float(rv), safe_float(mfe)))
-            g, k_ = cells["gecti"], cells["kesti"]
-            lines.append(f"  {grup_adi} | geçen n={len(g)} | kesen n={len(k_)}")
-            if len(g) < OLCUM_MIN_HUCRE:
-                lines.append(f"    Geçen: ölçülemez (n={len(g)})")
-            else:
-                lines.append(f"    Geçen: Ort.R {avg([x[0] for x in g]):+.3f} | Ort.MFE %{avg([x[1] for x in g]):.3f}")
-            if len(k_) < OLCUM_MIN_HUCRE:
-                lines.append(f"    Kesen: ölçülemez (n={len(k_)})")
-            else:
-                lines.append(f"    Kesen: Ort.R {avg([x[0] for x in k_]):+.3f} | Ort.MFE %{avg([x[1] for x in k_]):.3f}")
-            if len(g) >= OLCUM_MIN_HUCRE and len(k_) >= OLCUM_MIN_HUCRE:
-                lines.append(f"    Fark: ΔR {avg([x[0] for x in g])-avg([x[0] for x in k_]):+.3f} | ΔMFE %{avg([x[1] for x in g])-avg([x[1] for x in k_]):+.3f}")
-    return "\n".join(lines)
+        lines.append('\n• '+gate)
+        for control,name in ((0,'Normal'),(1,'Kontrol')):
+            group = [r for r in rows if r['kontrol']==control]
+            cells = {v:[r for r in group if r.get('kapilar',{}).get(gate)==v] for v in ('gecti','kesti')}
+            metrics = []
+            lines.append(f"{name} | ölçümsüz {len(group)-sum(map(len,cells.values()))}")
+            for value,label in (('gecti','Geçen'),('kesti','Kesen')):
+                m = _kombinasyon_metrik(cells[value]); metrics.append(m)
+                rr = _metric(m['r']) if m['kapanan']>=OLCUM_MIN_HUCRE else f"ölçülemez (n={m['kapanan']})"
+                mfe = _metric(m['mfe']) if m['toplam']>=OLCUM_MIN_HUCRE else f"ölçülemez (n={m['toplam']})"
+                lines.append(f"  {label}: toplam {m['toplam']} | kapanan {m['kapanan']} | Ort.R {rr} | Ort.MFE %{mfe}")
+            a,b = metrics
+            if min(a['kapanan'],b['kapanan'])>=OLCUM_MIN_HUCRE:
+                lines.append('  ΔR '+_metric(a['r']-b['r']))
+            if min(a['toplam'],b['toplam'])>=OLCUM_MIN_HUCRE:
+                lines.append('  ΔMFE %'+_metric(a['mfe']-b['mfe']))
+    return '\n'.join(lines)
 
 
 def telegram_parcala(text: str, limit: int = 4000) -> List[str]:
@@ -4115,7 +4071,7 @@ def yuzdelik(values: List[float], oran: float) -> float:
 
 def tp_raporu_uret() -> str:
     rows = olcum_db_tp_satirlari()
-    lines = ["📊 TP RAPORU"]
+    lines = ["📊 TP RAPORU | tüm sürümler", "TP oranları gözlenen temastır; açık/gölge izleme tamamlanmamıştır."]
     for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
         grup = [r for r in rows if int(r[0] or 0) == kontrol_degeri]
         kapali = [r for r in grup if r[4] != "ACIK"]
@@ -4171,7 +4127,7 @@ def tp_raporu_uret() -> str:
             f"p90 %{yuzdelik(golge_mfe, 0.90):.3f}"
         )
         lines.append(f"Gölge MAE medyan %{yuzdelik(golge_mae, 0.50):.3f}")
-        lines.append(f"TP1 süresi medyan {yuzdelik(golge_tp1_dk, 0.50):.1f} dk")
+        lines.append("TP1 süresi medyan "+(_metric(yuzdelik(golge_tp1_dk,.5),1)+" dk (mum sonu üst sınırı)" if golge_tp1_dk else "— (ulaşan yok)"))
     return "\n".join(lines)
 
 
@@ -4256,15 +4212,15 @@ def ortak_ozellik_analiz(grup_a: List[Dict[str, Any]],
 
 
 def ortak_rapor_uret(ters: bool = False) -> str:
-    tum = olcum_db_ortak_satirlari()
+    tum = _report_rows()
     baslik = "🧪 STOP ORTAK ÖZELLİK" if ters else "🧪 TP ORTAK ÖZELLİK"
-    lines = [baslik + " | açık TP1 pozisyonları dahil"]
+    lines = [baslik + " | açık TP1 pozisyonları dahil", _report_scope()]
     lines.append("⚠️ ~40 özellik test edildi. Bu kadar özellikte şans eseri fark çıkması beklenir. Buradaki bulgular hipotezdir, karar değildir — yeni bir örnekte doğrulanmadan kapı değiştirme.")
     tp_sonuclari = {"TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM"}
     for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
         kaynak = [r for r in tum if int(r.get("kontrol", 0)) == kontrol_degeri]
         tp_grubu = [r for r in kaynak if r.get("sonuc_tipi") in tp_sonuclari or
-                    (r.get("durum") == "ACIK" and r.get("hit1"))]
+                    r.get("hit1")]
         temiz_stop = [r for r in kaynak if r.get("sonuc_tipi") == "TEMIZ_STOP"]
         grup_a, grup_b = (temiz_stop, tp_grubu) if ters else (tp_grubu, temiz_stop)
         lines.append(f"\n{grup_adi} | A n={len(grup_a)} | B n={len(grup_b)}")
@@ -4272,219 +4228,146 @@ def ortak_rapor_uret(ters: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _kombinasyon_kosullari(rec: Dict[str, Any]) -> Dict[str, bool]:
-    oz = rec.get("ozellikler") or {}
-    kapilar = rec.get("kapilar") or {}
-    return {
-        "oi": safe_float(oz.get("oi_pct")) > 1.0,
-        "coin_ema": kapilar.get("coin_1h_ema") == "gecti",
-        "range": kapilar.get("range") == "gecti",
-        "kapanis": str(oz.get("giris_tipi") or "").lower() == "kapanis",
-        "spoof": kapilar.get("spoof") == "gecti",
-    }
+def _kombinasyon_kosullari(rec: Dict[str, Any]) -> Dict[str, Optional[bool]]:
+    oz, gates = rec.get('ozellikler') or {}, rec.get('kapilar') or {}
+    def gate(name):
+        return True if gates.get(name)=='gecti' else False if gates.get(name)=='kesti' else None
+    oi = safe_float(oz.get('oi_pct'),None)
+    source = str(oz.get('giris_tipi') or '').lower()
+    return {'oi': oi>1 if oi is not None else None,
+            'coin_ema':gate('coin_1h_ema'),'range':gate('range'),'spoof':gate('spoof'),
+            'kapanis': source=='kapanis' if source in ('kapanis','orderbook','mum') else None}
 
 
-def _kombinasyon_metrik(rows: List[Dict[str, Any]]) -> Dict[str, float]:
-    kapanan = [r for r in rows if r.get("durum") != "ACIK"]
-    toplam = len(rows)
-    kap_n = len(kapanan)
-    temiz = sum(1 for r in kapanan if r.get("sonuc_tipi") == "TEMIZ_STOP")
-    return {
-        "toplam": toplam,
-        "kapanan": kap_n,
-        "temiz_pct": temiz / kap_n * 100.0 if kap_n else 0.0,
-        "tp1_pct": sum(1 for r in rows if r.get("hit1")) / toplam * 100.0 if toplam else 0.0,
-        "tp2_pct": sum(1 for r in rows if r.get("hit2")) / toplam * 100.0 if toplam else 0.0,
-        "tp3_pct": sum(1 for r in rows if r.get("hit3")) / toplam * 100.0 if toplam else 0.0,
-        "tp4_pct": sum(1 for r in rows if r.get("hit4")) / toplam * 100.0 if toplam else 0.0,
-        "r": avg([safe_float(r.get("r_value")) for r in kapanan]),
-        "mfe": avg([safe_float(r.get("mfe_pct")) for r in rows]),
-        "mae": avg([safe_float(r.get("mae_pct")) for r in rows]),
-    }
+def _kombinasyon_metrik(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = [r for r in rows if r.get('durum') not in ('ACIK',None)]
+    n,nc = len(rows),len(closed)
+    return {'toplam':n,'kapanan':nc,
+            'temiz_pct':sum(r.get('sonuc_tipi')=='TEMIZ_STOP' for r in closed)/nc*100 if nc else None,
+            **{f'tp{i}_pct':sum(bool(r.get(f'hit{i}')) for r in rows)/n*100 if n else None for i in range(1,5)},
+            'r':_mean_present(closed,'r_value'),'net_r':_mean_present(closed,'net_r_value'),
+            'mfe':_mean_present(rows,'mfe_pct'),'mae':_mean_present(rows,'mae_pct')}
 
 
-def _kombinasyon_metrik_satiri(ad: str, m: Dict[str, float]) -> str:
-    return (
-        f"{ad}: toplam {int(m['toplam'])} | kapanan {int(m['kapanan'])} | "
-        f"temiz stop %{m['temiz_pct']:.1f} | TP %{m['tp1_pct']:.1f}/"
-        f"%{m['tp2_pct']:.1f}/%{m['tp3_pct']:.1f}/%{m['tp4_pct']:.1f} | "
-        f"Ort.R {m['r']:+.3f} | MFE/MAE %{m['mfe']:.3f}/%{m['mae']:.3f}"
-    )
+def _kombinasyon_metrik_satiri(ad: str, m: Dict[str, Any]) -> str:
+    return (f"{ad}: toplam {m['toplam']} | kapanan {m['kapanan']} | temiz stop %"+_metric(m['temiz_pct'],1)+
+            ' | '+' / '.join(f"TP{i} %"+_metric(m[f'tp{i}_pct'],1) for i in range(1,5))+
+            ' | Brüt Ort.R '+_metric(m['r'])+' | Net Ort.R '+_metric(m['net_r'])+
+            ' | MFE/MAE %'+_metric(m['mfe'])+'/%'+_metric(m['mae']))
 
 
 def kombinasyon_raporu_uret() -> str:
-    rows = olcum_db_ortak_satirlari()
-    if not rows:
-        return "🧪 KOMBİNASYON LABORATUVARI\nHenüz ölçüm kaydı yok."
-
-    kombinasyonlar = (
-        ("OI > %1", ("oi",)),
-        ("Coin EMA uyumlu", ("coin_ema",)),
-        ("RANGE geçti", ("range",)),
-        ("Giriş kapanış", ("kapanis",)),
-        ("Spoof geçti", ("spoof",)),
-        ("OI + Coin EMA", ("oi", "coin_ema")),
-        ("OI + kapanış", ("oi", "kapanis")),
-        ("OI + Coin EMA + RANGE", ("oi", "coin_ema", "range")),
-        ("Beş şart", ("oi", "coin_ema", "range", "kapanis", "spoof")),
-    )
-    lines = [
-        f"🧪 KOMBİNASYON LABORATUVARI | Min kapanan hücre: {KOMBINASYON_MIN_KAPANIS}",
-        "TP oranları ve MFE/MAE açık+kapalı toplamdan; temiz stop ve Ort.R kapananlardan.",
-        "Bu rapor yalnız ölçer; hiçbir koşul sinyal kesmez.",
-    ]
-    for kontrol, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
-        grup = [r for r in rows if int(r.get("kontrol", 0)) == kontrol]
-        for yon in ("TÜM", "LONG", "SHORT"):
-            taban = grup if yon == "TÜM" else [r for r in grup if str(r.get("side")) == yon]
-            lines.append(f"\n{grup_adi} / {yon} | n={len(taban)}")
-            for ad, anahtarlar in kombinasyonlar:
-                gecen = [r for r in taban if all(_kombinasyon_kosullari(r)[k] for k in anahtarlar)]
-                kalan = [r for r in taban if r not in gecen]
-                mg = _kombinasyon_metrik(gecen)
-                mk = _kombinasyon_metrik(kalan)
-                lines.append(f"\n• {ad}")
-                lines.append("  " + _kombinasyon_metrik_satiri("Geçen", mg))
-                lines.append("  " + _kombinasyon_metrik_satiri("Geçmeyen", mk))
-                lines.append(
-                    f"  Fark: Δtemiz stop {mg['temiz_pct']-mk['temiz_pct']:+.1f} puan | "
-                    f"ΔTP1 {mg['tp1_pct']-mk['tp1_pct']:+.1f} puan | "
-                    f"ΔR {mg['r']-mk['r']:+.3f} | ΔMFE %{mg['mfe']-mk['mfe']:+.3f} | "
-                    f"ΔMAE %{mg['mae']-mk['mae']:+.3f}"
-                )
-                if mg["kapanan"] < KOMBINASYON_MIN_KAPANIS or mk["kapanan"] < KOMBINASYON_MIN_KAPANIS:
-                    lines.append(
-                        f"  KARAR YOK: kapanan geçen={int(mg['kapanan'])}, "
-                        f"geçmeyen={int(mk['kapanan'])}"
-                    )
-                else:
-                    lines.append("  ÖLÇÜLEBİLİR: iki hücre de minimum kapanış sayısına ulaştı")
-
-        lines.append(f"\n{grup_adi} / BALİNA DURUMU + YÖN")
-        durumlar = sorted({str((r.get("ozellikler") or {}).get("balina_durum") or "OLCUMSUZ")
-                           for r in grup})
-        for yon in ("LONG", "SHORT"):
-            yon_rows = [r for r in grup if str(r.get("side")) == yon]
-            for durum in durumlar:
-                gecen = [r for r in yon_rows
-                          if str((r.get("ozellikler") or {}).get("balina_durum") or "OLCUMSUZ") == durum]
-                if not gecen:
-                    continue
-                kalan = [r for r in yon_rows if r not in gecen]
-                mg = _kombinasyon_metrik(gecen)
-                mk = _kombinasyon_metrik(kalan)
-                lines.append("\n• " + durum + " / " + yon)
-                lines.append("  " + _kombinasyon_metrik_satiri("Durum", mg))
-                lines.append("  " + _kombinasyon_metrik_satiri("Diğer durumlar", mk))
-                lines.append(
-                    f"  Fark: Δtemiz stop {mg['temiz_pct']-mk['temiz_pct']:+.1f} puan | "
-                    f"ΔTP1 {mg['tp1_pct']-mk['tp1_pct']:+.1f} puan | "
-                    f"ΔR {mg['r']-mk['r']:+.3f} | ΔMFE %{mg['mfe']-mk['mfe']:+.3f} | "
-                    f"ΔMAE %{mg['mae']-mk['mae']:+.3f}"
-                )
-                if mg["kapanan"] < KOMBINASYON_MIN_KAPANIS or mk["kapanan"] < KOMBINASYON_MIN_KAPANIS:
-                    lines.append(
-                        f"  KARAR YOK: kapanan durum={int(mg['kapanan'])}, "
-                        f"diğer={int(mk['kapanan'])}"
-                    )
-                else:
-                    lines.append("  ÖLÇÜLEBİLİR: iki hücre de minimum kapanış sayısına ulaştı")
-    return "\n".join(lines)
+    rows = _report_rows()
+    combos = (('OI > %1',('oi',)),('Coin EMA uyumlu',('coin_ema',)),('RANGE geçti',('range',)),
+              ('Giriş kapanış',('kapanis',)),('Spoof geçti',('spoof',)),('OI + Coin EMA',('oi','coin_ema')),
+              ('OI + kapanış',('oi','kapanis')),('OI + Coin EMA + RANGE',('oi','coin_ema','range')),
+              ('Beş şart',('oi','coin_ema','range','kapanis','spoof')))
+    for r in rows:
+        r['_conditions'] = _kombinasyon_kosullari(r)
+    lines = [f'🧪 KOMBİNASYON LABORATUVARI | Min kapanan hücre: {KOMBINASYON_MIN_KAPANIS}',_report_scope(),
+             'TP ve MFE/MAE açık+kapalı; R ve temiz stop yalnız kapananlardan. Açık sonuçlar tamamlanmamıştır.',
+             'Ölçümsüz kayıtlar karşılaştırmadan çıkarılır. Hiçbir kombinasyon sinyal kesmez.']
+    for control,name in ((0,'NORMAL'),(1,'KONTROL')):
+        group = [r for r in rows if r['kontrol']==control]
+        for side in ('TÜM','LONG','SHORT'):
+            base = group if side=='TÜM' else [r for r in group if r['side']==side]
+            lines.append(f'\n{name} / {side} | n={len(base)}')
+            for label,keys in combos:
+                a,b,u = _combo_partition(base,keys)
+                lines.append('\n• '+label)
+                lines.extend(_comparison_lines(a,b,len(u)))
+        lines.append(f'\n{name} / BALİNA DURUMU + YÖN')
+        for side in ('LONG','SHORT'):
+            base = [r for r in group if r['side']==side]
+            states = defaultdict(list)
+            for r in base:
+                states[(r.get('ozellikler') or {}).get('balina_durum') or 'OLCUMSUZ'].append(r)
+            for state,a in sorted(states.items()):
+                b = [r for s,items in states.items() if s!=state for r in items]
+                lines.append(f'\n• {state} / {side}')
+                lines.extend(_comparison_lines(a,b))
+    return '\n'.join(lines)
 
 
 def dogrulama_raporu_uret() -> str:
-    if not os.path.exists(OLCUM_DB):
-        return "📐 V12.0 DOĞRULAMA\nKayıt yok."
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        rows = conn.execute(
-            "SELECT side,kontrol,open_ts,close_ts,r_value,COALESCE(net_r_value,r_value),"
-            "mfe_pct,mae_pct,kapi_json FROM olcum_pozisyon "
-            "WHERE durum!='ACIK' ORDER BY open_ts"
-        ).fetchall()
-    lines = [
-        "📐 V12.0 İLERİ DOĞRULAMA",
-        f"Maliyet: çift yön komisyon %{SIM_FEE_RATE_PCT*2:.3f} + kayma %{SIM_SLIPPAGE_PCT:.3f} "
-        f"+ funding %{SIM_FUNDING_COST_PCT:.3f}",
-        f"Minimum kapanış: {VALIDATION_MIN_CLOSED}",
-    ]
-    for kontrol, grup_ad in ((0, "NORMAL"), (1, "KONTROL")):
-        grup = [r for r in rows if int(r[1] or 0) == kontrol]
-        kesim = int(len(grup) * 0.70)
-        donemler = (("Geliştirme %70", grup[:kesim]), ("İleri doğrulama %30", grup[kesim:]))
-        lines.append(f"\n{grup_ad} | kapanan={len(grup)}")
-        for ad, veri in donemler:
-            gross = avg([safe_float(r[4]) for r in veri])
-            net = avg([safe_float(r[5]) for r in veri])
-            karar = "ölçülebilir" if len(veri) >= VALIDATION_MIN_CLOSED else "karar yok"
-            lines.append(f"{ad}: n={len(veri)} | Brüt EV {gross:+.3f}R | Net EV {net:+.3f}R | {karar}")
-        for side in ("LONG", "SHORT"):
-            veri = [r for r in grup if r[0] == side]
-            lines.append(
-                f"{side}: n={len(veri)} | Net EV {avg([safe_float(r[5]) for r in veri]):+.3f}R | "
-                f"MFE/MAE %{avg([safe_float(r[6]) for r in veri]):.3f}/%{avg([safe_float(r[7]) for r in veri]):.3f}"
-            )
-        rejimler: Dict[str, List[Tuple[Any, ...]]] = defaultdict(list)
-        for r in grup:
-            try:
-                payload = json.loads(r[8] or "{}")
-                rejim = str((payload.get("_ozellikler") or {}).get("piyasa_modu") or "OLCUMSUZ")
-            except Exception:
-                rejim = "OLCUMSUZ"
-            rejimler[rejim].append(r)
-        for rejim, veri in sorted(rejimler.items(), key=lambda x: (-len(x[1]), x[0])):
-            lines.append(f"Rejim {rejim}: n={len(veri)} | Net EV {avg([safe_float(r[5]) for r in veri]):+.3f}R")
-    lines.append("\n⚠️ İleri doğrulama bölümü minimum örneğe ulaşmadan kapı kararı verilmez.")
-    return "\n".join(lines)
+    rows = _report_rows()
+    lines = ['📐 V12.0.1 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
+             'Maliyet girişte dondurulur; net R komisyon/kayma/funding varsayımı sonrasıdır.']
+    if VALIDATION_START_TS<=0:
+        lines.append('Sabit ileri doğrulama başlangıcı tanımlanmadı; sonuçlar betimseldir, karar yok.')
+    else:
+        lines.append('Sabit doğrulama başlangıcı: '+tr_str(VALIDATION_START_TS))
+    for control,name in ((0,'NORMAL'),(1,'KONTROL')):
+        group = [r for r in rows if r['kontrol']==control]
+        closed = [r for r in group if r['durum']!='ACIK']
+        lines.append(f"\n{name} | kapanan={len(closed)} | açık={len(group)-len(closed)}")
+        splits = [('Tüm kapananlar',closed)] if VALIDATION_START_TS<=0 else [
+            ('Başlangıç öncesi',[r for r in closed if r['open_ts']<VALIDATION_START_TS]),
+            ('İleri doğrulama',[r for r in closed if r['open_ts']>=VALIDATION_START_TS])]
+        for label,part in splits:
+            lines.append(f'{label}: n={len(part)} | Brüt EV '+_metric(_mean_present(part,'r_value'))+
+                         'R | Net EV '+_metric(_mean_present(part,'net_r_value'))+'R | '+
+                         ('karar yok' if len(part)<VALIDATION_MIN_CLOSED or VALIDATION_START_TS<=0 else 'örnek eşiği tamam; tek başına karar değildir'))
+        for side in ('LONG','SHORT'):
+            part = [r for r in closed if r['side']==side]
+            lines.append(f'{side}: n={len(part)} | Net EV '+_metric(_mean_present(part,'net_r_value'))+
+                         'R | MFE/MAE %'+_metric(_mean_present(part,'mfe_pct'))+'/%'+_metric(_mean_present(part,'mae_pct')))
+        regimes = sorted({str(r.get('ozellikler',{}).get('piyasa_modu') or 'OLCUMSUZ') for r in closed})
+        for regime in regimes:
+            part = [r for r in closed if str(r.get('ozellikler',{}).get('piyasa_modu') or 'OLCUMSUZ')==regime]
+            lines.append(f'Rejim {regime}: n={len(part)} | Net EV '+_metric(_mean_present(part,'net_r_value'))+'R')
+    lines.append('⚠️ Açık işlemler ve izleme süresi tamamlanmadan yalnız kapanan EV toplam performansı temsil etmez.')
+    return '\n'.join(lines)
 
 
 def golge_neden_raporu_uret() -> str:
     if not os.path.exists(OLCUM_DB):
         return "👻 STOP SONRASI ANALİZ\nKayıt yok."
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        rows = conn.execute(
-            "SELECT kontrol,golge_durum,COALESCE(golge_tp,0),golge_mfe_pct,golge_mae_pct,"
-            "golge_tp1_dk,golge_tp2_dk,golge_tp3_dk,golge_tp4_dk,stop_neden_json "
-            "FROM olcum_pozisyon WHERE sonuc_tipi IN ('TEMIZ_STOP','TP1_STOP','TP2_STOP','TP3_STOP')"
-        ).fetchall()
-    lines = ["👻 STOP SONRASI TP VE NEDEN ANALİZİ", f"İzleme: {GOLGE_SAAT:g} saat | TF {GOLGE_TF}"]
-    for kontrol, grup_ad in ((0, "NORMAL"), (1, "KONTROL")):
-        grup = [r for r in rows if int(r[0] or 0) == kontrol]
-        biten = [r for r in grup if r[1] == "BITTI"]
-        lines.append(f"\n{grup_ad}: stop={len(grup)} | biten={len(biten)} | izleniyor={len(grup)-len(biten)}")
-        for idx in range(1, 5):
-            ulasan = [r for r in grup if int(r[2] or 0) >= idx]
-            sureler = [safe_float(r[4 + idx]) for r in ulasan if r[4 + idx] is not None]
-            lines.append(
-                f"Stop sonrası TP{idx}: {len(ulasan)} (%{len(ulasan)/len(grup)*100 if grup else 0:.1f}) | "
-                f"medyan süre {yuzdelik(sureler, 0.5):.1f} dk"
-            )
-        lines.append(
-            f"Gölge MFE/MAE ort: %{avg([safe_float(r[3]) for r in grup]):.3f}/"
-            f"%{avg([safe_float(r[4]) for r in grup]):.3f}"
-        )
-        kurtulan = [r for r in grup if int(r[2] or 0) >= 1]
-        kurtulmayan = [r for r in biten if int(r[2] or 0) == 0]
-        alanlar = ("side", "event", "trend_1h", "trend_4h", "coin_1h_ema",
-                   "session", "piyasa_modu", "balina_durum")
-        farklar = []
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        rows=conn.execute("SELECT kontrol,golge_durum,COALESCE(golge_tp,0),golge_mfe_pct,golge_mae_pct,golge_tp1_dk,golge_tp2_dk,golge_tp3_dk,golge_tp4_dk,stop_neden_json FROM olcum_pozisyon WHERE sonuc_tipi IN ('TEMIZ_STOP','TP1_STOP','TP2_STOP','TP3_STOP')").fetchall()
+    lines=["👻 STOP SONRASI TP VE NEDEN ANALİZİ | tüm sürümler",f"İzleme: {GOLGE_SAAT:g} saat | TF {GOLGE_TF}","Devam eden izleme sonuçları henüz tamamlanmamıştır; süreler mum sonu üst sınırıdır."]
+    for control,name in ((0,"NORMAL"),(1,"KONTROL")):
+        all_rows=[r for r in rows if int(r[0] or 0)==control]
+        group=[r for r in all_rows if r[1] in ('IZLENIYOR','BITTI')]
+        finished=[r for r in group if r[1]=='BITTI']
+        lines.append(f"\n{name}: stop={len(all_rows)} | biten={len(finished)} | izleniyor={len(group)-len(finished)} | izlenmemiş={len(all_rows)-len(group)}")
+        for idx in range(1,5):
+            hit=[r for r in group if int(r[2] or 0)>=idx]
+            times=[safe_float(r[4+idx]) for r in hit if r[4+idx] is not None]
+            rate=100*len(hit)/len(group) if group else None
+            median=yuzdelik(times,.5) if times else None
+            lines.append(f"Stop sonrası TP{idx}: {len(hit)}/{len(group)} (%"+_metric(rate,1)+") | medyan süre "+_metric(median,1)+" dk")
+        mfe=[safe_float(r[3]) for r in group if r[3] is not None]
+        mae=[safe_float(r[4]) for r in group if r[4] is not None]
+        lines.append("Gölge MFE/MAE ort: %"+_metric(avg(mfe) if mfe else None)+"/%"+_metric(avg(mae) if mae else None))
+        a=[r for r in finished if int(r[2] or 0)>=1]
+        bb=[r for r in finished if int(r[2] or 0)==0]
+        lines.append(f"Tamamlanmış izlemelerde TP1 gören/görmeyen: {len(a)}/{len(bb)}")
         def payload(row):
             try:
-                return json.loads(row[9] or "{}")
-            except Exception:
+                value=json.loads(row[9] or '{}')
+                return value if isinstance(value,dict) else {}
+            except (ValueError,TypeError):
                 return {}
-        for alan in alanlar:
-            degerler = {str(payload(r).get(alan)) for r in kurtulan + kurtulmayan if payload(r).get(alan) is not None}
-            for deger in degerler:
-                na = sum(1 for r in kurtulan if str(payload(r).get(alan)) == deger)
-                nb = sum(1 for r in kurtulmayan if str(payload(r).get(alan)) == deger)
-                pa = na / len(kurtulan) * 100 if kurtulan else 0.0
-                pb = nb / len(kurtulmayan) * 100 if kurtulmayan else 0.0
-                farklar.append((abs(pa-pb), alan, deger, na, nb, pa-pb))
-        lines.append("Stop sonrası TP1 gören / görmeyen en büyük özellik farkları:")
-        for _absf, alan, deger, na, nb, fark in sorted(farklar, reverse=True)[:8]:
-            lines.append(f"• {alan}={deger}: nTP={na} nYok={nb} | fark {fark:+.1f} puan")
-    lines.append("\nBu bölüm stop nedenini nedensel olarak kanıtlamaz; stop anı ile sonraki toparlanma farklarını kaydeder.")
-    return "\n".join(lines)
+        features=('side','event','trend_1h','trend_4h','coin_1h_ema','session_name','piyasa_modu','balina_durum')
+        candidates=[]
+        for field in features:
+            values={str(payload(r)[field]) for r in a+bb if payload(r).get(field) is not None}
+            for value in values:
+                na=sum(str(payload(r).get(field))==value for r in a)
+                nb=sum(str(payload(r).get(field))==value for r in bb)
+                diff=100*na/len(a)-100*nb/len(bb) if a and bb else 0
+                if abs(diff)>=10:
+                    candidates.append((abs(diff),field,value,na,nb,diff))
+        if len(a)<ORTAK_MIN_N or len(bb)<ORTAK_MIN_N:
+            lines.append(f"Özellik farkı: yetersiz (nTP={len(a)}, nYok={len(bb)})")
+        for _,field,value,na,nb,diff in sorted(candidates,reverse=True)[:15]:
+            if na<ORTAK_MIN_N or nb<ORTAK_MIN_N:
+                lines.append(f"{field}={value}: yetersiz (nA={na}, nB={nb})")
+            else:
+                lines.append(f"{field}={value}: TP {na}/{len(a)} | Yok {nb}/{len(bb)} | fark {diff:+.1f} puan")
+    lines.append("⚠️ Çoklu özellik karşılaştırması hipotez üretir; stop nedenini nedensel olarak kanıtlamaz.")
+    return '\n'.join(lines)
 
 
 def selftest_raporu_uret() -> str:
@@ -4500,7 +4383,7 @@ def selftest_raporu_uret() -> str:
     test("DB mevcut", os.path.exists(OLCUM_DB))
     ok, detay = db_integrity_kontrol()
     test("DB integrity", ok)
-    lines = ["🧪 V12.0 ÖZ TEST"]
+    lines = ["🧪 V12.0.1 ÖZ TEST"]
     lines.extend(f"{'✅' if sonuc else '❌'} {ad}" for ad, sonuc in testler)
     lines.append(f"Sonuç: {sum(1 for _, x in testler if x)}/{len(testler)} geçti")
     lines.append(f"DB: {detay}")
@@ -4508,81 +4391,40 @@ def selftest_raporu_uret() -> str:
 
 
 async def post_init(application) -> None:
-    olcum_db_init()
+    if SIGNAL_CHART_FIB:
+        logger.info('SIGNAL_CHART_FIB uyumluluk ayarı; bu sürümde Fibonacci çizimi uygulanmıyor')
+    logger.info('Veri kaynakları: OKX REST ve isteğe bağlı OKX WS; MEXC yok')
+    await _db_call(olcum_db_init)
+    await _db_call(_restore_ledger)
     now = time.time()
-    _RUNTIME_HEALTH.update({
-        "started_ts": now, "scan_heartbeat": now, "paper_heartbeat": now,
-        "shadow_heartbeat": now, "save_heartbeat": now,
-        "emergency_stop": bool(memory.get("emergency_stop", False)),
-    })
-    audit_yaz("BOT_START", payload={"python": platform.python_version(), "schema": DB_SCHEMA_VERSION})
+    _RUNTIME_HEALTH.update(started_ts=now,scan_heartbeat=now,paper_heartbeat=now,
+        shadow_heartbeat=now,save_heartbeat=now,emergency_stop=bool(memory.get('emergency_stop',False)))
+    await _db_call(audit_yaz,'BOT_START','','',{'python':platform.python_version(),'schema':DB_SCHEMA_VERSION})
     if BALINA_MOTOR_ENABLED:
         await asyncio.to_thread(balina_db_init)
-    if OLCUM_MODU:
-        for pos in _v10_mem().get("open", []):
-            saved = olcum_db_acik_durum(v107_pos_uid(pos))
-            if saved:
-                kontrol, rv, mfe, mae, raw_json = saved
-                try:
-                    pos["kapi_sonuclari"] = json.loads(raw_json or "{}")
-                except Exception:
-                    pos["kapi_sonuclari"] = {ad: "olcumsuz" for ad in OLCUM_KAPILARI}
-                pos["kontrol"] = bool(kontrol)
-                pos["current_r"] = safe_float(rv)
-                pos["mfe_pct"] = safe_float(mfe)
-                pos["mae_pct"] = safe_float(mae)
-            else:
-                pos["kapi_sonuclari"] = {ad: "olcumsuz" for ad in OLCUM_KAPILARI}
-                pos["kontrol"] = False
-                pos["mfe_pct"] = pos["mae_pct"] = pos["current_r"] = 0.0
-                olcum_db_pozisyon_ac(pos)
-    active_count, pruned_count = await refresh_coin_pool(force=True)
-    olcum_kayit_sayisi = len(olcum_db_satirlari())
-    olcum_db_dizin = os.path.abspath(os.path.dirname(OLCUM_DB) or ".")
-    olcum_kalici_uyari = ""
-    if OLCUM_MODU and (not olcum_db_dizin.startswith("/data") or not os.access(olcum_db_dizin, os.W_OK)):
-        olcum_kalici_uyari = "\n⚠️ OLCUM_DB kalıcı diskte değil — deploy'da veri silinir"
-    await safe_send_telegram(
-        f"🚀 {VERSION_NAME} başladı\n"
-        f"Saat: {tr_str()}\n"
-        f"Coin sayısı: {active_count}\n"
-        f"Kaldıraç: {LEVERAGE}x | Risk: %{V10_RISK_PCT}/işlem\n"
-        f"TP: {TP1_RR}/{TP2_RR}/{TP3_RR}/{TP4_RR}R "
-        f"(paylar %{TP1_WEIGHT*100:.0f}/%{TP2_WEIGHT*100:.0f}/%{TP3_WEIGHT*100:.0f}/%{TP4_WEIGHT*100:.0f})\n"
-        f"Stop: Sabit %{SABIT_STOP_PCT}\n"
-        f"🎯 KATMANLAR:\n"
-        f"  🧠 BTC 1H+4H trend + Coin 1H EMA\n"
-        f"  🧠 Yapı: CHoCH/BOS (RANGE engelli)\n"
-        f"  🧠 Skor (engellemez, risk ayarlar)\n"
-        f"  🛡 Spoof + Wash + Pump/Dump + Insider + Stop-Hunt\n"
-        f"  📊 VWAP {VWAP_PERIOD_HOURS}h {'AKTİF' if VWAP_ENABLED else 'kapalı'}\n"
-        f"  🕐 Session filtresi {'AKTİF' if SESSION_FILTER_ENABLED else 'kapalı'}\n"
-        f"  📈 ADX piyasa modu {'AKTİF' if ADX_ENABLED else 'kapalı'}\n"
-        f"  💥 Likidasyon haritası {'AKTİF' if LIQ_HEATMAP_ENABLED else 'kapalı'}\n"
-        f"  🔀 MTF confluence {'AKTİF' if MTF_CONFLUENCE_ENABLED else 'kapalı'}\n"
-        f"  📉 VWM (hacim ağırlıklı) {'AKTİF' if VWM_ENABLED else 'kapalı'}\n"
-        f"  🔗 Korelasyon kilidi {'AKTİF' if CORRELATION_GUARD_ENABLED else 'kapalı'}\n"
-        f"  ⏱ Time-exit {TIME_EXIT_HOURS}h\n"
-        f"  📐 Adaptif pozisyon boyutlandırma"
-        f"\n🧪 Ölçüm modu: {'AKTİF' if OLCUM_MODU else 'kapalı'} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}"
-        f"\nÖlçüm kaydı: {olcum_kayit_sayisi} pozisyon"
-        f"{olcum_kalici_uyari}"
-        f"\n🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}"
-        f"\n🐋 Kârlı durum kapısı: {'AKTİF' if (BALINA_KARLI_KAPI_ENABLED and BALINA_MOTOR_ENABLED) else 'kapalı'}"
-        f" | OR: {', '.join(sorted(BALINA_KARLI_DURUMLAR))}"
-        f"\n🏢 Kurumsal izleme: {'AKTİF' if KURUMSAL_ENABLED else 'kapalı'}"
-        f" | Risk motoru: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}"
-        f"\n💾 DB şema: v{DB_SCHEMA_VERSION} | Yedek: {'AKTİF' if DB_BACKUP_ENABLED else 'kapalı'}"
-        f" | Config: {config_fingerprint()}"
-    )
-    temel_looplar = [symbol_refresh_loop, v10_scan_loop, v10_paper_loop, golge_loop, save_loop]
+    active,_ = await refresh_coin_pool(force=True)
+    count = len(await _db_call(olcum_db_satirlari))
+    mp = _v10_mem()
+    text = (f'🚀 {VERSION_NAME} başladı\nSaat: {tr_str()}\nCoin sayısı: {active}\n'
+        f'PAPER | Stop %{SABIT_STOP_PCT} | TP {TP1_RR}/{TP2_RR}/{TP3_RR}/{TP4_RR}R\n'
+        f'Paylar: {"/".join(str(round(w*100)) for w in _tp_weights())}%\n'
+        f'Ölçüm modu: {OLCUM_MODU} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}\n'
+        f'Ölçüm kaydı: {count} pozisyon | Açık {len(mp["open"])} | Gölge {len(mp["golge"])}\n'
+        f'RSI yöntemi: {RSI_METHOD} | Skor CVD: mum yönü proxy\n'
+        f'Balina motoru: {BALINA_MOTOR_ENABLED} | WS defter kanalı: {BALINA_WS_BOOK_CHANNEL}\n'
+        f'Balina durum kapısı: {BALINA_KARLI_KAPI_ENABLED} | Ölçümde sinyal kesmez\n'
+        f'Likidite: tahmini mesafe bantları; {"hesaplanıyor" if LIQ_HEATMAP_ENABLED and LIQ_HEATMAP_FETCH_OI else "hesaplanmıyor"}; bilgi amaçlı\n'
+        f'Risk motoru: {RISK_ENGINE_ENABLED} | DB şema {DB_SCHEMA_VERSION}\n'+_report_scope()+
+        '\n'+'\n'.join(_persistence_warnings()))
+    # Startup bildirimi tarama/paper başlamasını bekletmez.
+    await _db_call(_enqueue_system_notification,text)
+    for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop):
+        _start_loop(factory)
     if KURUMSAL_ENABLED:
-        temel_looplar.append(kurumsal_bakim_loop)
-    for _kur in temel_looplar:
-        asyncio.create_task(_kur(), name=_kur.__name__)
+        _start_loop(kurumsal_bakim_loop)
     if BALINA_MOTOR_ENABLED:
-        asyncio.create_task(balina_db_loop(), name="balina_db_loop")
-        asyncio.create_task(balina_ws_loop(), name="balina_ws_loop")
+        _start_loop(balina_db_loop)
+        _start_loop(balina_ws_loop)
 
 
 async def cmd_start(update, context):
@@ -4613,80 +4455,9 @@ async def cmd_test(update, context):
 async def cmd_status(update, context):
     if not telegram_yetkili(update):
         return
-    mp = _v10_mem()
-    cl = mp["closed"]; n = len(cl)
-    wins = sum(1 for x in cl if x["R"] > 0)
-    ev = (sum(x["R"] for x in cl) / n) if n else 0
-    try:
-        with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-            net_values = [safe_float(x[0]) for x in conn.execute(
-                "SELECT COALESCE(net_r_value,r_value) FROM olcum_pozisyon WHERE durum!='ACIK'"
-            ).fetchall()]
-    except Exception:
-        net_values = []
-    net_ev = avg(net_values)
-    tum_rows = olcum_db_ortak_satirlari()
-    sonuc_rows = [r for r in tum_rows if r.get("durum") != "ACIK"]
-    acik_rows = [r for r in tum_rows if r.get("durum") == "ACIK"]
-    sonuc_adlari = ("TEMIZ_STOP", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM", "TIME_EXIT")
-    sonuc_satirlari = []
-    for sonuc_adi in sonuc_adlari:
-        grup = [r for r in sonuc_rows if r.get("sonuc_tipi") == sonuc_adi]
-        yuzde = len(grup) / len(sonuc_rows) * 100.0 if sonuc_rows else 0.0
-        ort_r = avg([safe_float(r.get("r_value")) for r in grup])
-        sonuc_satirlari.append(f"{sonuc_adi}: {len(grup)} (%{yuzde:.1f}) | Ort.R {ort_r:+.3f}")
-    en_az_bir_tp = sum(1 for r in sonuc_rows if r.get("hit1"))
-    hic_tp = len(sonuc_rows) - en_az_bir_tp
-    toplam_tp1 = sum(1 for r in tum_rows if r.get("hit1"))
-    toplam_tp2 = sum(1 for r in tum_rows if r.get("hit2"))
-    toplam_tp3 = sum(1 for r in tum_rows if r.get("hit3"))
-    toplam_tp4 = sum(1 for r in tum_rows if r.get("hit4"))
-    acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
-    acik_tpsiz = len(acik_rows) - acik_tp
-    lines = [
-        f"📊 V12.0 ULTRA DURUM",
-        f"Saat: {tr_str()}",
-        f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
-        f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
-        f"Açık: {len(mp['open'])} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {round(ev,3)}R",
-        f"Maliyet sonrası Net EV: {net_ev:+.3f}R | Kayıt: {len(net_values)}",
-        f"Tüm sinyallerde TP teması: TP1 {toplam_tp1} | TP2 {toplam_tp2} | TP3 {toplam_tp3} | TP4 {toplam_tp4}",
-        f"Açık pozisyon: TP gören {acik_tp} | Henüz TP görmeyen {acik_tpsiz}",
-        f"TP görmeden stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TEMIZ_STOP')}",
-        f"TP1 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP1_STOP')} | "
-        f"TP2 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP2_STOP')} | "
-        f"TP3 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP3_STOP')}",
-        *sonuc_satirlari,
-        f"En az bir TP aldı: {en_az_bir_tp} (%{en_az_bir_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
-        f"Hiç TP almadı: {hic_tp} (%{hic_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
-        f"🎯 Filtre red sayaçları:",
-        f"  Yapı: {stats.get('v10_red_yapi', 0)}",
-        f"  Coin EMA: {stats.get('v11_red_coin_ema', 0)}",
-        f"  RANGE: {stats.get('v107_red_range', 0)}",
-        f"  FOMO: {stats.get('v11_red_fomo', 0)}",
-        f"  OI zayıf: {stats.get('v11_red_oi_zayif', 0)}",
-        f"  RSI: {stats.get('v10_red_rsi', 0)}",
-        f"  VWAP: {stats.get('v113_red_vwap', 0)}",
-        f"  Session: {stats.get('v113_red_session', 0)}",
-        f"  MTF: {stats.get('v113_red_mtf', 0)}",
-        f"  VWM: {stats.get('v113_red_vwm', 0)}",
-        f"  Korelasyon: {stats.get('v113_red_correlation', 0)}",
-        f"🛡 Manipülasyon:",
-        f"  Spoof: {stats.get('v112_red_spoofing', 0)}",
-        f"  Spoof görülen: {stats.get('v112_spoof_gorulen', 0)} | Keserdi: {stats.get('v112_spoof_keserdi', 0)}",
-        f"  Wash: {stats.get('v112_red_wash', 0)}",
-        f"  Pump/Dump: {stats.get('v112_red_pump_dump', 0)}",
-        f"  Insider: {stats.get('v112_red_insider', 0)}",
-        f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
-        f"  OKX timeout: {stats.get('okx_timeout', 0)}",
-        f"  Balina kârlı kapı reddi: {stats.get('balina_red_karli_kapi', 0)}",
-        f"🏢 Risk reddi: {stats.get('risk_reject', 0)} | Veri kalitesi reddi: {stats.get('data_quality_reject', 0)}",
-        f"💾 DB: {_RUNTIME_HEALTH.get('db_integrity')} | Yedek: {stats.get('backup_success', 0)} başarılı / {stats.get('backup_fail', 0)} hata",
-        f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
-        f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'YEDEK/KAPALI'} | "
-        f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
-    ]
-    await update.message.reply_text("\n".join(lines))
+    text = await _db_call(status_raporu_uret)
+    for part in telegram_parcala(text):
+        await update.message.reply_text(part)
 
 async def cmd_coin(update, context):
     if not telegram_yetkili(update):
@@ -4697,20 +4468,21 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V12.0 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için V12.0.1 sinyali yok.")
         return
-    await update.message.reply_text(build_v10_message(res))
+    for part in telegram_parcala('ÖN ANALİZ — deftere sinyal açılmadı; giriş tekrar fiyatlanır.\n'+build_v10_message(res)):
+        await update.message.reply_text(part)
 
 async def cmd_v10(update, context):
     if not telegram_yetkili(update):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V12.0 ULTRA motor durumu",
+        f"🆕 V12.0.1 ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
-        f"Likidite: {'AKTİF' if LIQ_HEATMAP_ENABLED else 'kapalı'} | MTF: {'AKTİF' if MTF_CONFLUENCE_ENABLED else 'kapalı'}",
+        f"Tahmini mesafe bantları: {'hesaplanıyor' if LIQ_HEATMAP_ENABLED and LIQ_HEATMAP_FETCH_OI else 'hesaplanmıyor'} | MTF: {'AKTİF' if MTF_CONFLUENCE_ENABLED else 'kapalı'}",
         f"Red: vwap={stats.get('v113_red_vwap',0)} session={stats.get('v113_red_session',0)} mtf={stats.get('v113_red_mtf',0)} "
         f"vwm={stats.get('v113_red_vwm',0)} kor={stats.get('v113_red_correlation',0)}",
     ]
@@ -4793,7 +4565,7 @@ async def cmd_risk(update, context):
         return
     d = await asyncio.to_thread(risk_durumu)
     await update.message.reply_text(
-        "🛡 V12.0 RİSK MOTORU\n"
+        "🛡 V12.0.1 RİSK MOTORU\n"
         f"Motor: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}\n"
         f"Acil durdurma: {'AKTİF' if d['kill_switch'] else 'kapalı'}\n"
         f"Günlük: {d['daily_r']:+.2f}R / -{abs(RISK_MAX_DAILY_R):.2f}R\n"
@@ -4808,7 +4580,7 @@ async def cmd_durdur(update, context):
         return
     _RUNTIME_HEALTH["emergency_stop"] = True
     memory["emergency_stop"] = True
-    audit_yaz("EMERGENCY_STOP", payload={"chat_id": str(update.effective_chat.id)})
+    await _db_call(audit_yaz,"EMERGENCY_STOP","","",{"chat_id":str(update.effective_chat.id)})
     await save_memory_async()
     await update.message.reply_text("🛑 Yeni sinyal üretimi acil olarak durduruldu. Açık paper pozisyonlar izlenmeye devam ediyor.")
 
@@ -4821,7 +4593,7 @@ async def cmd_devam(update, context):
         return
     _RUNTIME_HEALTH["emergency_stop"] = False
     memory["emergency_stop"] = False
-    audit_yaz("EMERGENCY_RESUME", payload={"chat_id": str(update.effective_chat.id)})
+    await _db_call(audit_yaz,"EMERGENCY_RESUME","","",{"chat_id":str(update.effective_chat.id)})
     await save_memory_async()
     await update.message.reply_text("▶️ Yeni sinyal üretimi yeniden açıldı.")
 
@@ -4954,11 +4726,11 @@ async def cmd_dagitim(update, context):
 async def cmd_ws(update, context):
     if not telegram_yetkili(update):
         return
-    age = time.time() - safe_float(_BALINA_WS_STATUS.get("last_message_ts"))
+    age = max(0.0,time.time()-safe_float(_BALINA_WS_STATUS.get("last_message_ts")))
     await update.message.reply_text(
         "🌐 BALİNA WEBSOCKET\n"
         f"Motor: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'}\n"
-        f"Bağlantı: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK/YEDEK'}\n"
+        f"Bağlantı: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK; REST sinyal analizi sürer'}\n"
         f"Abonelik: {_BALINA_WS_STATUS.get('subscriptions', 0)}\n"
         f"Son veri yaşı: {age:.1f} sn\n"
         f"Mesaj: {stats.get('balina_ws_message', 0)} | İşlem: {stats.get('balina_trade', 0)} | "
@@ -4978,14 +4750,15 @@ def balina_raporu_uret() -> str:
             FROM balina_event WHERE ts>=? GROUP BY event_type,side ORDER BY COUNT(*) DESC
         """, (cutoff,)).fetchall()
         snaps = conn.execute("""
-            SELECT durum,COUNT(*),AVG(guven) FROM balina_snapshot GROUP BY durum ORDER BY COUNT(*) DESC
-        """).fetchall()
+            SELECT durum,COUNT(*),AVG(guven) FROM balina_snapshot WHERE ts>=? GROUP BY durum ORDER BY COUNT(*) DESC
+        """, (time.time()-max(10.0,BALINA_STALE_SEC*2),)).fetchall()
     lines = ["🐋 BALİNA RAPORU | Son 24 saat", "OLAYLAR"]
     lines.extend(f"{t} {s or '-'}: {n} | {safe_float(v):,.0f} USDT" for t, s, n, v in rows)
     lines.append("ANLIK DURUMLAR")
     lines.extend(f"{d}: {n} | Ort.güven {safe_float(g):.1f}" for d, n, g in snaps)
-    lines.append("SİNYAL SONUÇLARI")
-    olcum_rows = olcum_db_ortak_satirlari()
+    lines.append("SİNYAL SONUÇLARI | Ort.R yalnız kapananlar; açık sonuçlar tamamlanmamıştır")
+    lines.append(_report_scope())
+    olcum_rows = _report_rows()
     for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
         grup = [r for r in olcum_rows if int(r.get("kontrol", 0)) == kontrol_degeri]
         durumlar = defaultdict(list)
@@ -5001,11 +4774,11 @@ def balina_raporu_uret() -> str:
             kapanan = [r for r in kayitlar if r.get("durum") != "ACIK"]
             temiz = sum(1 for r in kapanan if r.get("sonuc_tipi") == "TEMIZ_STOP")
             tp_goren = sum(1 for r in kayitlar if r.get("hit1"))
-            ort_r = avg([safe_float(r.get("r_value")) for r in kapanan])
+            ort_r = _mean_present(kapanan,"r_value")
             ort_mfe = avg([safe_float(r.get("mfe_pct")) for r in kayitlar])
             lines.append(
                 f"{durum}: n={len(kayitlar)} | kapanan={len(kapanan)} | "
-                f"temiz stop={temiz} | TP1+={tp_goren} | Ort.R {ort_r:+.3f} | Ort.MFE %{ort_mfe:.3f}"
+                f"temiz stop={temiz} | TP1+={tp_goren} | Ort.R {_metric(ort_r)} | Ort.MFE %{ort_mfe:.3f}"
             )
     return "\n".join(lines)
 
@@ -5024,7 +4797,7 @@ def telegram_yetkili(update: Update) -> bool:
 
 
 def build_app():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_stop(post_stop).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -5053,6 +4826,16 @@ def build_app():
 
 
 def validate_config() -> None:
+    if RSI_METHOD not in ('LEGACY','WILDER'):
+        raise ValueError('RSI_METHOD LEGACY/WILDER olmalı')
+    if BALINA_WS_BOOK_CHANNEL not in ('books','books5') or BALINA_WS_FAIL_POLICY not in ('REST','BLOCK'):
+        raise ValueError('WS kanal/fail policy geçersiz')
+    if not 0<SABIT_STOP_PCT<100 or SABIT_STOP_PCT*TP4_RR>=100:
+        raise ValueError('Stop/SHORT TP fiyatı geçersiz')
+    if not 0<TP1_RR<TP2_RR<TP3_RR<TP4_RR:
+        raise ValueError('TP R seviyeleri pozitif ve artan olmalı')
+    if min(HTTP_TIMEOUT,OKX_EXECUTOR_WORKERS,ENTRY_MAX_AGE_SEC,PAPER_HISTORY_MAX_PAGES)<=0:
+        raise ValueError('Süre/worker/sayfa sınırı pozitif olmalı')
     missing = []
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
@@ -5082,7 +4865,7 @@ def main() -> None:
     app = build_app()
     logger.info("%s başlıyor", VERSION_NAME)
     try:
-        app.run_polling(close_loop=False, drop_pending_updates=True)
+        app.run_polling(close_loop=True, drop_pending_updates=True)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
@@ -5094,6 +4877,694 @@ def main() -> None:
             SESSION.close()
         except Exception:
             pass
+
+
+
+# === V12.0.1 kalıcı defter / bildirim kuyruğu ===
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger")
+_OKX_SLOTS = asyncio.Semaphore(OKX_EXECUTOR_WORKERS)
+_SIGNAL_LOCK = asyncio.Lock()
+_BACKGROUND_TASKS = set()
+_HTTP_LOCAL = threading.local()
+_HTTP_SESSIONS = []
+_SHUTTING_DOWN = False
+_BALINA_LAST_RETENTION = 0.0
+
+
+class OKXRequestError(RuntimeError):
+    def __init__(self, message, code="", retryable=False, retry_after=0.0):
+        super().__init__(message)
+        self.code, self.retryable, self.retry_after = code, retryable, retry_after
+
+
+class TelegramDeliveryError(RuntimeError):
+    def __init__(self, code, retry_after=0):
+        super().__init__(f"Telegram HTTP/API {code}")
+        self.retry_after = max(0.0, safe_float(retry_after))
+        self.permanent = code in (400, 401, 403, 404)
+
+
+def _http_session():
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": f"BalinaAvcisi/{BOT_BUILD}"})
+        _HTTP_LOCAL.session = session
+        _HTTP_SESSIONS.append(session)
+    return session
+
+
+async def _db_call(fn, *args):
+    # Kopan/cancel edilen coroutine, devam eden DB transaction'ını kesmez.
+    future = asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, functools.partial(fn, *args))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Kapanışta transaction tamamlandıktan sonra JSON snapshot alınır.
+        await asyncio.shield(future)
+        raise
+
+
+def _cohort():
+    return f"{BOT_BUILD}:{config_fingerprint()}"
+
+
+def _adx_regime(value):
+    return "TREND" if value >= ADX_TREND_THRESHOLD else "RANGE" if value < ADX_RANGE_THRESHOLD else "GECIS"
+
+
+def _rsi_wilder(values, period=14):
+    out = [50.0] * len(values)
+    if len(values) <= period:
+        return out
+    diffs = [values[i] - values[i-1] for i in range(1, len(values))]
+    gain = sum(max(x, 0) for x in diffs[:period]) / period
+    loss = sum(max(-x, 0) for x in diffs[:period]) / period
+    def value(g, l):
+        return 50.0 if g == l == 0 else 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+    out[period] = value(gain, loss)
+    for i in range(period+1, len(values)):
+        gain = (gain * (period-1) + max(diffs[i-1], 0)) / period
+        loss = (loss * (period-1) + max(-diffs[i-1], 0)) / period
+        out[i] = value(gain, loss)
+    return out
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _db_payload(pos, previous=None):
+    payload = dict(previous or pos.get("kapi_sonuclari") or {})
+    payload.setdefault("_ozellikler", pozisyon_ozellikleri(pos))
+    for i in range(1, 5):
+        payload[f"_hit{i}"] = bool(payload.get(f"_hit{i}") or pos.get(f"hit{i}"))
+    payload["_coverage"] = pos.get("coverage", "LEGACY_UNVERIFIED")
+    payload["_cohort"] = pos.get("cohort", "LEGACY")
+    return payload
+
+
+def _db_insert_position(conn, pos):
+    conn.execute("""INSERT OR IGNORE INTO olcum_pozisyon
+        (uid,symbol,side,kontrol,open_ts,durum,r_value,mfe_pct,mae_pct,kapi_json,
+         position_json,build,config_hash,cohort)
+        VALUES(?,?,?,?,?,'ACIK',?,?,?,?,?,?,?,?)""",
+        (v107_pos_uid(pos), pos["symbol"], pos["side"], int(bool(pos.get("kontrol"))),
+         pos["open_ts"], safe_float(pos.get("current_r")), safe_float(pos.get("mfe_pct")),
+         safe_float(pos.get("mae_pct")), _json(_db_payload(pos)), _json(pos),
+         pos.get("build", BOT_BUILD), pos.get("config_hash", config_fingerprint()), pos.get("cohort", "LEGACY")))
+
+
+def _db_update_position(conn, pos, durum="ACIK", r_value=None):
+    _db_insert_position(conn, pos)
+    old = conn.execute("SELECT durum,kapi_json,mfe_pct,mae_pct FROM olcum_pozisyon WHERE uid=?",
+                       (pos["uid"],)).fetchone()
+    if old[0] != "ACIK":
+        return False  # Kapanmış UID tekrar açılamaz/kapatılamaz.
+    payload = _db_payload(pos, json.loads(old[1] or "{}"))
+    for i in range(1, 5):
+        pos[f"hit{i}"] = payload[f"_hit{i}"]
+    pos["mfe_pct"] = max(safe_float(old[2]), safe_float(pos.get("mfe_pct")))
+    pos["mae_pct"] = max(safe_float(old[3]), safe_float(pos.get("mae_pct")))
+    closed = durum != "ACIK"
+    rv = safe_float(pos.get("current_r")) if r_value is None else safe_float(r_value)
+    cost = simulasyon_maliyet_r(pos) if closed else 0.0
+    close_ts = safe_float(pos.get("close_ts"), time.time()) if closed else None
+    conn.execute("""UPDATE olcum_pozisyon SET durum=?,close_ts=?,r_value=?,net_r_value=?,cost_r=?,
+        mfe_pct=?,mae_pct=?,kapi_json=?,position_json=?,sonuc_tipi=? WHERE uid=? AND durum='ACIK'""",
+        (durum, close_ts, rv, rv-cost, cost, pos["mfe_pct"], pos["mae_pct"], _json(payload), _json(pos),
+         sonuc_tipi_belirle(durum, pos) if closed else None, pos["uid"]))
+    return True
+
+
+def _outbox_insert(conn, event_id, pos, kind, text, sig=None):
+    conn.execute("""INSERT OR IGNORE INTO notification_outbox
+        (event_id,uid,kind,payload,created_ts) VALUES(?,?,?,?,?)""",
+        (event_id, pos["uid"], kind, _json({"text": text, "signal": sig}), time.time()))
+
+
+def _persist_open(pos, sig):
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute('SELECT position_json FROM olcum_pozisyon WHERE uid=?',(pos['uid'],)).fetchone()
+        if existing:
+            return json.loads(existing[0])
+        old = conn.execute("SELECT value FROM schema_meta WHERE key='signal_seq'").fetchone()
+        number = max(int(old[0]) if old else 0, int(memory.get("signal_seq", 0)), int(stats.get("v10_signals", 0))) + 1
+        pos["signal_no"] = sig["signal_no"] = number
+        _db_insert_position(conn, pos)
+        _audit_tx(conn,"PAPER_OPEN",pos)
+        _outbox_insert(conn, pos["uid"] + ":OPEN", pos, "OPEN", build_v10_message(sig), sig)
+        conn.execute("INSERT OR REPLACE INTO schema_meta VALUES('signal_seq',?)", (str(number),))
+    return pos
+
+
+def _closed_record(pos, r_value, outcome):
+    record = copy.deepcopy(pos)
+    record.update(R=round(r_value, 3), outcome=outcome,
+                  sonuc_tipi=sonuc_tipi_belirle(outcome, pos),
+                  close_ts=safe_float(pos.get("close_ts"), time.time()))
+    record["tutma_dk"] = round((record["close_ts"] - pos["open_ts"]) / 60, 1)
+    return record
+
+
+def _shadow_from_position(pos):
+    stop_ts = safe_float(pos.get("shadow_start_ts"), pos["close_ts"])
+    return {"uid": pos["uid"], "symbol": pos["symbol"], "side": pos["side"],
+            "entry": pos["entry"], **{f"tp{i}": pos[f"tp{i}"] for i in range(1, 5)},
+            "stop_ts": stop_ts, "scan_ts": 0.0, "kontrol": bool(pos.get("kontrol")),
+            "golge_tp": 0, "golge_mfe_pct": 0.0, "golge_mae_pct": 0.0,
+            "end_ts": stop_ts + max(0.0, GOLGE_SAAT) * 3600,
+            "coverage": "COMPLETE", **{f"golge_tp{i}_dk": None for i in range(1, 5)}}
+
+
+def _persist_paper_step(pos, r_value=None, outcome=None):
+    shadow = None
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        changed = _db_update_position(conn, pos, outcome or "ACIK", r_value)
+        if not changed:
+            return None
+        for i in pos.get("pending_hits", []):
+            text = (f"✅ TP{i} GELDİ | #{pos.get('signal_no', 0)} | {pos['side']} | {pos['symbol']}\n"
+                    f"Seviye: {_v10_fmt(pos[f'tp{i}'])} | Paper: {tr_str(pos.get('last_price_ts'))}")
+            _outbox_insert(conn, f"{pos['uid']}:TP{i}", pos, "TP", text)
+        if outcome:
+            _audit_tx(conn,"PAPER_CLOSE",dict(pos,R=r_value,outcome=outcome))
+            text = build_v10_close_message(pos, r_value, outcome, pos["exit_price"])
+            _outbox_insert(conn, pos["uid"] + ":CLOSE", pos, "CLOSE", text)
+            if outcome == "STOP" and GOLGE_IZLEME:
+                shadow = _shadow_from_position(pos)
+                conn.execute("""UPDATE olcum_pozisyon SET golge_durum='IZLENIYOR',golge_tp=0,
+                    golge_mfe_pct=0,golge_mae_pct=0,shadow_json=?,stop_neden_json=?
+                    WHERE uid=? AND golge_durum IS NULL""", (_json(shadow), _json(pos), pos["uid"]))
+    return shadow
+
+
+def _restore_ledger():
+    """SQLite commit edilmiş kayıtlar JSON'dan üstün; eski JSON tek başına da korunur."""
+    mp = _v10_mem()
+    old_open = {v107_pos_uid(p): p for p in mp["open"]}
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        for p in old_open.values():
+            _db_insert_position(conn, p)
+        rows = conn.execute("SELECT * FROM olcum_pozisyon ORDER BY open_ts").fetchall()
+    opens, closed, shadows, unresolved = [], [], {}, []
+    for row in rows:
+        r = dict(row)
+        payload = json.loads(r["kapi_json"] or "{}")
+        p = json.loads(r.get("position_json") or "{}") or copy.deepcopy(old_open.get(r["uid"], {}))
+        p.update(uid=r["uid"], symbol=r["symbol"], side=r["side"], kontrol=bool(r["kontrol"]),
+                 open_ts=r["open_ts"], current_r=r["r_value"],
+                 mfe_pct=max(safe_float(p.get("mfe_pct")), r["mfe_pct"]),
+                 mae_pct=max(safe_float(p.get("mae_pct")), r["mae_pct"]))
+        p.setdefault("kapi_sonuclari", {k: payload.get(k, "olcumsuz") for k in OLCUM_KAPILARI})
+        for i in range(1, 5):
+            p[f"hit{i}"] = bool(p.get(f"hit{i}") or payload.get(f"_hit{i}"))
+        p.setdefault("cohort", r.get("cohort") or "LEGACY")
+        if r["durum"] == "ACIK":
+            if safe_float(p.get("entry")) > 0 and safe_float(p.get("orig_stop")) > 0 and all(safe_float(p.get(f"tp{i}")) > 0 for i in range(1, 5)):
+                # Kaybolan eski MFE'yi tahmin ederek üretme; eldeki maxima korunur.
+                p.setdefault("coverage", "LEGACY_UNVERIFIED")
+                opens.append(p)
+            else:
+                unresolved.append(p)
+                logger.error("Kurtarılamayan açık UID %s: JSON'da giriş/TP gerekiyor", r["uid"])
+                stats["recovery_missing_position"] = int(stats.get("recovery_missing_position", 0)) + 1
+        else:
+            p["close_ts"] = r["close_ts"]
+            closed.append(_closed_record(p, r["r_value"], r["durum"]))
+        if r["golge_durum"] == "IZLENIYOR":
+            g = json.loads(r.get("shadow_json") or "{}")
+            if g:
+                shadows[r["uid"]] = g
+        if p.get("candle_ts"):
+            symbol = p["symbol"]
+            if safe_float(p["candle_ts"]) >= safe_float(v10_sent_candle.get(symbol)):
+                v10_sent_candle[symbol] = p["candle_ts"]
+            v10_last_alert[symbol] = max(safe_float(v10_last_alert.get(symbol)), p["open_ts"])
+        memory["signal_seq"] = max(int(memory.get("signal_seq", 0)), int(p.get("signal_no", 0)))
+    # JSON-only tarihçe, ilk SQLite sürümünden önce bulunabilir.
+    for legacy in mp["closed"]:
+        if any((legacy.get("uid") and legacy.get("uid") == c.get("uid")) or
+               (legacy.get("symbol") == c.get("symbol") and legacy.get("side") == c.get("side") and
+                abs(safe_float(legacy.get("close_ts"))-safe_float(c.get("close_ts"))) < 2)
+               for c in closed):
+            continue
+        closed.append(legacy)
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        done = {r[0] for r in conn.execute("SELECT uid FROM olcum_pozisyon WHERE golge_durum='BITTI'")}
+    for g in mp.get("golge", []):
+        if g.get("uid") not in done:
+            shadows.setdefault(g["uid"], g)
+    mp.update(open=opens, closed=closed, golge=list(shadows.values()), recovery_pending=unresolved)
+    stats['v10_signals'] = max(int(stats.get('v10_signals',0)),len(rows))
+    stats['recovery_missing_position'] = len(unresolved)
+
+
+def _outbox_next():
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("""SELECT a.* FROM notification_outbox a WHERE a.sent_ts IS NULL AND a.next_ts<=?
+            AND NOT EXISTS(SELECT 1 FROM notification_outbox b WHERE b.uid=a.uid
+            AND b.sent_ts IS NULL AND b.rowid<a.rowid) ORDER BY a.rowid LIMIT 1""", (time.time(),)).fetchone()
+        return dict(row) if row else None
+
+
+def _outbox_update(event_id, part=None, sent=False, error=None, delay=0):
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+        if error is not None:
+            conn.execute("UPDATE notification_outbox SET attempts=attempts+1,next_ts=?,last_error=? WHERE event_id=?",
+                         (time.time()+delay, str(error)[:240], event_id))
+        elif sent:
+            conn.execute("UPDATE notification_outbox SET sent_ts=?,last_error=NULL WHERE event_id=?", (time.time(), event_id))
+        else:
+            conn.execute("UPDATE notification_outbox SET part_index=? WHERE event_id=?", (part, event_id))
+
+
+async def notification_loop():
+    while True:
+        item = await _db_call(_outbox_next)
+        if item is None:
+            await asyncio.sleep(0.5)
+            continue
+        payload = json.loads(item["payload"])
+        try:
+            parts = telegram_parcala(payload["text"])
+            for i in range(item["part_index"], len(parts)):
+                await asyncio.to_thread(_telegram_api_send, parts[i])
+                await _db_call(_outbox_update, item["event_id"], i+1)
+                await asyncio.sleep(max(0.05, NOTIFICATION_INTERVAL_SEC))
+            await _db_call(_outbox_update, item["event_id"], None, True)
+            stats["notification_sent"] = int(stats.get("notification_sent", 0)) + 1
+            # Grafik/haber başarısızlığı ana bildirimi tekrar göndermez.
+            sig = payload.get("signal")
+            if sig and SIGNAL_CHART_ENABLED and _MPL_OK:
+                try:
+                    png = await render_signal_chart(sig["symbol"], sig["direction"], sig["entry"], sig["stop"],
+                                                    {f"TP{i}": sig[f"tp{i}"] for i in range(1, 5)}, sig)
+                    if png:
+                        await safe_send_telegram_photo(f"Paper sinyal #{sig['signal_no']} | {sig['symbol']}", png)
+                except Exception:
+                    logger.exception("Sinyal grafiği gönderilemedi")
+            if sig and SIGNAL_NEWS_ENABLED:
+                news = await fetch_coin_news(sig["symbol"])
+                if news:
+                    await safe_send_telegram(f"📰 #{sig['signal_no']} {sig['symbol']}\n{news}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            delay = max(getattr(exc, "retry_after", 0), min(300, 2 ** min(8, item["attempts"])))
+            if getattr(exc, "permanent", False):
+                delay = 3600
+            await _db_call(_outbox_update, item["event_id"], None, False, type(exc).__name__, delay)
+            stats["telegram_fail"] += 1
+            logger.warning("Bildirim kuyrukta kaldı: %s (%s)", item["event_id"], type(exc).__name__)
+
+
+async def _supervised(factory):
+    while not _SHUTTING_DOWN:
+        try:
+            await factory()
+            if not _SHUTTING_DOWN:
+                raise RuntimeError(f"{factory.__name__} beklenmeden sonlandı")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stats["task_restart"] = int(stats.get("task_restart", 0)) + 1
+            logger.exception("Döngü yeniden başlatılacak: %s", factory.__name__)
+            await asyncio.sleep(5)
+
+
+def _start_loop(factory):
+    task = asyncio.create_task(_supervised(factory), name=factory.__name__)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def post_stop(application):
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+    tasks = list(_BACKGROUND_TASKS)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await _db_call(_restore_ledger)
+    await save_memory_async()
+
+
+async def post_shutdown(application):
+    if not _SHUTTING_DOWN:
+        await post_stop(application)
+    await asyncio.to_thread(OKX_EXECUTOR.shutdown, wait=True, cancel_futures=True)
+    await asyncio.to_thread(_DB_EXECUTOR.shutdown, wait=True, cancel_futures=True)
+    for session in _HTTP_SESSIONS:
+        session.close()
+    SESSION.close()
+
+
+
+async def _live_entry_quote(symbol, side):
+    rows = await _okx_get_async("/api/v5/market/books", {"instId": symbol, "sz": 5})
+    if not rows:
+        raise ValueError("boş orderbook")
+    book = rows[0]
+    ts = safe_float(book.get("ts"))/1000
+    bid = safe_float((book.get("bids") or [[0]])[0][0])
+    ask = safe_float((book.get("asks") or [[0]])[0][0])
+    age = time.time()-ts
+    if not (0 < bid <= ask) or ts <= 0 or age > ENTRY_MAX_AGE_SEC or age < -2:
+        raise ValueError("eski veya geçersiz orderbook")
+    return {"price": ask if side == "LONG" else bid, "ts": ts,
+            "source": "orderbook ask" if side == "LONG" else "orderbook bid"}
+
+
+def _balina_gate(sig):
+    if not BALINA_MOTOR_ENABLED or not (BALINA_KARLI_KAPI_ENABLED or BALINA_MOTOR_BLOCK):
+        return True, "kapalı"
+    snap = sig.get("balina_akis") or {}
+    if snap.get("status") != "CANLI":
+        return BALINA_WS_FAIL_POLICY == "REST", "WS ölçümsüz; REST sinyal motoru"
+    state = str(snap.get("durum", ""))
+    long_states = {"SATIS_EMILIMI", "BALINA_ALIMI", "BIRIKIM", "PARCALI_BALINA_ALIMI"}
+    short_states = {"ALIS_EMILIMI", "BALINA_SATISI", "DAGITIM", "PARCALI_BALINA_SATISI"}
+    aligned = long_states if sig["direction"] == "LONG" else short_states
+    opposite = short_states if sig["direction"] == "LONG" else long_states
+    if BALINA_KARLI_KAPI_ENABLED and (state not in BALINA_KARLI_DURUMLAR or state not in aligned):
+        return False, "durum/yön allowlist dışında"
+    if BALINA_MOTOR_BLOCK and state in opposite and safe_float(snap.get("guven")) >= 70:
+        return False, "ters yön akışı"
+    return True, "uygun"
+
+
+
+async def _history_range(symbol, interval, start_ms, end_ms, step_ms):
+    """[start,end) kapalı mumlar; sayfa/interval boşluğu ayrıca bildirilir."""
+    start_ms, end_ms = int(start_ms), int(end_ms)
+    if start_ms >= end_ms:
+        return [], True
+    rows, after = {}, str(end_ms)
+    for _ in range(max(1,PAPER_HISTORY_MAX_PAGES)):
+        data = await _okx_get_async('/api/v5/market/history-candles',
+            {'instId':symbol,'bar':interval,'limit':300,'after':after})
+        if not data:
+            break
+        oldest = min(int(safe_float(r[0])) for r in data)
+        for raw in data:
+            if len(raw)<9 or str(raw[8])!='1':
+                continue
+            ts = int(safe_float(raw[0]))
+            if start_ms <= ts and ts+step_ms <= end_ms:
+                rows[ts] = _okx_to_kline(raw)+[step_ms]
+        if oldest <= start_ms or oldest >= int(after):
+            break
+        after = str(oldest)
+    result = [rows[t] for t in sorted(rows)]
+    complete = (len(result)==max(0,(end_ms-start_ms)//step_ms) and
+                all(int(r[0])==start_ms+i*step_ms for i,r in enumerate(result)))
+    return result, complete
+
+
+def _paper_process_rows(pos, rows):
+    """Mumları sırayla işler; çıkış sonrası fiyatları aynı işlemde saymaz."""
+    for raw in rows:
+        row = list(raw)
+        ts = safe_float(row[0])/1000
+        duration = safe_float(row[9])/1000 if len(row)>9 else interval_minutes(V107_TAKIP_TF)*60
+        if ts < pos['open_ts'] or ts*1000 < safe_float(pos.get('scan_ts')):
+            continue
+        R, outcome = v107_check_paper_bar(pos,safe_float(row[2]),safe_float(row[3]))
+        close_at = ts+duration
+        if outcome:
+            if outcome=='STOP':
+                exit_price = pos['orig_stop']
+                if pos['side']=='LONG':
+                    row[2],row[3] = max(pos['entry'],safe_float(row[1])), min(exit_price,safe_float(row[1]))
+                else:
+                    row[2],row[3] = max(exit_price,safe_float(row[1])), min(pos['entry'],safe_float(row[1]))
+            else:
+                exit_price = pos['tp4']
+                if pos['side']=='LONG':
+                    row[2],row[3] = exit_price,min(pos['entry'],safe_float(row[1]))
+                else:
+                    row[2],row[3] = max(pos['entry'],safe_float(row[1])),exit_price
+            row[4] = exit_price
+            pos.update(excursion_exit_bound=True,event_resolution_sec=duration,
+                       close_ts=close_at,shadow_start_ts=close_at,exit_price=exit_price)
+        v10_update_excursions(pos,[row])
+        pos.update(last_price=safe_float(row[4]),last_price_ts=close_at,scan_ts=close_at*1000)
+        if outcome:
+            return R,outcome
+        if TIME_EXIT_ENABLED and close_at>=pos['open_ts']+TIME_EXIT_HOURS*3600:
+            risk = abs(pos['entry']-pos['orig_stop'])
+            move = (pos['last_price']-pos['entry'])*(1 if pos['side']=='LONG' else -1)
+            R = _paper_time_exit_r(pos,move/risk) if risk else 0.0
+            pos.update(close_ts=close_at,exit_price=pos['last_price'])
+            return round(R,3),'TIME_EXIT'
+    return None,None
+
+
+async def paper_tur():
+    mp = _v10_mem()
+    for original in list(mp['open']):
+        _RUNTIME_HEALTH['paper_heartbeat'] = time.time()
+        pos = copy.deepcopy(original)
+        try:
+            rows,_ = await v107_takip_barlari(pos)
+            if not rows:
+                continue
+            R,outcome = _paper_process_rows(pos,rows)
+            shadow = await _db_call(_persist_paper_step,pos,R,outcome)
+            if outcome:
+                v10_record_closed(pos,R,outcome)
+                mp['open'] = [p for p in mp['open'] if p.get('uid')!=pos['uid']]
+                if shadow and not any(g.get('uid')==shadow['uid'] for g in mp['golge']):
+                    mp['golge'].append(shadow)
+            else:
+                pos.pop('pending_hits',None)
+                original.clear()
+                original.update(pos)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stats['paper_position_error'] = int(stats.get('paper_position_error',0))+1
+            logger.exception('Paper UID %s hatası; diğer pozisyonlar sürüyor',pos.get('uid'))
+
+
+
+async def golge_tur():
+    mp = _v10_mem()
+    groups = defaultdict(list)
+    for g in list(mp['golge']):
+        groups[g['symbol']].append(g)
+    step = interval_minutes(GOLGE_TF)*60000
+    now = int(time.time()*1000)
+    for symbol,records in groups.items():
+        _RUNTIME_HEALTH['shadow_heartbeat'] = time.time()
+        try:
+            start = int(min(max(g['stop_ts']*1000,safe_float(g.get('scan_ts'))) for g in records))
+            max_deadline = max(safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600) for g in records)*1000
+            end = min(now,int(max_deadline))//step*step
+            bars,complete = await _history_range(symbol,GOLGE_TF,start//step*step,end,step)
+            # Tüm kayıtların kısmi ilk/son mumlarını ortak 1m havuzunda tek kez çek.
+            bounds = []
+            for g in records:
+                a = int(max(g['stop_ts']*1000,safe_float(g.get('scan_ts'))))
+                b = ((a+step-1)//step)*step
+                deadline = int(safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600)*1000)
+                if a<b<=now:
+                    bounds.append((((a+59999)//60000)*60000,b))
+                if deadline<=now and deadline%step:
+                    bounds.append((deadline//step*step,deadline//60000*60000))
+            minute_rows,minute_ok = [],True
+            if bounds:
+                minute_rows,minute_ok = await _history_range(symbol,'1m',min(a for a,b in bounds),max(b for a,b in bounds),60000)
+            for original in records:
+                g = copy.deepcopy(original)
+                deadline = safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600)
+                g['end_ts'] = deadline
+                cutoff = max(g['stop_ts']*1000,safe_float(g.get('scan_ts')))
+                first_full = ((int(cutoff)+step-1)//step)*step
+                end_full = int(deadline*1000)//step*step
+                partial = [r for r in minute_rows if int(r[0])<first_full or int(r[0])>=end_full]
+                usable = [r for r in bars if int(r[0])>=first_full and int(r[0])+step<=end_full]
+                golge_kaydi_guncelle(g,partial+usable)
+                if not complete or not minute_ok:
+                    g['coverage'] = 'INCOMPLETE_HISTORY'
+                if int(g['stop_ts']*1000)%60000 or int(deadline*1000)%60000:
+                    g['coverage'] = 'PARTIAL_BOUNDARY_MINUTE'
+                done = now>=deadline*1000
+                await _db_call(olcum_db_golge_guncelle,g,done)
+                if done:
+                    mp['golge'] = [x for x in mp['golge'] if x['uid']!=g['uid']]
+                else:
+                    original.clear()
+                    original.update(g)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stats['shadow_error'] = int(stats.get('shadow_error',0))+1
+            logger.exception('Gölge takip hatası %s; kayıt korunuyor',symbol)
+
+
+
+def _report_rows():
+    rows = olcum_db_ortak_satirlari()
+    if REPORT_CURRENT_COHORT_ONLY:
+        rows = [r for r in rows if r.get('cohort')==_cohort()]
+    if REPORT_REQUIRE_COMPLETE:
+        rows = [r for r in rows if r.get('coverage') in ('COMPLETE','SUBSECOND_ENTRY_OMITTED')]
+    return rows
+
+
+def _report_scope():
+    return ('Ölçüm serisi: '+(_cohort() if REPORT_CURRENT_COHORT_ONLY else 'TÜM SÜRÜMLER / AYARLAR')+
+            (' | Eksik/kaba tarihçe hariç; girişin <1 saniyesi ve çıkış mumu sınırı belirsiz' if REPORT_REQUIRE_COMPLETE else ' | Eksik tarihçe dahil'))
+
+
+def _metric(value, digits=3):
+    return '— (ölçümsüz)' if value is None else f'{value:+.{digits}f}'
+
+
+def _mean_present(rows,key):
+    values = [safe_float(r[key]) for r in rows if r.get(key) is not None]
+    return avg(values) if values else None
+
+
+def _combo_partition(rows,keys):
+    passed,failed,unknown = [],[],[]
+    for row in rows:
+        conditions = row.get('_conditions') or _kombinasyon_kosullari(row)
+        values = [conditions[k] for k in keys]
+        (failed if False in values else passed if all(v is True for v in values) else unknown).append(row)
+    return passed,failed,unknown
+
+
+def _comparison_lines(first,second,unknown=0):
+    a,b = _kombinasyon_metrik(first),_kombinasyon_metrik(second)
+    lines = [_kombinasyon_metrik_satiri('Geçen',a),_kombinasyon_metrik_satiri('Geçmeyen',b),
+             f'Ölçümsüz: {unknown}']
+    delta = lambda k: None if a[k] is None or b[k] is None else a[k]-b[k]
+    lines.append('Fark: Δtemiz stop '+_metric(delta('temiz_pct'),1)+' puan | '+
+                 ' | '.join(f'ΔTP{i} '+_metric(delta(f'tp{i}_pct'),1)+' puan' for i in range(1,5))+
+                 ' | ΔR '+_metric(delta('r'))+' | ΔMFE %'+_metric(delta('mfe'))+' | ΔMAE %'+_metric(delta('mae')))
+    ready = min(a['kapanan'],b['kapanan'])>=KOMBINASYON_MIN_KAPANIS
+    lines.append(('ÖRNEK EŞİĞİ TAMAM; ileri doğrulama gerekir' if ready else 'KARAR YOK')+
+                 f": kapanan geçen={a['kapanan']}, geçmeyen={b['kapanan']}")
+    return lines
+
+
+
+def status_raporu_uret():
+    mp = _v10_mem()
+    cl = mp["closed"]; n = len(cl)
+    wins = sum(1 for x in cl if x["R"] > 0)
+    ev = (sum(x["R"] for x in cl) / n) if n else 0
+    try:
+        with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+            net_values = [safe_float(x[0]) for x in conn.execute(
+                "SELECT net_r_value FROM olcum_pozisyon WHERE durum!='ACIK' AND net_r_value IS NOT NULL"
+            ).fetchall()]
+    except Exception:
+        net_values = []
+    net_ev = avg(net_values) if net_values else None
+    tum_rows = olcum_db_ortak_satirlari()
+    sonuc_rows = [r for r in tum_rows if r.get("durum") != "ACIK"]
+    acik_rows = [r for r in tum_rows if r.get("durum") == "ACIK"]
+    n = len(sonuc_rows)
+    wins = sum(r['r_value']>0 for r in sonuc_rows)
+    ev = _mean_present(sonuc_rows,'r_value')
+    incomplete = sum(r.get('coverage') not in ('COMPLETE','SUBSECOND_ENTRY_OMITTED') for r in tum_rows)
+    sonuc_adlari = ("TEMIZ_STOP", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM", "TIME_EXIT")
+    sonuc_satirlari = []
+    for sonuc_adi in sonuc_adlari:
+        grup = [r for r in sonuc_rows if r.get("sonuc_tipi") == sonuc_adi]
+        yuzde = len(grup) / len(sonuc_rows) * 100.0 if sonuc_rows else 0.0
+        ort_r = avg([safe_float(r.get("r_value")) for r in grup])
+        sonuc_satirlari.append(f"{sonuc_adi}: {len(grup)} (%{yuzde:.1f}) | Ort.R {ort_r:+.3f}")
+    en_az_bir_tp = sum(1 for r in sonuc_rows if r.get("hit1"))
+    hic_tp = len(sonuc_rows) - en_az_bir_tp
+    toplam_tp1 = sum(1 for r in tum_rows if r.get("hit1"))
+    toplam_tp2 = sum(1 for r in tum_rows if r.get("hit2"))
+    toplam_tp3 = sum(1 for r in tum_rows if r.get("hit3"))
+    toplam_tp4 = sum(1 for r in tum_rows if r.get("hit4"))
+    acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
+    acik_tpsiz = len(acik_rows) - acik_tp
+    lines = [
+        f"📊 V12.0.1 ULTRA DURUM",
+        f"Saat: {tr_str()}", "Kapsam: tüm kayıtlı sürümler; TP temasları birbirini dışlamaz.",
+        f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
+        f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
+        f"Açık: {len(acik_rows)} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {_metric(ev)}R",
+        f"Eksik/legacy tarihçe: {incomplete} | Kurtarma bekleyen: {stats.get('recovery_missing_position',0)}",
+        f"Maliyet sonrası Net EV: {_metric(net_ev)}R | Kayıt: {len(net_values)}",
+        f"Tüm sinyallerde TP teması: TP1 {toplam_tp1} | TP2 {toplam_tp2} | TP3 {toplam_tp3} | TP4 {toplam_tp4}",
+        f"Açık pozisyon: TP gören {acik_tp} | Henüz TP görmeyen {acik_tpsiz}",
+        f"TP görmeden stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TEMIZ_STOP')}",
+        f"TP1 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP1_STOP')} | "
+        f"TP2 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP2_STOP')} | "
+        f"TP3 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP3_STOP')}",
+        *sonuc_satirlari,
+        f"Kapananlarda en az bir TP aldı: {en_az_bir_tp} (%{en_az_bir_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
+        f"Kapananlarda hiç TP almadı: {hic_tp} (%{hic_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
+        f"🎯 Filtre red sayaçları:",
+        f"  Yapı: {stats.get('v10_red_yapi', 0)} | 4H: {stats.get('v10_red_4h',0)} | Pullback: {stats.get('v10_red_pullback',0)}",
+        f"  Coin EMA: {stats.get('v11_red_coin_ema', 0)}",
+        f"  RANGE: {stats.get('v107_red_range', 0)}",
+        f"  FOMO: {stats.get('v11_red_fomo', 0)}",
+        f"  OI zayıf: {stats.get('v11_red_oi_zayif', 0)}",
+        f"  RSI: {stats.get('v10_red_rsi', 0)}",
+        f"  VWAP: {stats.get('v113_red_vwap', 0)}",
+        f"  Session: {stats.get('v113_red_session', 0)}",
+        f"  MTF: {stats.get('v113_red_mtf', 0)}",
+        f"  VWM: {stats.get('v113_red_vwm', 0)}",
+        f"  Korelasyon: {stats.get('v113_red_correlation', 0)}",
+        f"🛡 Manipülasyon:",
+        f"  Spoof: {stats.get('v112_red_spoofing', 0)}",
+        f"  Spoof görülen: {stats.get('v112_spoof_gorulen', 0)} | Keserdi: {stats.get('v112_spoof_keserdi', 0)}",
+        f"  Wash: {stats.get('v112_red_wash', 0)}",
+        f"  Pump/Dump: {stats.get('v112_red_pump_dump', 0)}",
+        f"  Insider: {stats.get('v112_red_insider', 0)}",
+        f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
+        f"  OKX timeout: {stats.get('okx_timeout', 0)}",
+        f"  Balina kârlı kapı reddi: {stats.get('balina_red_karli_kapi', 0)}",
+        f"🏢 Risk reddi: {stats.get('risk_reject', 0)} | Veri kalitesi reddi: {stats.get('data_quality_reject', 0)}",
+        f"💾 DB: {_RUNTIME_HEALTH.get('db_integrity')} | Yedek: {stats.get('backup_success', 0)} başarılı / {stats.get('backup_fail', 0)} hata",
+        f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
+        f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK/KAPALI'} | "
+        f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
+    ]
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        pending = conn.execute("SELECT COUNT(*) FROM notification_outbox WHERE sent_ts IS NULL").fetchone()[0]
+    lines.append(f"Bildirim bekleyen: {pending} | Analiz hatası: {stats.get('analysis_error',0)} | DB yazım hatası: {stats.get('ledger_write_fail',0)}")
+    lines.append(f"Ölçümde keserdi: MTF {stats.get('v113_would_mtf',0)} | Korelasyon {stats.get('v113_would_correlation',0)} | Balina {stats.get('balina_would_reject',0)}")
+    return "\n".join(lines)
+
+
+
+def _persistence_warnings():
+    root = os.path.realpath(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','/data'))
+    warnings = []
+    for name,path in (('OLCUM_DB',OLCUM_DB),('MEMORY_FILE',MEMORY_FILE),('BALINA_DB',BALINA_DB)):
+        directory = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+        if os.path.commonpath([root,directory])!=root or not os.access(directory,os.W_OK):
+            warnings.append(f"⚠️ {name}: kalıcı disk yolu doğrulanamadı; deploy'da veri kaybı olabilir")
+    return warnings
+
+
+
+def _enqueue_system_notification(text):
+    uid = 'SYSTEM:'+uuid.uuid4().hex
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        _outbox_insert(conn,uid,{'uid':uid},'SYSTEM',text)
+
+
+def _audit_tx(conn,event,pos):
+    if AUDIT_ENABLED:
+        conn.execute('INSERT INTO audit_event(ts,event_type,uid,symbol,build,config_hash,payload_json) VALUES(?,?,?,?,?,?,?)',
+            (time.time(),event,pos['uid'],pos['symbol'],pos.get('build',BOT_BUILD),
+             pos.get('config_hash',config_fingerprint()),_json(pos)))
 
 
 if __name__ == "__main__":
