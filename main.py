@@ -26,8 +26,8 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-VERSION_NAME = "Balina Avcısı V12.0.1 KURUMSAL ÖLÇÜM PLATFORMU"
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.0.1")
+VERSION_NAME = "Balina Avcısı V12.0.2 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = os.getenv("BOT_BUILD", "V12.0.2")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -54,7 +54,7 @@ GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
 GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
 
-# === V12.0.1 KURUMSAL ALTYAPI ===
+# === V12.0.2 KURUMSAL ALTYAPI ===
 KURUMSAL_ENABLED = os.getenv("KURUMSAL_ENABLED", "true").lower() == "true"
 DB_SCHEMA_VERSION = 13
 DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
@@ -84,9 +84,26 @@ RISK_MAX_SAME_SIDE = int(float(os.getenv("RISK_MAX_SAME_SIDE", "12")))
 RISK_MAX_GROUP = int(float(os.getenv("RISK_MAX_GROUP", "4")))
 VALIDATION_MIN_CLOSED = int(float(os.getenv("VALIDATION_MIN_CLOSED", "100")))
 
-# === V12.0.1 ÖLÇÜM BÜTÜNLÜĞÜ ===
+# === V12.0.2 ÖLÇÜM BÜTÜNLÜĞÜ ===
 # Eski veri aynı dosyada korunur; yeni ölçümler build/config ile ayrılır.
-RSI_METHOD = os.getenv("RSI_METHOD", "LEGACY").strip().upper()
+
+# V12.0.2: tüm seçenekler yapılandırma kimliğine girer.
+SCORE_MODE = os.getenv("SCORE_MODE", "EVIDENCE").upper()
+SCORE_CVD_SOURCE = os.getenv("SCORE_CVD_SOURCE", "AUTO").upper()
+SCORE_FIB_ENABLED = os.getenv("SCORE_FIB_ENABLED", "true").lower() == "true"
+SPOOF_SOURCE = os.getenv("SPOOF_SOURCE", "AUTO").upper()
+SPOOF_CACHE_SEC = float(os.getenv("SPOOF_CACHE_SEC", "20"))
+WASH_GUARD_BLOCK = os.getenv("WASH_GUARD_BLOCK", "false").lower() == "true"
+TIME_EXIT_MODE = os.getenv("TIME_EXIT_MODE", "HARD").upper()
+TIME_EXIT_MAX_HOURS = float(os.getenv("TIME_EXIT_MAX_HOURS", "0"))
+LIQ_EVENTS_ENABLED = os.getenv("LIQ_EVENTS_ENABLED", "false").lower() == "true"
+MEXC_ENABLED = os.getenv("MEXC_ENABLED", "false").lower() == "true"
+MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://contract.mexc.com").rstrip("/")
+MEXC_REFRESH_SEC = float(os.getenv("MEXC_REFRESH_SEC", "15"))
+MEXC_STALE_SEC = float(os.getenv("MEXC_STALE_SEC", "45"))
+MEXC_HTTP_TIMEOUT = float(os.getenv("MEXC_HTTP_TIMEOUT", "8"))
+
+RSI_METHOD = os.getenv("RSI_METHOD", "WILDER").strip().upper()
 ENTRY_MAX_AGE_SEC = float(os.getenv("ENTRY_MAX_AGE_SEC", "5"))
 BALINA_WS_BOOK_CHANNEL = os.getenv("BALINA_WS_BOOK_CHANNEL", "books").strip()
 BALINA_THRESHOLD_REFRESH_SEC = float(os.getenv("BALINA_THRESHOLD_REFRESH_SEC", "1"))
@@ -344,6 +361,9 @@ DEFAULT_COINS = [
 ]
 COINS = [x.strip().upper() for x in (RAW_COINS_ENV or ",".join(DEFAULT_COINS)).split(",") if x.strip()]
 
+for _file_path in (LOG_FILE, MEMORY_FILE, OLCUM_DB, BALINA_DB):
+    os.makedirs(os.path.dirname(os.path.abspath(_file_path)), exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -521,7 +541,7 @@ def config_fingerprint() -> str:
                 'BALINA_', 'RISK_', 'SIM_', 'GOLGE_', 'ADX_', 'VWAP_', 'MTF_',
                 'RSI_', 'ENTRY_', 'PAPER_', 'CORRELATION_', 'SESSION_', 'SPOOF_',
                 'WASH_', 'PUMP_', 'INSIDER_', 'VWM_', 'TIME_EXIT_', 'COIN_',
-                'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_')
+                'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_', 'SCORE_', 'MEXC_', 'LIQ_')
     values = {}
     for key,value in list(globals().items()):
         if not key.startswith(prefixes) or any(x in key for x in ('TOKEN','SECRET','KEY','URL','DB')):
@@ -1108,6 +1128,11 @@ def _render_signal_chart_unlocked(symbol, direction, klines, entry, stop, tps, m
         for idx, (name, val) in enumerate(sorted(tp_items, key=lambda kv: abs(kv[1] - entry))):
             _hline(val, tp_cols[min(idx, 3)], "-.", name)
 
+        if SIGNAL_CHART_FIB:
+            fib = fibonacci_context(_s_closed(rows), d)
+            for ratio, level in fib.get("levels", {}).items():
+                ax.axhline(level, color="#eab308", linestyle=":", linewidth=0.7, alpha=0.5)
+                ax.text(0, level, "Fib " + ratio, fontsize=6, color="#eab308")
         # VWAP
         if vwap_val and vwap_val > 0:
             _hline(vwap_val, VWAP_COL, ":", "VWAP")
@@ -2168,7 +2193,7 @@ async def balina_db_loop() -> None:
 
 
 async def _balina_ws_subscribe(ws, symbols: List[str]) -> None:
-    args = []
+    args = [{"channel": "liquidation-orders", "instType": "SWAP"}] if LIQ_EVENTS_ENABLED else []
     for symbol in symbols:
         args.append({"channel": "trades", "instId": symbol})
         args.append({"channel": BALINA_WS_BOOK_CHANNEL, "instId": symbol})
@@ -2190,7 +2215,7 @@ async def _balina_ws_change_symbols(ws, old_symbols: set, new_symbols: set) -> N
             await asyncio.sleep(0.2)
     for symbol in old_symbols-new_symbols:
         _BALINA_STATE.pop(symbol,None)
-    _BALINA_WS_STATUS["subscriptions"] = len(new_symbols) * 2
+    _BALINA_WS_STATUS["subscriptions"] = len(new_symbols) * 2 + int(LIQ_EVENTS_ENABLED)
 
 
 async def balina_ws_loop() -> None:
@@ -2237,7 +2262,9 @@ async def balina_ws_loop() -> None:
                     for row in msg.get("data", []):
                         if inst_id and "instId" not in row:
                             row["instId"] = inst_id
-                        if channel == "trades":
+                        if channel == "liquidation-orders":
+                            _process_liquidation_report(row)
+                        elif channel == "trades":
                             _balina_process_trade(row)
                         elif channel == BALINA_WS_BOOK_CHANNEL:
                             _balina_process_book(row,msg.get("action","snapshot"))
@@ -2366,56 +2393,25 @@ def session_yon_uygun(side: str, force: bool = False) -> Tuple[bool, str]:
     return True, name
 
 
-def likidasyon_haritasi(symbol: str, klines: List[List[Any]], oi_value: float) -> Dict[str, Any]:
-    """
-    Tahmini likidasyon haritası.
-    OI'nin belirli kaldıraç seviyelerinde yoğunlaştığını varsayarak,
-    mevcut fiyatın çevresinde likidasyon kümeleri hesaplar.
-    """
-    sonuç = {"clusters": [], "top_bid_cluster": 0.0, "top_ask_cluster": 0.0,
-             "estimated": True, "can_block": False}
-    if not LIQ_HEATMAP_ENABLED or oi_value <= 0 or len(klines) < 20:
-        return sonuç
+def likidasyon_haritasi(symbol, klines, oi_value):
+    out = {"clusters": [], "top_bid_cluster": 0.0, "top_ask_cluster": 0.0,
+           "estimated": True, "can_block": False, "model": "DISTANCE_BANDS",
+           "note": "Giriş fiyatı ve kaldıraç dağılımı bilinmiyor; küme büyüklüğü hesaplanamaz."}
+    if not LIQ_HEATMAP_ENABLED or not klines:
+        return out
     price = safe_float(klines[-1][4])
     if price <= 0:
-        return sonuç
-
-    # OI'yi kabaca long/short yarı yarıya kabul et (kaba tahmin)
-    oi_per_side = oi_value / 2.0
-
-    # Her kaldıraç seviyesi için likidasyon mesafesi = 1/lev - bakım marjı
+        return out
     for lev in LIQ_HEATMAP_LEVERAGES:
-        liq_distance_pct = (1.0 / lev) * 100.0 - 0.5  # %0.5 bakım marjı çıkarıldı
-        if liq_distance_pct <= 0:
+        if lev <= 0:
             continue
-        # Long likidasyonlar: fiyatın altında
-        long_liq_price = price * (1 - liq_distance_pct / 100.0)
-        # Short likidasyonlar: fiyatın üstünde
-        short_liq_price = price * (1 + liq_distance_pct / 100.0)
-
-        # Menzil kontrolü
-        cluster_value = oi_per_side / max(1, len(LIQ_HEATMAP_LEVERAGES))
-        if cluster_value >= LIQ_HEATMAP_MIN_CLUSTER and abs(pct_change(price, long_liq_price)) <= LIQ_HEATMAP_DIST_PCT:
-            sonuç["clusters"].append({
-                "side": "LONG_LIQ", "price": long_liq_price,
-                "value": cluster_value,
-                "lev": lev,
-            })
-        if cluster_value >= LIQ_HEATMAP_MIN_CLUSTER and abs(pct_change(price, short_liq_price)) <= LIQ_HEATMAP_DIST_PCT:
-            sonuç["clusters"].append({
-                "side": "SHORT_LIQ", "price": short_liq_price,
-                "value": cluster_value,
-                "lev": lev,
-            })
-
-    # En büyük alt ve üst küme
-    alt = [c for c in sonuç["clusters"] if c["side"] == "LONG_LIQ"]
-    ust = [c for c in sonuç["clusters"] if c["side"] == "SHORT_LIQ"]
-    if alt:
-        sonuç["top_bid_cluster"] = max(alt, key=lambda x: x["value"])["price"]
-    if ust:
-        sonuç["top_ask_cluster"] = max(ust, key=lambda x: x["value"])["price"]
-    return sonuç
+        distance = 100/lev-.5
+        if not 0 < distance <= LIQ_HEATMAP_DIST_PCT:
+            continue
+        for side, sign in (("LONG_LIQ", -1), ("SHORT_LIQ", 1)):
+            out["clusters"].append({"side": side, "price": price*(1+sign*distance/100),
+                                    "value": None, "lev": lev, "assumed_maintenance_pct": .5})
+    return out
 
 
 def likidasyon_cakismasi(side: str, entry: float, liq_map: Dict[str, Any]) -> Tuple[bool, str]:
@@ -2754,7 +2750,7 @@ def v107_oi_skor(side, oi_pct, fiyat_pct):
     return (0.5, "long likidasyonu — zayıf düşüş") if side == "SHORT" else (0.4, "long likidasyonu")
 
 
-def v10_quality_score(side, k, ms, ext):
+def _legacy_quality_score(side, k, ms, ext):
     p, bayrak = {}, {}
     ok, _ = v10_structure_allows(side, ms)
     s = 18.0 if ok else 0.0
@@ -2889,7 +2885,7 @@ async def v10_fetch_orderbook(symbol):
         return blank
 
 
-async def v112_spoof_tespit(symbol: str, force: bool = False) -> Tuple[bool, str]:
+async def _legacy_spoof_tespit(symbol: str, force: bool = False) -> Tuple[bool, str]:
     if (not SPOOF_GUARD_ENABLED and not force) or not V10_USE_ORDERBOOK:
         return False, "kapalı"
     try:
@@ -3164,8 +3160,9 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
         return None
     kayma = abs(entry - entry_ref) / entry_ref * 100.0 if entry_ref > 0 else 0.0
     kor_block, _ = korelasyon_kilidi(symbol, side, force=True)
-    ext = {"oi_change_pct": oi if oi is not None else 0.0, "funding": funding,
+    ext = {"oi_change_pct": oi, "funding": funding,
            "btc_dir": btc_4h, "btc_dir_1h": btc_1h, "orderbook": ob}
+    ext.update(await score_market_context(symbol, k, side))
     score, parts, r_value, bayrak = v10_quality_score(side, k, ms, ext)
     oi_yorum = ext.get("oi_yorum", "")
     rsi_ok = ((V10_RSI_LONG_MIN <= r_value <= V10_RSI_LONG_MAX) if side == "LONG"
@@ -3179,7 +3176,7 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                 "session_ok": session_ok, "vwap_ok": vwap_ok,
                 "mtf_ok": None if "veri yok" in mtf_note.lower() else mtf_ok,
                 "vwm_ok": vwm_ok,
-                "spoof_ok": None if spoof_note in ("hata", "veri yok", "yetersiz", "kapalı") else not spoof_hit,
+                "spoof_ok": None if spoof_hit is None or spoof_note in ("hata", "veri yok", "yetersiz", "kapalı") else not spoof_hit,
                 "rsi_ok": rsi_ok,
                 "oi_yorum_ok": None if oi is None else not ((side == "LONG" and "short kapanışı" in oi_yorum) or
                                                              (side == "SHORT" and "long likidasyonu" in oi_yorum)),
@@ -3197,7 +3194,7 @@ async def analyze_olcum_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "event": ms.get("event"), "structure": "Rastgele kontrol grubu" if kontrol else v10_structure_allows(side, ms)[1],
             "range_break": bool(ms.get("range_break")), "trend_1h": ms.get("trend", "RANGE"),
             "trend_4h": trend4, "fomo_move_pct": round(fomo_mv, 2), "pullback": pb_note or "yok",
-            "score": score, "score_parts": parts, "bayrak": bayrak, "rsi": r_value,
+            "score": score, "score_parts": parts, "bayrak": bayrak, "market_context": ext.get("market_context", {}), "rsi": r_value,
             "candle_ts": str(k[-1][0]), "oi_change_pct": oi, "oi_yorum": oi_yorum,
             "coin_1h_ema": coin_yon, "funding": funding, "ob_imbalance": ob.get("imbalance", 0),
             "btc_4h": btc_4h, "btc_1h": btc_1h, "trend_uyum": allowed_side == side,
@@ -3242,7 +3239,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
 
     # V11.2 savunmaları
     wash_hit, wash_note = v112_wash_tespit(symbol, _s_closed(k1h))
-    if wash_hit:
+    if wash_hit and WASH_GUARD_BLOCK:
         stats["v112_red_wash"] = int(stats.get("v112_red_wash", 0)) + 1
         return None
 
@@ -3313,12 +3310,13 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             return None
         stats["v112_spoof_keserdi"] = int(stats.get("v112_spoof_keserdi", 0)) + 1
 
-    ext = {"oi_change_pct": oi if oi is not None else 0.0,
+    ext = {"oi_change_pct": oi,
            "funding": funding, "btc_dir": btc_4h, "btc_dir_1h": btc_1h,
            "orderbook": ob}
 
+    ext.update(await score_market_context(symbol, k, side))
     score, parts, r, bayrak = v10_quality_score(side, k, gate["ms"], ext)
-    if ((side == "LONG" and gate.get("trend4") == "UP") or
+    if SCORE_MODE == "LEGACY" and ((side == "LONG" and gate.get("trend4") == "UP") or
             (side == "SHORT" and gate.get("trend4") == "DOWN")):
         score = round(min(100.0, score + SIGNAL_SCORE_TREND_4H_BONUS), 1)
         parts["trend_4h_bonus"] = round(SIGNAL_SCORE_TREND_4H_BONUS, 1)
@@ -3375,7 +3373,7 @@ async def analyze_v10_symbol(symbol: str) -> Optional[Dict[str, Any]]:
             "range_break": bool(gate["ms"].get("range_break")),
             "trend_1h": gate["ms"]["trend"], "trend_4h": gate["trend4"],
             "fomo_move_pct": gate["fomo"], "pullback": gate["pullback"],
-            "score": score, "score_parts": parts, "bayrak": bayrak, "rsi": r,
+            "score": score, "score_parts": parts, "bayrak": bayrak, "market_context": ext.get("market_context", {}), "rsi": r,
             "candle_ts": str(k[-1][0]), "oi_change_pct": ext["oi_change_pct"],
             "oi_yorum": ext.get("oi_yorum", ""),
             "coin_1h_ema": gate.get("coin_1h_ema", "-"),
@@ -3411,7 +3409,7 @@ def build_v10_message(sig):
     p = sig["score_parts"]
     tag = lambda key, lbl: f"{lbl}{'✅' if b.get(key, p.get(key, 0) > 0) else '▫️'}"
     conf = " ".join([tag("order_block", "OB"), tag("fvg", "FVG"), tag("volume_profile", "VP"),
-                     tag("cvd", "CVD-proxy"), tag("sweep", "Sweep"), tag("orderbook", "OBflow")])
+                     tag("cvd", "CVD:" + sig.get("market_context", {}).get("score_cvd_source", "CANDLE_PROXY")), tag("sweep", "Sweep"), tag("orderbook", "OBflow")])
     fund = safe_float(sig.get("funding"))
     trend_line = ("🎲 KONTROL GRUBU — yön rastgele\n" if sig.get("kontrol") else
                   ("Trend Uyumu: BTC ile AYNI YÖN ✅\n" if sig.get("trend_uyum") else
@@ -3449,7 +3447,7 @@ def build_v10_message(sig):
 
     signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
     return (f"{signal_no_line}{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V12.0.1 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V12.0.2 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -3479,7 +3477,7 @@ def build_v10_close_message(pos, R, outcome, exit_price):
     else:
         head = f"🏁 {outcome}"
     return (
-        f"🆕 V12.0.1 — POZİSYON KAPANDI\n"
+        f"🆕 V12.0.2 — POZİSYON KAPANDI\n"
         + (f"🆔 Sinyal #{int(safe_float(pos.get('signal_no')))}\n" if pos.get("signal_no") else "") +
         f"{head}\n"
         f"Coin: {pos['symbol']}\n"
@@ -3535,6 +3533,9 @@ def v10_open_paper(sig, persist=True):
         "kontrol": bool(sig.get("kontrol")),
         "mfe_pct": 0.0, "mae_pct": 0.0, "current_r": 0.0,
     }
+    poz["market_context"] = copy.deepcopy(sig.get("market_context", {}))
+    poz["time_exit_policy"] = {"enabled": TIME_EXIT_ENABLED, "mode": TIME_EXIT_MODE,
+        "hours": TIME_EXIT_HOURS, "min_r": TIME_EXIT_MIN_PROFIT_R, "max_hours": TIME_EXIT_MAX_HOURS}
     poz["tp_weights"] = _tp_weights()
     poz["tp_rrs"] = [safe_float(sig.get(f"tp{i}_rr"), rr) for i, rr in enumerate((TP1_RR, TP2_RR, TP3_RR, TP4_RR), 1)]
     poz["cost_r_frozen"] = simulasyon_maliyet_r(poz)
@@ -3958,7 +3959,7 @@ def health_raporu_uret() -> str:
         disk_free = 0.0
     ws_age = max(0.0, now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"), now))
     return (
-        "🏥 V12.0.1 SİSTEM SAĞLIĞI\n"
+        "🏥 V12.0.2 SİSTEM SAĞLIĞI\n"
         f"Çalışma süresi: {(now-safe_float(_RUNTIME_HEALTH.get('started_ts')))/3600:.1f} saat\n"
         f"Tarama yaşı: {now-safe_float(_RUNTIME_HEALTH.get('scan_heartbeat')):.1f} sn\n"
         f"Paper takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('paper_heartbeat')):.1f} sn\n"
@@ -4010,7 +4011,7 @@ async def kurumsal_bakim_loop() -> None:
             if sorunlar and HEALTH_ALERT_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_health_alert_ts")) >= HEALTH_ALERT_COOLDOWN_SEC:
                 _RUNTIME_HEALTH["last_health_alert_ts"] = now
                 stats["health_alert"] = int(stats.get("health_alert", 0)) + 1
-                await safe_send_telegram("🚨 V12.0.1 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
+                await safe_send_telegram("🚨 V12.0.2 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
         except Exception as e:
             logger.exception("kurumsal_bakim_loop hata: %s", e)
         await asyncio.sleep(max(15, HEALTH_CHECK_INTERVAL_SEC))
@@ -4291,7 +4292,7 @@ def kombinasyon_raporu_uret() -> str:
 
 def dogrulama_raporu_uret() -> str:
     rows = _report_rows()
-    lines = ['📐 V12.0.1 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
+    lines = ['📐 V12.0.2 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
              'Maliyet girişte dondurulur; net R komisyon/kayma/funding varsayımı sonrasıdır.']
     if VALIDATION_START_TS<=0:
         lines.append('Sabit ileri doğrulama başlangıcı tanımlanmadı; sonuçlar betimseldir, karar yok.')
@@ -4383,7 +4384,7 @@ def selftest_raporu_uret() -> str:
     test("DB mevcut", os.path.exists(OLCUM_DB))
     ok, detay = db_integrity_kontrol()
     test("DB integrity", ok)
-    lines = ["🧪 V12.0.1 ÖZ TEST"]
+    lines = ["🧪 V12.0.2 ÖZ TEST"]
     lines.extend(f"{'✅' if sonuc else '❌'} {ad}" for ad, sonuc in testler)
     lines.append(f"Sonuç: {sum(1 for _, x in testler if x)}/{len(testler)} geçti")
     lines.append(f"DB: {detay}")
@@ -4391,9 +4392,7 @@ def selftest_raporu_uret() -> str:
 
 
 async def post_init(application) -> None:
-    if SIGNAL_CHART_FIB:
-        logger.info('SIGNAL_CHART_FIB uyumluluk ayarı; bu sürümde Fibonacci çizimi uygulanmıyor')
-    logger.info('Veri kaynakları: OKX REST ve isteğe bağlı OKX WS; MEXC yok')
+    logger.info('Veri kaynakları: OKX REST/WS; MEXC ikincil REST=%s', MEXC_ENABLED)
     await _db_call(olcum_db_init)
     await _db_call(_restore_ledger)
     now = time.time()
@@ -4410,7 +4409,8 @@ async def post_init(application) -> None:
         f'Paylar: {"/".join(str(round(w*100)) for w in _tp_weights())}%\n'
         f'Ölçüm modu: {OLCUM_MODU} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}\n'
         f'Ölçüm kaydı: {count} pozisyon | Açık {len(mp["open"])} | Gölge {len(mp["golge"])}\n'
-        f'RSI yöntemi: {RSI_METHOD} | Skor CVD: mum yönü proxy\n'
+        f'RSI: {RSI_METHOD} | Skor: {SCORE_MODE} | CVD: {SCORE_CVD_SOURCE}\n'
+        f'MEXC ikincil veri: {MEXC_ENABLED} | Süre çıkışı: {TIME_EXIT_MODE}\n'
         f'Balina motoru: {BALINA_MOTOR_ENABLED} | WS defter kanalı: {BALINA_WS_BOOK_CHANNEL}\n'
         f'Balina durum kapısı: {BALINA_KARLI_KAPI_ENABLED} | Ölçümde sinyal kesmez\n'
         f'Likidite: tahmini mesafe bantları; {"hesaplanıyor" if LIQ_HEATMAP_ENABLED and LIQ_HEATMAP_FETCH_OI else "hesaplanmıyor"}; bilgi amaçlı\n'
@@ -4420,6 +4420,8 @@ async def post_init(application) -> None:
     await _db_call(_enqueue_system_notification,text)
     for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop):
         _start_loop(factory)
+    if MEXC_ENABLED:
+        _start_loop(mexc_market_loop)
     if KURUMSAL_ENABLED:
         _start_loop(kurumsal_bakim_loop)
     if BALINA_MOTOR_ENABLED:
@@ -4432,7 +4434,7 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
-        "/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
+        "/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
         "/kombinasyon - koşul ve kombinasyon laboratuvarı\n"
         "/dogrulama - ileri doğrulama ve net maliyet raporu\n"
@@ -4468,7 +4470,7 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V12.0.1 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için V12.0.2 sinyali yok.")
         return
     for part in telegram_parcala('ÖN ANALİZ — deftere sinyal açılmadı; giriş tekrar fiyatlanır.\n'+build_v10_message(res)):
         await update.message.reply_text(part)
@@ -4478,7 +4480,7 @@ async def cmd_v10(update, context):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V12.0.1 ULTRA motor durumu",
+        f"🆕 V12.0.2 ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
@@ -4565,7 +4567,7 @@ async def cmd_risk(update, context):
         return
     d = await asyncio.to_thread(risk_durumu)
     await update.message.reply_text(
-        "🛡 V12.0.1 RİSK MOTORU\n"
+        "🛡 V12.0.2 RİSK MOTORU\n"
         f"Motor: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}\n"
         f"Acil durdurma: {'AKTİF' if d['kill_switch'] else 'kapalı'}\n"
         f"Günlük: {d['daily_r']:+.2f}R / -{abs(RISK_MAX_DAILY_R):.2f}R\n"
@@ -4798,6 +4800,7 @@ def telegram_yetkili(update: Update) -> bool:
 
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_stop(post_stop).post_shutdown(post_shutdown).build()
+    app.add_handler(CommandHandler("mexc", cmd_mexc))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -4826,6 +4829,16 @@ def build_app():
 
 
 def validate_config() -> None:
+    for name,value,allowed in (("SCORE_MODE",SCORE_MODE,{"LEGACY","EVIDENCE"}),
+        ("SCORE_CVD_SOURCE",SCORE_CVD_SOURCE,{"AUTO","WS","PROXY"}),
+        ("SPOOF_SOURCE",SPOOF_SOURCE,{"AUTO","REST","LEGACY"}),
+        ("TIME_EXIT_MODE",TIME_EXIT_MODE,{"HARD","MIN_PROFIT"})):
+        if value not in allowed:
+            raise ValueError(name+" geçersiz: "+str(value))
+    if min(MEXC_REFRESH_SEC,MEXC_STALE_SEC,MEXC_HTTP_TIMEOUT) <= 0 or SPOOF_CACHE_SEC < 0:
+        raise ValueError("Veri kaynaklarının süreleri geçersiz")
+    if TIME_EXIT_MAX_HOURS < 0 or (TIME_EXIT_MAX_HOURS and TIME_EXIT_MAX_HOURS < TIME_EXIT_HOURS):
+        raise ValueError("TIME_EXIT_MAX_HOURS sıfır veya ilk çıkış saatinden büyük olmalı")
     if RSI_METHOD not in ('LEGACY','WILDER'):
         raise ValueError('RSI_METHOD LEGACY/WILDER olmalı')
     if BALINA_WS_BOOK_CHANNEL not in ('books','books5') or BALINA_WS_FAIL_POLICY not in ('REST','BLOCK'):
@@ -4880,7 +4893,7 @@ def main() -> None:
 
 
 
-# === V12.0.1 kalıcı defter / bildirim kuyruğu ===
+# === V12.0.2 kalıcı defter / bildirim kuyruğu ===
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger")
 _OKX_SLOTS = asyncio.Semaphore(OKX_EXECUTOR_WORKERS)
 _SIGNAL_LOCK = asyncio.Lock()
@@ -5316,7 +5329,7 @@ def _paper_process_rows(pos, rows):
         pos.update(last_price=safe_float(row[4]),last_price_ts=close_at,scan_ts=close_at*1000)
         if outcome:
             return R,outcome
-        if TIME_EXIT_ENABLED and close_at>=pos['open_ts']+TIME_EXIT_HOURS*3600:
+        if _time_exit_due(pos, close_at):
             risk = abs(pos['entry']-pos['orig_stop'])
             move = (pos['last_price']-pos['entry'])*(1 if pos['side']=='LONG' else -1)
             R = _paper_time_exit_r(pos,move/risk) if risk else 0.0
@@ -5492,7 +5505,7 @@ def status_raporu_uret():
     acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
     acik_tpsiz = len(acik_rows) - acik_tp
     lines = [
-        f"📊 V12.0.1 ULTRA DURUM",
+        f"📊 V12.0.2 ULTRA DURUM",
         f"Saat: {tr_str()}", "Kapsam: tüm kayıtlı sürümler; TP temasları birbirini dışlamaz.",
         f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
         f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
@@ -5544,12 +5557,21 @@ def status_raporu_uret():
 
 
 def _persistence_warnings():
-    root = os.path.realpath(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','/data'))
+    root = os.path.realpath(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "/data"))
+    mounts = set()
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            for line in stream:
+                fields = line.split()
+                if len(fields) > 4:
+                    mounts.add(os.path.realpath(fields[4].replace("\\040", " ")))
+    except OSError:
+        pass
     warnings = []
-    for name,path in (('OLCUM_DB',OLCUM_DB),('MEMORY_FILE',MEMORY_FILE),('BALINA_DB',BALINA_DB)):
+    for name,path in (("OLCUM_DB",OLCUM_DB),("MEMORY_FILE",MEMORY_FILE),("BALINA_DB",BALINA_DB)):
         directory = os.path.realpath(os.path.dirname(os.path.abspath(path)))
-        if os.path.commonpath([root,directory])!=root or not os.access(directory,os.W_OK):
-            warnings.append(f"⚠️ {name}: kalıcı disk yolu doğrulanamadı; deploy'da veri kaybı olabilir")
+        if root not in mounts or os.path.commonpath([root,directory]) != root or not os.access(directory,os.W_OK):
+            warnings.append(f"⚠️ {name}: yazılabilir ayrı kalıcı bağlama doğrulanamadı; deploy'da veri kaybı olabilir")
     return warnings
 
 
@@ -5565,6 +5587,334 @@ def _audit_tx(conn,event,pos):
         conn.execute('INSERT INTO audit_event(ts,event_type,uid,symbol,build,config_hash,payload_json) VALUES(?,?,?,?,?,?,?)',
             (time.time(),event,pos['uid'],pos['symbol'],pos.get('build',BOT_BUILD),
              pos.get('config_hash',config_fingerprint()),_json(pos)))
+
+
+# === V12.0.2 VERİ KAYNAKLARI VE ÖLÇÜLEBİLİR SKOR ===
+_MEXC_CACHE = {"instruments": {}, "tickers": {}, "ts": 0.0, "meta_ts": 0.0, "error": ""}
+_SPOOF_CACHE = {}
+_SPOOF_LOCKS = {}
+_CVD_REST_CACHE = {}
+
+
+def fibonacci_context(k, side):
+    """Yalnız sağında yeterli kapanmış mum bulunan pivotlardan son yönlü çift."""
+    if side not in ("LONG", "SHORT"):
+        return {}
+    k = _s_closed(k)
+    left, right = max(1, V10_SWING_LEFT), max(1, V10_SWING_RIGHT)
+    pivots = []
+    for i in range(left, len(k)-right):
+        segment = k[i-left:i+right+1]
+        h, l = safe_float(k[i][2]), safe_float(k[i][3])
+        hs, ls = highs(segment), lows(segment)
+        if h == max(hs) and hs.count(h) == 1:
+            pivots.append((i, "H", h))
+        if l == min(ls) and ls.count(l) == 1:
+            pivots.append((i, "L", l))
+    start_kind, end_kind = ("L", "H") if side == "LONG" else ("H", "L")
+    for end in reversed(pivots):
+        if end[1] != end_kind:
+            continue
+        starts = [p for p in pivots if p[0] < end[0] and p[1] == start_kind]
+        if not starts:
+            continue
+        start = starts[-1]
+        direction = 1 if side == "LONG" else -1
+        span = (end[2]-start[2])*direction
+        if span <= 0:
+            continue
+        depth = (end[2]-safe_float(k[-1][4]))*direction/span
+        return {"start_ts": k[start[0]][0], "end_ts": k[end[0]][0],
+                "start": start[2], "end": end[2], "depth": depth,
+                "levels": {str(r): end[2]-direction*span*r for r in (.382,.5,.618,.786)},
+                "quality": 1.0 if .382 <= depth <= .618 else .5 if .618 < depth <= .786 else 0.0}
+    return {}
+
+
+def _time_exit_due(pos, now):
+    # Eski kayıtlar kendi tarihsel HARD çıkışını sürdürür.
+    policy = pos.get("time_exit_policy") or {"enabled": TIME_EXIT_ENABLED,
+                "mode": "HARD", "hours": TIME_EXIT_HOURS}
+    if not policy.get("enabled", True):
+        return False
+    age = (now-safe_float(pos.get("open_ts")))/3600
+    if age < safe_float(policy.get("hours"), 48):
+        return False
+    if policy.get("mode") == "HARD":
+        return True
+    maximum = safe_float(policy.get("max_hours"))
+    if maximum > 0 and age >= maximum:
+        return True
+    risk = abs(pos["entry"]-pos["orig_stop"])
+    if risk <= 0:
+        return False
+    move = (pos["last_price"]-pos["entry"])*(1 if pos["side"] == "LONG" else -1)/risk
+    # Gerçekleşmiş parçalar + kalan pozisyon; eski R formülü değişmez.
+    return _paper_time_exit_r(pos, move) >= safe_float(policy.get("min_r"), .5)
+
+
+def _mexc_http(path):
+    response = _http_session().get(MEXC_BASE_URL+path, timeout=MEXC_HTTP_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("success") is not True or str(payload.get("code")) != "0":
+        raise RuntimeError("MEXC market API başarısız")
+    return payload.get("data")
+
+
+def _mexc_instruments(rows):
+    result = {}
+    for row in rows if isinstance(rows, list) else []:
+        base = str(row.get("baseCoin", "")).upper()
+        if not base or row.get("quoteCoin") != "USDT" or row.get("settleCoin") != "USDT":
+            continue
+        if str(row.get("state", "0")) != "0" or str(row.get("futureType", "1")) != "1":
+            continue
+        if safe_float(row.get("contractSize")) <= 0 or row.get("symbol") != base+"_USDT":
+            continue
+        result[base+"-USDT-SWAP"] = dict(row)
+    return result
+
+
+async def mexc_market_loop():
+    # Tek sıralı worker çağrısı: timeout'ta yeni thread yığılmaz.
+    while True:
+        try:
+            if time.time()-_MEXC_CACHE["meta_ts"] > 1800:
+                data = await asyncio.to_thread(_mexc_http, "/api/v1/contract/detail")
+                _MEXC_CACHE["instruments"] = _mexc_instruments(data)
+                _MEXC_CACHE["meta_ts"] = time.time()
+            data = await asyncio.to_thread(_mexc_http, "/api/v1/contract/ticker")
+            rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+            _MEXC_CACHE.update(tickers={r["symbol"]: r for r in rows if r.get("symbol")},
+                               ts=time.time(), error="")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _MEXC_CACHE["error"] = type(exc).__name__
+            stats["mexc_api_fail"] = int(stats.get("mexc_api_fail", 0))+1
+            logger.warning("MEXC ikincil veri alınamadı: %s", type(exc).__name__)
+        await asyncio.sleep(max(5, MEXC_REFRESH_SEC))
+
+
+def mexc_snapshot(symbol):
+    out = {"source": "MEXC_REST", "status": "KAPALI" if not MEXC_ENABLED else "VERI_YOK"}
+    if not MEXC_ENABLED:
+        return out
+    instrument = _MEXC_CACHE["instruments"].get(normalize_symbol(symbol))
+    if not instrument:
+        return out
+    row = _MEXC_CACHE["tickers"].get(instrument["symbol"])
+    if not row:
+        return out
+    ts = safe_float(row.get("timestamp"))/1000
+    age = time.time()-ts
+    if ts <= 0 or age < -5 or age > MEXC_STALE_SEC or time.time()-_MEXC_CACHE["ts"] > MEXC_STALE_SEC:
+        out["status"] = "BAYAT"
+        return out
+    price = safe_float(row.get("lastPrice"))
+    out.update(status="CANLI", ts=ts, symbol=instrument["symbol"], price=price,
+        funding=safe_float(row.get("fundingRate")), turnover_24h_usdt=safe_float(row.get("amount24")),
+        oi_notional_estimate_usdt=safe_float(row.get("holdVol"))*safe_float(instrument["contractSize"])*price)
+    return out
+
+
+async def cmd_mexc(update, context):
+    if not telegram_yetkili(update):
+        return
+    symbol = normalize_symbol(context.args[0]) if context.args else "BTC-USDT-SWAP"
+    data = mexc_snapshot(symbol)
+    await update.message.reply_text("MEXC İKİNCİL VERİ | "+symbol+"\n"+json.dumps(data, ensure_ascii=False)+
+                                   "\nOKX giriş/çıkış fiyatını değiştirmez.")
+
+
+def _taker_cvd(rows, symbol, now, window=60):
+    # 500 kayıt sınırına takılan pencere tam CVD olarak sunulmaz.
+    cutoff = (now-window)*1000
+    timestamps = [safe_float(r.get("ts")) for r in rows]
+    if not timestamps or (len(rows) >= 500 and min(timestamps) > cutoff):
+        return None
+    selected = [r for r in rows if cutoff <= safe_float(r.get("ts")) <= now*1000]
+    buy = sell = 0.0
+    seen = set()
+    for row in selected:
+        key = row.get("tradeId")
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        price, qty = safe_float(row.get("px")), safe_float(row.get("sz"))
+        value = _balina_contract_value(symbol, price, qty)
+        if value <= 0 or row.get("side") not in ("buy", "sell"):
+            return None
+        if row["side"] == "buy":
+            buy += value
+        else:
+            sell += value
+    total = buy+sell
+    return {"cvd_value_usdt": buy-sell, "cvd_norm": (buy-sell)/total if total else 0.0,
+            "cvd_source": "OKX_REST", "cvd_window_sec": window, "cvd_ts": now} if total else None
+
+
+async def score_market_context(symbol, k, side):
+    context = {"cvd_source": "CANDLE_PROXY", "cvd_value_usdt": None,
+               "cvd_norm": None, "cvd_window_sec": None, "cvd_ts": time.time(),
+               "fib": fibonacci_context(k, side), "mexc": mexc_snapshot(symbol), "score_mode": SCORE_MODE}
+    if SCORE_CVD_SOURCE != "PROXY":
+        snapshot = balina_snapshot(symbol) if BALINA_MOTOR_ENABLED else {}
+        if snapshot.get("status") == "CANLI" and snapshot.get("flow_ready"):
+            context.update(cvd_source="OKX_WS", cvd_value_usdt=snapshot.get("cvd_1m"),
+                           cvd_norm=snapshot.get("cvd_norm_1m"), cvd_window_sec=60)
+        elif SCORE_CVD_SOURCE == "AUTO":
+            cached = _CVD_REST_CACHE.get(symbol)
+            if not cached or time.time()-cached[0] > 5:
+                try:
+                    rows = await _okx_get_async("/api/v5/market/trades", {"instId": symbol, "limit": 500})
+                    data = _taker_cvd(rows, symbol, time.time())
+                except Exception:
+                    data = None
+                _CVD_REST_CACHE[symbol] = (time.time(), data)
+                if len(_CVD_REST_CACHE) > 500:
+                    _CVD_REST_CACHE.pop(next(iter(_CVD_REST_CACHE)))
+            data = _CVD_REST_CACHE[symbol][1]
+            if data:
+                context.update(data)
+    return {"market_context": context}
+
+
+def v10_quality_score(side, k, ms, ext):
+    score, parts, r, flags = _legacy_quality_score(side, k, ms, ext)
+    if SCORE_MODE == "LEGACY":
+        ext.setdefault("market_context", {})["score_cvd_source"] = "CANDLE_PROXY"
+        return score, parts, r, flags
+    # Ön şart olan yapı/BTC/4H uyumu tekrar sabit puan kazandırmaz.
+    weights = {"volume": 2, "rsi": 7, "oi": 9, "funding": 7, "orderbook": 7,
+               "order_block": 11, "fvg": 8, "volume_profile": 5, "cvd": 5, "sweep": 7}
+    p = {name: max(0.0, parts.get(name, 0.0)) for name in weights}
+    if ext.get("oi_change_pct") is None:
+        p["oi"] = 0.0
+    if ext.get("funding") is None:
+        p["funding"] = 0.0
+    if not ext.get("orderbook") or not ext["orderbook"].get("mid"):
+        p["orderbook"] = 0.0
+    # Eski zayıf/ters yöndeki pozitif tabanları kaldır.
+    if p["order_block"] < 11:
+        p["order_block"] = 0.0
+    if p["volume_profile"] < 5:
+        p["volume_profile"] = 0.0
+    context = ext.get("market_context", {})
+    norm = context.get("cvd_norm")
+    if norm is not None and context.get("cvd_source") in ("OKX_WS", "OKX_REST"):
+        p["cvd"] = 5*max(0.0, min(1.0, safe_float(norm)*(1 if side == "LONG" else -1)))
+    else:
+        cv = v10_cvd_proxy(k)
+        p["cvd"] = 5.0 if cv*(1 if side == "LONG" else -1) > 0 else 0.0
+    if SCORE_FIB_ENABLED:
+        weights["fib"] = 5
+        p["fib"] = 5*safe_float(context.get("fib", {}).get("quality"))
+    flags.update(cvd=p["cvd"]>0, fib=p.get("fib",0)>0)
+    score = 100*sum(p.values())/sum(weights.values())
+    context["score_cvd_source"] = context.get("cvd_source", "CANDLE_PROXY")
+    context["score_max_points"] = sum(weights.values())
+    return round(score,1), {name:round(value,3) for name,value in p.items()}, r, flags
+
+
+def _rest_wall_result(first, last, trades):
+    start, end = safe_float(first.get("ts")), safe_float(last.get("ts"))
+    if not start or end <= start:
+        return None, "veri yok"
+    if len(trades) >= 500 and min(safe_float(t.get("ts")) for t in trades) > start:
+        return None, "veri yok"
+    total = lost = unknown = 0
+    for side_name, taker_side in (("bids", "sell"), ("asks", "buy")):
+        initial = [(safe_float(r[0]),safe_float(r[1])) for r in first.get(side_name, [])[:10]]
+        final = [(safe_float(r[0]),safe_float(r[1])) for r in last.get(side_name, [])]
+        mean = avg([q for _,q in initial])
+        if not final:
+            return None, "veri yok"
+        lo, hi = min(p for p,q in final), max(p for p,q in final)
+        for price, qty in initial:
+            if qty <= 0 or mean <= 0 or qty < mean*V10_OB_WALL_MULT:
+                continue
+            tolerance = price*SPOOF_FIYAT_TOLERANS_PCT/100
+            if price-tolerance < lo or price+tolerance > hi:
+                unknown += 1
+                continue
+            total += 1
+            remaining = sum(q for p,q in final if abs(p-price) <= tolerance)
+            seen, filled = set(), 0.0
+            for trade in trades:
+                key = trade.get("tradeId")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                if start < safe_float(trade.get("ts")) <= end and trade.get("side") == taker_side and abs(safe_float(trade.get("px"))-price) <= tolerance:
+                    filled += safe_float(trade.get("sz"))
+            if max(0.0, qty-remaining-filled)/qty >= SPOOF_CHANGE_THRESHOLD:
+                lost += 1
+    # Görünür defter dışına kayan duvar iptal diye sayılmaz.
+    if lost and total and lost/(total+unknown) >= SPOOF_MIN_ORAN:
+        return True, f"REST duvar iptal anomalisi ({lost}/{total+unknown}); manipülasyon kanıtı değil"
+    return (None, "veri yok") if unknown else (False, "stabil")
+
+
+async def v112_spoof_tespit(symbol, force=False):
+    if (not SPOOF_GUARD_ENABLED and not force) or not V10_USE_ORDERBOOK:
+        return False, "kapalı"
+    if SPOOF_SOURCE == "LEGACY":
+        return await _legacy_spoof_tespit(symbol, force)
+    snapshot = balina_snapshot(symbol) if BALINA_MOTOR_ENABLED else {}
+    if SPOOF_SOURCE == "AUTO" and snapshot.get("status") == "CANLI" and snapshot.get("flow_ready"):
+        count = int(safe_float(snapshot.get("spoof_1m")))
+        return bool(count), (f"WS duvar iptal anomalisi: {count}" if count else "stabil")
+    lock = _SPOOF_LOCKS.setdefault(symbol, asyncio.Lock())
+    async with lock:
+        cached = _SPOOF_CACHE.get(symbol)
+        if cached and time.time()-cached[0] < SPOOF_CACHE_SEC:
+            return cached[1]
+        try:
+            first = await _okx_get_async("/api/v5/market/books", {"instId":symbol,"sz":20})
+            await asyncio.sleep(max(0.1, SPOOF_CHECK_INTERVAL))
+            last = await _okx_get_async("/api/v5/market/books", {"instId":symbol,"sz":20})
+            trades = await _okx_get_async("/api/v5/market/trades", {"instId":symbol,"limit":500})
+            result = _rest_wall_result(first[0],last[0],trades) if first and last else (None,"veri yok")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            result = None,"hata"
+        _SPOOF_CACHE[symbol] = time.time(),result
+        if len(_SPOOF_CACHE) > 500:
+            for old in list(_SPOOF_CACHE):
+                if old != symbol and not _SPOOF_LOCKS.get(old, lock).locked():
+                    _SPOOF_CACHE.pop(old, None)
+                    _SPOOF_LOCKS.pop(old, None)
+                    break
+        return result
+
+
+
+_LIQ_REPORTS_SEEN = {}
+
+
+def _process_liquidation_report(row):
+    symbol = str(row.get("instId", ""))
+    for detail in row.get("details", []):
+        ts = safe_float(detail.get("ts"))/1000
+        price, qty = safe_float(detail.get("bkPx")), safe_float(detail.get("sz"))
+        if not symbol or ts <= 0 or price <= 0 or qty <= 0:
+            continue
+        key = hashlib.sha256(json.dumps([symbol,detail],sort_keys=True).encode()).hexdigest()
+        if key in _LIQ_REPORTS_SEEN:
+            continue
+        _LIQ_REPORTS_SEEN[key] = time.time()
+        if len(_LIQ_REPORTS_SEEN) > 10000:
+            _LIQ_REPORTS_SEEN.pop(next(iter(_LIQ_REPORTS_SEEN)))
+        value = _balina_contract_value(symbol,price,qty)
+        _balina_queue_event({"ts":ts,"symbol":symbol,"event_type":"LIQUIDATION_REPORTED",
+            "side":detail.get("posSide"),"price":price,"value_usdt":value,
+            "detail":detail,"coverage":"OKX_REPORTED_SUBSET", "source":"OKX_WS",
+            "note":"Geçmiş gerçekleşen bildirim; toplam likidasyon veya gelecek haritası değil"})
 
 
 if __name__ == "__main__":
