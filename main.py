@@ -4441,7 +4441,7 @@ async def cmd_start(update, context):
         "/golge - stop sonrası TP ve neden analizi\n"
         "/health - sistem ve veri sağlığı\n/risk - portföy risk durumu\n"
         "/durdur - yeni sinyalleri acil durdur\n/devam - sinyalleri yeniden aç\n"
-        "/selftest - dahili doğrulama testleri\n/backup - manuel DB yedeği\n"
+        "/selftest - dahili doğrulama testleri\n/backup - manuel DB yedeği\n/yedekindir - DB ve JSON dosyalarını indir\n"
         "/tportak - TP ortak özellikleri\n/stoportak - temiz stop ortak özellikleri\n"
         "/balina [COIN] - balina akış durumu\n/akis COIN - büyük işlemler\n"
         "/birikim - birikim adayları\n/dagitim - dağıtım adayları\n"
@@ -4819,6 +4819,7 @@ def build_app():
     app.add_handler(CommandHandler("devam", cmd_devam))
     app.add_handler(CommandHandler("selftest", cmd_selftest))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("yedekindir", cmd_yedekindir, block=False))
     app.add_handler(CommandHandler("balina", cmd_balina))
     app.add_handler(CommandHandler("akis", cmd_akis))
     app.add_handler(CommandHandler("birikim", cmd_birikim))
@@ -5915,6 +5916,100 @@ def _process_liquidation_report(row):
             "side":detail.get("posSide"),"price":price,"value_usdt":value,
             "detail":detail,"coverage":"OKX_REPORTED_SUBSET", "source":"OKX_WS",
             "note":"Geçmiş gerçekleşen bildirim; toplam likidasyon veya gelecek haritası değil"})
+
+
+
+# Yalnız yedek indirme eki: sürüm/cohort ve işlem mantığı değişmez.
+_YEDEK_INDIR_LOCK = asyncio.Lock()
+
+
+def _yedek_indir_hazirla(directory, snapshot):
+    import zipfile
+    from pathlib import Path
+    root = Path(directory)
+    started = time.time()
+    manifest = {"build": BOT_BUILD, "started_ts": started, "files": [], "missing": [],
+                "note": "DB'ler ayrı SQLite online snapshot; JSON ayrı anlık görüntüdür."}
+    for name, source in (("balina_olcum.db", OLCUM_DB), ("balina_akis.db", BALINA_DB)):
+        srcpath = Path(source).resolve()
+        if not srcpath.is_file():
+            manifest["missing"].append(name)
+            continue
+        target = root/name
+        deadline = time.monotonic()+120
+        def progress(status, remaining, total):
+            if time.monotonic() > deadline:
+                raise TimeoutError("Yedek süre sınırı")
+        # mode=ro olmayan kaynak için boş DB oluşturulmasını önler; WAL dahil.
+        with sqlite3.connect(srcpath.as_uri()+"?mode=ro", uri=True, timeout=10) as src:
+            with sqlite3.connect(target) as dst:
+                src.backup(dst, pages=256, progress=progress, sleep=.05)
+                if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise RuntimeError("Yedek bütünlük kontrolü başarısız")
+        manifest["files"].append(name)
+    (root/"paper_memory.json").write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    manifest["files"].append("paper_memory.json")
+    manifest["completed_ts"] = time.time()
+    (root/"manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = root/("balina_yedek_"+stamp+".zip")
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in manifest["files"]+["manifest.json"]:
+            z.write(root/name, name)
+    # Büyük arşivleri eksiksiz, sıralı ikili parçalara böl.
+    limit = 40*1024*1024
+    if archive.stat().st_size <= limit:
+        return [str(archive)], manifest
+    pieces = []
+    with archive.open("rb") as stream:
+        while True:
+            chunk = stream.read(limit)
+            if not chunk:
+                break
+            part = root/(archive.name+f".part{len(pieces)+1:03d}")
+            part.write_bytes(chunk)
+            pieces.append(str(part))
+    return pieces, manifest
+
+
+async def cmd_yedekindir(update, context):
+    if not telegram_yetkili(update):
+        return
+    if _YEDEK_INDIR_LOCK.locked():
+        await update.message.reply_text("Bir yedek indirme işlemi zaten sürüyor.")
+        return
+    import tempfile
+    from telegram import InputFile
+    async with _YEDEK_INDIR_LOCK:
+        await update.message.reply_text("Yedek hazırlanıyor; veritabanları silinmez veya sıfırlanmaz.")
+        try:
+            async with memory_lock:
+                snapshot = copy.deepcopy(json_memory_snapshot())
+            with tempfile.TemporaryDirectory(prefix="balina_export_") as directory:
+                # Cancel durumunda worker bitmeden geçici dizin silinmez.
+                worker = asyncio.create_task(asyncio.to_thread(_yedek_indir_hazirla, directory, snapshot))
+                try:
+                    paths, manifest = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    await worker
+                    raise
+                total = len(paths)
+                for i, path in enumerate(paths, 1):
+                    caption = f"Balina veri yedeği ({i}/{total}). Dosyayı indirip inceleme için paylaşabilirsin."
+                    if total > 1:
+                        caption += " Büyük ZIP parçalandı; bütün .part dosyalarını birlikte gönder."
+                    with open(path, "rb") as stream:
+                        await update.message.reply_document(
+                            document=InputFile(stream, filename=os.path.basename(path), read_file_handle=False),
+                            caption=caption, read_timeout=120, write_timeout=180, connect_timeout=20)
+                missing = ", ".join(manifest["missing"])
+                await update.message.reply_text("Yedek dosyaları gönderildi."+
+                    (" Bulunamayan dosyalar: "+missing if missing else ""))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Yedek indirme başarısız")
+            await update.message.reply_text("Yedek hazırlanamadı veya gönderilemedi. /yedekindir ile tekrar deneyebilirsin; asıl kayıtlar korunur.")
 
 
 if __name__ == "__main__":
