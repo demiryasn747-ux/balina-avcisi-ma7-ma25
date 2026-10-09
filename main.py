@@ -24,10 +24,10 @@ from zoneinfo import ZoneInfo
 
 import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-VERSION_NAME = "Balina Avcısı V12.0.2 KURUMSAL ÖLÇÜM PLATFORMU"
-BOT_BUILD = os.getenv("BOT_BUILD", "V12.0.2")
+VERSION_NAME = "Balina Avcısı V12.1.0 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = "V12.1.0"  # Bu çalıştırılabilir dosyanın sürümü; eski Railway etiketiyle karışmaz.
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -54,9 +54,9 @@ GOLGE_SAAT = float(os.getenv("GOLGE_SAAT", "48"))
 GOLGE_ARALIK_SEC = int(float(os.getenv("GOLGE_ARALIK_SEC", "300")))
 GOLGE_TF = os.getenv("GOLGE_TF", "15m").strip()
 
-# === V12.0.2 KURUMSAL ALTYAPI ===
+# === V12.1.0 KURUMSAL ALTYAPI ===
 KURUMSAL_ENABLED = os.getenv("KURUMSAL_ENABLED", "true").lower() == "true"
-DB_SCHEMA_VERSION = 13
+DB_SCHEMA_VERSION = 14
 DB_BACKUP_ENABLED = os.getenv("DB_BACKUP_ENABLED", "true").lower() == "true"
 DB_BACKUP_DIR = os.getenv("DB_BACKUP_DIR", "/data/backups").strip()
 DB_BACKUP_INTERVAL_SEC = int(float(os.getenv("DB_BACKUP_INTERVAL_SEC", "21600")))
@@ -84,10 +84,10 @@ RISK_MAX_SAME_SIDE = int(float(os.getenv("RISK_MAX_SAME_SIDE", "12")))
 RISK_MAX_GROUP = int(float(os.getenv("RISK_MAX_GROUP", "4")))
 VALIDATION_MIN_CLOSED = int(float(os.getenv("VALIDATION_MIN_CLOSED", "100")))
 
-# === V12.0.2 ÖLÇÜM BÜTÜNLÜĞÜ ===
+# === V12.1.0 ÖLÇÜM BÜTÜNLÜĞÜ ===
 # Eski veri aynı dosyada korunur; yeni ölçümler build/config ile ayrılır.
 
-# V12.0.2: tüm seçenekler yapılandırma kimliğine girer.
+# V12.1.0: tüm seçenekler yapılandırma kimliğine girer.
 SCORE_MODE = os.getenv("SCORE_MODE", "EVIDENCE").upper()
 SCORE_CVD_SOURCE = os.getenv("SCORE_CVD_SOURCE", "AUTO").upper()
 SCORE_FIB_ENABLED = os.getenv("SCORE_FIB_ENABLED", "true").lower() == "true"
@@ -364,6 +364,32 @@ COINS = [x.strip().upper() for x in (RAW_COINS_ENV or ",".join(DEFAULT_COINS)).s
 for _file_path in (LOG_FILE, MEMORY_FILE, OLCUM_DB, BALINA_DB):
     os.makedirs(os.path.dirname(os.path.abspath(_file_path)), exist_ok=True)
 
+# V12.1: eski veri salt okunur arşiv, yeni defter ayrı dosyalardadır.
+ESKI_OLCUM_DB = os.path.abspath(os.getenv("ESKI_OLCUM_DB", OLCUM_DB))
+ESKI_MEMORY_FILE = os.path.abspath(os.getenv("ESKI_MEMORY_FILE", MEMORY_FILE))
+ESKI_BALINA_DB = os.path.abspath(os.getenv("ESKI_BALINA_DB", BALINA_DB))
+def _yeni_yol(path, suffix):
+    base, ext = os.path.splitext(os.path.abspath(path))
+    return base + suffix + ext
+OLCUM_DB = os.path.abspath(os.getenv("YENI_OLCUM_DB", _yeni_yol(OLCUM_DB, "_v12_1")))
+MEMORY_FILE = os.path.abspath(os.getenv("YENI_MEMORY_FILE", _yeni_yol(MEMORY_FILE, "_v12_1")))
+BALINA_DB = os.path.abspath(os.getenv("YENI_BALINA_DB", _yeni_yol(BALINA_DB, "_v12_1")))
+for _new in (OLCUM_DB, MEMORY_FILE, BALINA_DB):
+    if os.path.realpath(_new) in {os.path.realpath(p) for p in (ESKI_OLCUM_DB, ESKI_MEMORY_FILE, ESKI_BALINA_DB)}:
+        raise RuntimeError("Yeni ve eski dosya yolları aynı olamaz; arşiv korunmalıdır")
+DB_BACKUP_DIR = os.path.join(DB_BACKUP_DIR, "v12_1")
+GIZLI_ENABLED = os.getenv("GIZLI_ENABLED", "true").lower() == "true"
+GIZLI_TELEGRAM_ENABLED = os.getenv("GIZLI_TELEGRAM_ENABLED", "false").lower() == "true"
+GIZLI_MAX_OPEN = int(os.getenv("GIZLI_MAX_OPEN", "400"))
+GIZLI_MIN_OI_PCT = float(os.getenv("GIZLI_MIN_OI_PCT", "1"))
+GIZLI_GEREKLI_KAPILAR = tuple(x.strip() for x in os.getenv("GIZLI_GEREKLI_KAPILAR", "coin_1h_ema").split(",") if x.strip())
+HISTORY_SETTLE_SEC = max(1, int(os.getenv("HISTORY_SETTLE_SEC", "5")))
+TAKIP_SAAT = float(os.getenv("TAKIP_SAAT", "48"))
+# Yeni defterde TP1 tam kapanış; eski kademeli ayarlar kullanılmaz.
+TP1_WEIGHT, TP2_WEIGHT, TP3_WEIGHT, TP4_WEIGHT = 1.0, 0.0, 0.0, 0.0
+PAPER_SECOND_BARS = True
+SIM_AMBIGUOUS_BAR_POLICY = "STOP_FIRST"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -541,7 +567,7 @@ def config_fingerprint() -> str:
                 'BALINA_', 'RISK_', 'SIM_', 'GOLGE_', 'ADX_', 'VWAP_', 'MTF_',
                 'RSI_', 'ENTRY_', 'PAPER_', 'CORRELATION_', 'SESSION_', 'SPOOF_',
                 'WASH_', 'PUMP_', 'INSIDER_', 'VWM_', 'TIME_EXIT_', 'COIN_',
-                'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_', 'SCORE_', 'MEXC_', 'LIQ_')
+                'HISTORY_', 'TAKIP_', 'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_', 'SCORE_', 'MEXC_', 'LIQ_')
     values = {}
     for key,value in list(globals().items()):
         if not key.startswith(prefixes) or any(x in key for x in ('TOKEN','SECRET','KEY','URL','DB')):
@@ -703,6 +729,8 @@ def olcum_db_pozisyon_guncelle(pos: Dict[str, Any], durum: str = "ACIK",
 
 
 def sonuc_tipi_belirle(outcome: str, kaynak: Dict[str, Any]) -> str:
+    if outcome == "TP1":
+        return "TP1_TAM"
     if outcome == "TP4":
         return "TP4_TAM"
     if outcome == "TIME_EXIT":
@@ -3447,7 +3475,7 @@ def build_v10_message(sig):
 
     signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
     return (f"{signal_no_line}{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V12.0.2 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 V12.1.0 | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -3464,29 +3492,16 @@ def build_v10_message(sig):
             f"Pullback: {sig['pullback']} | FOMO:%{sig['fomo_move_pct']}\n"
             f"OI%{round(safe_float(sig.get('oi_change_pct')),2)} ({sig.get('oi_yorum','-')}) Fund:{round(fund*100,4)}% OBimb:{round(safe_float(sig.get('ob_imbalance')),2)}\n"
             f"Pozisyon: {sig.get('position_multiplier',1)}x ayar | Marjin ≈{sig.get('margin_usdt',0)} USDT | Risk ≈{sig.get('estimated_risk_usdt',0)} USDT\n"
-            f"⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
+            f"TP1: %100 kapanış. Sonraki TP/stop yalnız izlemedir.\n⚠️ PAPER — risk %{V10_RISK_PCT}/işlem")
 
 
 def build_v10_close_message(pos, R, outcome, exit_price):
-    if outcome == "STOP":
-        head = "❌ STOP GELDİ"
-    elif outcome == "TP4":
-        head = "✅ TP4 GELDİ — kademeli çıkış tamamlandı"
-    elif outcome == "TIME_EXIT":
-        head = "⏱ SÜRE DOLDU — kalan pay kapandı"
-    else:
-        head = f"🏁 {outcome}"
-    return (
-        f"🆕 V12.0.2 — POZİSYON KAPANDI\n"
-        + (f"🆔 Sinyal #{int(safe_float(pos.get('signal_no')))}\n" if pos.get("signal_no") else "") +
-        f"{head}\n"
-        f"Coin: {pos['symbol']}\n"
-        f"Yön: {pos['side']}\n"
-        f"Giriş: {_v10_fmt(pos['entry'])}\n"
-        f"Çıkış: {_v10_fmt(exit_price)}\n"
-        f"Sonuç: {R:+.2f}R (skor {pos['score']})\n"
-        f"Saat: {tr_str()}"
-    )
+    head = "✅ TP1 — %100 KAPANIŞ" if outcome=='TP1' else "❌ TP GÖRMEDEN STOP" if outcome=='STOP' else "⏱ SÜRE ÇIKIŞI"
+    prefix = "GİZLİ " if pos.get('engine')=='GIZLI' else ""
+    return (f"{prefix}{BOT_BUILD} | #{pos.get('signal_no',0)} | {pos['symbol']} {pos['side']}\n"
+            f"{head}\nGiriş: {_v10_fmt(pos['entry'])} | Çıkış: {_v10_fmt(exit_price)}\n"
+            f"Brüt sonuç: {R:+.3f}R | Net: {R-simulasyon_maliyet_r(pos):+.3f}R\n"
+            "Sonraki fiyat takibi bu kapanış sonucunu değiştirmez.")
 
 
 def _v10_mem():
@@ -3544,6 +3559,8 @@ def v10_open_paper(sig, persist=True):
     poz["cohort"] = _cohort()
     poz["coverage"] = "COMPLETE"
     poz["entry_ref"] = sig.get("entry_ref")
+    if TIME_EXIT_ENABLED and TIME_EXIT_MODE=='HARD':
+        poz['tracking_deadline']=float(math.ceil(poz['open_ts']+TIME_EXIT_HOURS*3600))
     if persist:
         olcum_db_pozisyon_ac(poz)
         mp["open"].append(poz)
@@ -3551,43 +3568,67 @@ def v10_open_paper(sig, persist=True):
 
 
 async def v107_takip_barlari(pos):
-    step = interval_minutes(V107_TAKIP_TF)*60000
-    end = int(time.time()*1000)//step*step
+    tracking_tf = GOLGE_TF if pos.get('phase')=='AFTER_STOP' else V107_TAKIP_TF
+    step = interval_minutes(tracking_tf)*60000
+    now = int((time.time()-HISTORY_SETTLE_SEC)*1000)
     start = max(int(pos['open_ts']*1000), int(safe_float(pos.get('scan_ts'))))
-    if start >= end:
-        return [], "kapalı mum bekleniyor"
-    first_full = ((start+step-1)//step)*step
-    end = min(end,first_full+max(1,PAPER_HISTORY_MAX_PAGES)*300*step)
+    # Entry subsecond cannot be reconstructed by candles. Omit at most 999 ms explicitly.
+    cursor = ((start+999)//1000)*1000
     if start%1000 and pos.get('coverage')=='COMPLETE':
-        pos['coverage']='SUBSECOND_ENTRY_OMITTED' 
-    bars = []
-    if first_full > start:
-        if PAPER_SECOND_BARS:
-            partial, ok = await _history_range(pos['symbol'], '1s', ((start+999)//1000)*1000, min(first_full,end), 1000)
-            bars.extend(partial)
-            if not ok:
-                pos['coverage'] = 'INCOMPLETE_ENTRY'
-        else:
-            pos['coverage'] = 'INCOMPLETE_ENTRY'
-    if first_full < end:
-        full, ok = await _history_range(pos['symbol'], V107_TAKIP_TF, first_full, end, step)
-        bars.extend(full)
-        if not ok:
-            pos['coverage'] = 'INCOMPLETE_HISTORY'
-    refined = []
-    for row in bars:
-        hi, lo = safe_float(row[2]), safe_float(row[3])
-        stop = lo <= pos['orig_stop'] if pos['side']=='LONG' else hi >= pos['orig_stop']
-        target = any((hi >= pos[f'tp{i}'] if pos['side']=='LONG' else lo <= pos[f'tp{i}'])
-                     and not pos.get(f'hit{i}') for i in range(1,5))
-        if row[9] > 1000 and PAPER_SECOND_BARS and (stop or target):
-            seconds, ok = await _history_range(pos['symbol'], '1s', int(row[0]), int(row[0])+row[9], 1000)
-            if ok and seconds:
-                refined.extend(seconds)
-                continue
-            pos['coverage'] = 'COARSE_EXIT_BAR'
-        refined.append(row)
-    return sorted(refined,key=lambda r:int(r[0])), V107_TAKIP_TF
+        pos['coverage']='SUBSECOND_ENTRY_OMITTED'
+    if pos.get('fetch_cutoff_ts') is not None:
+        now=min(now,int(pos['fetch_cutoff_ts']*1000))
+    limit = pos.get('tracking_deadline')
+    if limit is not None:
+        now = min(now, int(limit*1000))
+    result=[]
+    # Start/end partial minute uses closed seconds. Full minutes are refined at barriers.
+    first_full=((cursor+step-1)//step)*step
+    spans=[]
+    if cursor<first_full:
+        spans.append(('1s',cursor,min(first_full,now//1000*1000),1000))
+    full_end=now//step*step
+    if first_full<full_end:
+        spans.append((tracking_tf,first_full,min(full_end,first_full+300*step),step))
+    for tf,a,b,width in spans:
+        if b<=a: continue
+        raw, _ = await _history_range(pos['symbol'],tf,a,b,width)
+        by_ts={int(r[0]):r for r in raw}
+        t=a
+        while t<b:
+            if t not in by_ts:
+                _history_gap(pos,t,b)
+                return result,'eksik mum bekleniyor'
+            row=by_ts[t]
+            if width>1000:
+                hi,lo=safe_float(row[2]),safe_float(row[3])
+                barrier=pos.get('phase')!='AFTER_STOP' and (lo<=pos['orig_stop'] if pos['side']=='LONG' else hi>=pos['orig_stop'])
+                observed=pos.get('shadow_hits',[]) if pos.get('phase')=='AFTER_STOP' else pos.get('follow_hits',[])
+                barrier=barrier or any((hi>=pos[f'tp{i}'] if pos['side']=='LONG' else lo<=pos[f'tp{i}']) and i not in observed and (pos.get('phase')=='AFTER_STOP' or not pos.get(f'hit{i}')) for i in range(1,5))
+                if barrier:
+                    seconds,ok=await _history_range(pos['symbol'],'1s',t,t+width,1000)
+                    sec={int(r[0]):r for r in seconds}
+                    for s in range(t,t+width,1000):
+                        if s not in sec:
+                            _history_gap(pos,s,t+width)
+                            return result,'çıkış saniyesi eksik'
+                        result.append(sec[s])
+                    pos.pop('history_gap',None)
+                    return result,'eşik mumu saniyelerle doğrulandı'
+            result.append(row)
+            t+=width
+    # At fixed tracking deadline include the last partial minute as seconds.
+    last = int(result[-1][0])+int(result[-1][9]) if result else cursor
+    if limit is not None and now>=int(limit*1000) and last<now and now-last<step:
+        rows,_=await _history_range(pos['symbol'],'1s',last,now//1000*1000,1000)
+        by_ts={int(r[0]):r for r in rows}
+        for t in range(last,now//1000*1000,1000):
+            if t not in by_ts:
+                _history_gap(pos,t,now);return result,'son aralık eksik'
+            result.append(by_ts[t])
+    if result:
+        pos.pop('history_gap',None)
+    return result,V107_TAKIP_TF
 
 
 def _tp_weights() -> List[float]:
@@ -3597,44 +3638,26 @@ def _tp_weights() -> List[float]:
     return [x / total for x in raw] if total > 0 else [0.5, 0.3, 0.15, 0.05]
 
 
-def _paper_realized_r(pos, stop_remaining: bool) -> float:
-    weights = pos.get("tp_weights") or _tp_weights()
-    rrs = pos.get("tp_rrs") or [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
-    realized = sum(weights[i] * rrs[i] for i in range(4) if pos.get(f"hit{i + 1}"))
-    remaining = sum(weights[i] for i in range(4) if not pos.get(f"hit{i + 1}"))
-    return realized - remaining if stop_remaining else realized
+def _paper_realized_r(pos, stop_remaining):
+    return float(pos['tp_rrs'][0]) if pos.get('hit1') else (-1.0 if stop_remaining else 0.0)
 
 
-def _paper_time_exit_r(pos, current_r: float) -> float:
-    weights = pos.get("tp_weights") or _tp_weights()
-    rrs = pos.get("tp_rrs") or [TP1_RR, TP2_RR, TP3_RR, TP4_RR]
-    realized = sum(weights[i] * rrs[i] for i in range(4) if pos.get(f"hit{i + 1}"))
-    remaining = sum(weights[i] for i in range(4) if not pos.get(f"hit{i + 1}"))
-    return realized + remaining * current_r
+def _paper_time_exit_r(pos, current_r):
+    return float(pos['tp_rrs'][0]) if pos.get('hit1') else current_r
 
 
 def v107_check_paper_bar(pos, hi, lo):
-    side = pos["side"]
-    stop_lv = safe_float(pos["orig_stop"])
-    if side == "LONG":
-        stop_hit = lo <= stop_lv
-        reached = lambda level: hi >= safe_float(pos[level])
-    else:
-        stop_hit = hi >= stop_lv
-        reached = lambda level: lo <= safe_float(pos[level])
-    ayni_mum_tp = any(not pos.get(f"hit{idx}") and reached(f"tp{idx}") for idx in range(1, 5))
-    if stop_hit and ayni_mum_tp:
-        stats["paper_ambiguous_bar"] = int(stats.get("paper_ambiguous_bar", 0)) + 1
-    if stop_hit and SIM_AMBIGUOUS_BAR_POLICY != "TP_FIRST":
-        return round(_paper_realized_r(pos, True), 3), "STOP"
-    for idx in range(1, 5):
-        if not pos.get(f"hit{idx}") and reached(f"tp{idx}"):
-            pos[f"hit{idx}"] = True
-            pos.setdefault("pending_hits", []).append(idx)
-    if pos.get("hit4"):
-        return round(_paper_realized_r(pos, False), 3), "TP4"
-    if stop_hit:
-        return round(_paper_realized_r(pos, True), 3), "STOP"
+    stop = lo <= pos['orig_stop'] if pos['side']=='LONG' else hi >= pos['orig_stop']
+    hit = hi >= pos['tp1'] if pos['side']=='LONG' else lo <= pos['tp1']
+    if stop:
+        if hit:
+            pos['ambiguous_exit'] = True
+            stats['paper_ambiguous_bar'] = int(stats.get('paper_ambiguous_bar',0))+1
+        return -1.0, 'STOP'
+    if hit:
+        pos['hit1'] = True
+        pos['pending_hits'] = [1]
+        return float(pos['tp_rrs'][0]), 'TP1'
     return None, None
 
 
@@ -3838,6 +3861,7 @@ async def v10_scan_loop() -> None:
                     stats["v10_analyzed"] = int(stats.get("v10_analyzed", 0)) + 1
                     if res:
                         stats["v10_candidates"] = int(stats.get("v10_candidates", 0)) + 1
+                        await gizli_aday(res)
                         await maybe_send_v10_signal(res)
                 await asyncio.sleep(max(0.1, min(HOT_SCAN_INTERVAL_SEC, 2.0)))
         except Exception as e:
@@ -3883,8 +3907,7 @@ def golge_kaydi_guncelle(golge: Dict[str, Any], barlar: List[List[Any]]) -> None
 async def golge_loop() -> None:
     while True:
         _RUNTIME_HEALTH['shadow_heartbeat']=time.time()
-        if GOLGE_IZLEME:
-            await golge_tur()
+        await golge_tur()
         await asyncio.sleep(max(1,GOLGE_ARALIK_SEC))
 
 
@@ -3959,7 +3982,7 @@ def health_raporu_uret() -> str:
         disk_free = 0.0
     ws_age = max(0.0, now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"), now))
     return (
-        "🏥 V12.0.2 SİSTEM SAĞLIĞI\n"
+        "🏥 V12.1.0 SİSTEM SAĞLIĞI\n"
         f"Çalışma süresi: {(now-safe_float(_RUNTIME_HEALTH.get('started_ts')))/3600:.1f} saat\n"
         f"Tarama yaşı: {now-safe_float(_RUNTIME_HEALTH.get('scan_heartbeat')):.1f} sn\n"
         f"Paper takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('paper_heartbeat')):.1f} sn\n"
@@ -4011,7 +4034,7 @@ async def kurumsal_bakim_loop() -> None:
             if sorunlar and HEALTH_ALERT_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_health_alert_ts")) >= HEALTH_ALERT_COOLDOWN_SEC:
                 _RUNTIME_HEALTH["last_health_alert_ts"] = now
                 stats["health_alert"] = int(stats.get("health_alert", 0)) + 1
-                await safe_send_telegram("🚨 V12.0.2 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
+                await safe_send_telegram("🚨 V12.1.0 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
         except Exception as e:
             logger.exception("kurumsal_bakim_loop hata: %s", e)
         await asyncio.sleep(max(15, HEALTH_CHECK_INTERVAL_SEC))
@@ -4070,66 +4093,8 @@ def yuzdelik(values: List[float], oran: float) -> float:
     return sirali[alt] * (1.0 - pay) + sirali[ust] * pay
 
 
-def tp_raporu_uret() -> str:
-    rows = olcum_db_tp_satirlari()
-    lines = ["📊 TP RAPORU | tüm sürümler", "TP oranları gözlenen temastır; açık/gölge izleme tamamlanmamıştır."]
-    for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
-        grup = [r for r in rows if int(r[0] or 0) == kontrol_degeri]
-        kapali = [r for r in grup if r[4] != "ACIK"]
-        acik = [r for r in grup if r[4] == "ACIK"]
-
-        def hit_sayisi(veriler: List[Tuple[Any, ...]], idx: int) -> int:
-            toplam = 0
-            for row in veriler:
-                try:
-                    toplam += int(bool(json.loads(row[3] or "{}").get(f"_hit{idx}")))
-                except Exception:
-                    pass
-            return toplam
-
-        def tp_satiri(baslik: str, veriler: List[Tuple[Any, ...]]) -> str:
-            n = len(veriler)
-            parcalar = []
-            for idx in range(1, 5):
-                sayi = hit_sayisi(veriler, idx)
-                yuzde = sayi / n * 100.0 if n else 0.0
-                parcalar.append(f"TP{idx} {sayi} (%{yuzde:.1f})")
-            return f"{baslik} n={n} | " + " | ".join(parcalar)
-
-        mfe = [safe_float(r[1]) for r in grup]
-        mae = [safe_float(r[2]) for r in grup]
-        stopa_yapisan = sum(1 for x in mae if x >= 2.0)
-        stoplar = [r for r in grup if r[4] == "STOP"]
-        biten = [r for r in stoplar if r[5] == "BITTI"]
-        golge_mfe = [safe_float(r[7]) for r in stoplar if r[5] in ("IZLENIYOR", "BITTI")]
-        golge_mae = [safe_float(r[8]) for r in stoplar if r[5] in ("IZLENIYOR", "BITTI")]
-        golge_tp1_dk = [safe_float(r[9]) for r in stoplar if r[9] is not None]
-
-        lines.append(f"\n{grup_adi}")
-        lines.append(tp_satiri("Kapanmış", kapali))
-        lines.append(tp_satiri("Açık", acik))
-        lines.append(
-            f"MFE n={len(mfe)} | medyan %{yuzdelik(mfe, 0.50):.3f} | ortalama %{avg(mfe):.3f} | "
-            f"p75 %{yuzdelik(mfe, 0.75):.3f} | p90 %{yuzdelik(mfe, 0.90):.3f}"
-        )
-        lines.append(
-            f"MAE n={len(mae)} | medyan %{yuzdelik(mae, 0.50):.3f} | ortalama %{avg(mae):.3f} | "
-            f"stopa yapışan {stopa_yapisan}"
-        )
-        lines.append("STOP SONRASI")
-        lines.append(f"Stop {len(stoplar)} | İzlemesi biten {len(biten)}")
-        for idx in range(1, 5):
-            sayi = sum(1 for r in stoplar if int(r[6] or 0) >= idx)
-            yuzde = sayi / len(stoplar) * 100.0 if stoplar else 0.0
-            lines.append(f"TP{idx} {sayi} (%{yuzde:.1f})")
-        lines.append(
-            f"Gölge MFE n={len(golge_mfe)} | medyan %{yuzdelik(golge_mfe, 0.50):.3f} | "
-            f"ortalama %{avg(golge_mfe):.3f} | p75 %{yuzdelik(golge_mfe, 0.75):.3f} | "
-            f"p90 %{yuzdelik(golge_mfe, 0.90):.3f}"
-        )
-        lines.append(f"Gölge MAE medyan %{yuzdelik(golge_mae, 0.50):.3f}")
-        lines.append("TP1 süresi medyan "+(_metric(yuzdelik(golge_tp1_dk,.5),1)+" dk (mum sonu üst sınırı)" if golge_tp1_dk else "— (ulaşan yok)"))
-    return "\n".join(lines)
+def tp_raporu_uret():
+    return _engine_report('MAIN') + '\n' + _target_report('MAIN')
 
 
 def sayisal_bantlar(ozellikler: Dict[str, Any]) -> Dict[str, str]:
@@ -4215,9 +4180,9 @@ def ortak_ozellik_analiz(grup_a: List[Dict[str, Any]],
 def ortak_rapor_uret(ters: bool = False) -> str:
     tum = _report_rows()
     baslik = "🧪 STOP ORTAK ÖZELLİK" if ters else "🧪 TP ORTAK ÖZELLİK"
-    lines = [baslik + " | açık TP1 pozisyonları dahil", _report_scope()]
+    lines = [baslik + " | TP1 tam kapanış / temiz stop karşılaştırması", _report_scope()]
     lines.append("⚠️ ~40 özellik test edildi. Bu kadar özellikte şans eseri fark çıkması beklenir. Buradaki bulgular hipotezdir, karar değildir — yeni bir örnekte doğrulanmadan kapı değiştirme.")
-    tp_sonuclari = {"TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM"}
+    tp_sonuclari = {"TP1_TAM", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM"}
     for kontrol_degeri, grup_adi in ((0, "NORMAL"), (1, "KONTROL")):
         kaynak = [r for r in tum if int(r.get("kontrol", 0)) == kontrol_degeri]
         tp_grubu = [r for r in kaynak if r.get("sonuc_tipi") in tp_sonuclari or
@@ -4292,7 +4257,7 @@ def kombinasyon_raporu_uret() -> str:
 
 def dogrulama_raporu_uret() -> str:
     rows = _report_rows()
-    lines = ['📐 V12.0.2 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
+    lines = ['📐 V12.1.0 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
              'Maliyet girişte dondurulur; net R komisyon/kayma/funding varsayımı sonrasıdır.']
     if VALIDATION_START_TS<=0:
         lines.append('Sabit ileri doğrulama başlangıcı tanımlanmadı; sonuçlar betimseldir, karar yok.')
@@ -4321,54 +4286,8 @@ def dogrulama_raporu_uret() -> str:
     return '\n'.join(lines)
 
 
-def golge_neden_raporu_uret() -> str:
-    if not os.path.exists(OLCUM_DB):
-        return "👻 STOP SONRASI ANALİZ\nKayıt yok."
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB,timeout=10) as conn:
-        rows=conn.execute("SELECT kontrol,golge_durum,COALESCE(golge_tp,0),golge_mfe_pct,golge_mae_pct,golge_tp1_dk,golge_tp2_dk,golge_tp3_dk,golge_tp4_dk,stop_neden_json FROM olcum_pozisyon WHERE sonuc_tipi IN ('TEMIZ_STOP','TP1_STOP','TP2_STOP','TP3_STOP')").fetchall()
-    lines=["👻 STOP SONRASI TP VE NEDEN ANALİZİ | tüm sürümler",f"İzleme: {GOLGE_SAAT:g} saat | TF {GOLGE_TF}","Devam eden izleme sonuçları henüz tamamlanmamıştır; süreler mum sonu üst sınırıdır."]
-    for control,name in ((0,"NORMAL"),(1,"KONTROL")):
-        all_rows=[r for r in rows if int(r[0] or 0)==control]
-        group=[r for r in all_rows if r[1] in ('IZLENIYOR','BITTI')]
-        finished=[r for r in group if r[1]=='BITTI']
-        lines.append(f"\n{name}: stop={len(all_rows)} | biten={len(finished)} | izleniyor={len(group)-len(finished)} | izlenmemiş={len(all_rows)-len(group)}")
-        for idx in range(1,5):
-            hit=[r for r in group if int(r[2] or 0)>=idx]
-            times=[safe_float(r[4+idx]) for r in hit if r[4+idx] is not None]
-            rate=100*len(hit)/len(group) if group else None
-            median=yuzdelik(times,.5) if times else None
-            lines.append(f"Stop sonrası TP{idx}: {len(hit)}/{len(group)} (%"+_metric(rate,1)+") | medyan süre "+_metric(median,1)+" dk")
-        mfe=[safe_float(r[3]) for r in group if r[3] is not None]
-        mae=[safe_float(r[4]) for r in group if r[4] is not None]
-        lines.append("Gölge MFE/MAE ort: %"+_metric(avg(mfe) if mfe else None)+"/%"+_metric(avg(mae) if mae else None))
-        a=[r for r in finished if int(r[2] or 0)>=1]
-        bb=[r for r in finished if int(r[2] or 0)==0]
-        lines.append(f"Tamamlanmış izlemelerde TP1 gören/görmeyen: {len(a)}/{len(bb)}")
-        def payload(row):
-            try:
-                value=json.loads(row[9] or '{}')
-                return value if isinstance(value,dict) else {}
-            except (ValueError,TypeError):
-                return {}
-        features=('side','event','trend_1h','trend_4h','coin_1h_ema','session_name','piyasa_modu','balina_durum')
-        candidates=[]
-        for field in features:
-            values={str(payload(r)[field]) for r in a+bb if payload(r).get(field) is not None}
-            for value in values:
-                na=sum(str(payload(r).get(field))==value for r in a)
-                nb=sum(str(payload(r).get(field))==value for r in bb)
-                diff=100*na/len(a)-100*nb/len(bb) if a and bb else 0
-                if abs(diff)>=10:
-                    candidates.append((abs(diff),field,value,na,nb,diff))
-        if len(a)<ORTAK_MIN_N or len(bb)<ORTAK_MIN_N:
-            lines.append(f"Özellik farkı: yetersiz (nTP={len(a)}, nYok={len(bb)})")
-        for _,field,value,na,nb,diff in sorted(candidates,reverse=True)[:15]:
-            if na<ORTAK_MIN_N or nb<ORTAK_MIN_N:
-                lines.append(f"{field}={value}: yetersiz (nA={na}, nB={nb})")
-            else:
-                lines.append(f"{field}={value}: TP {na}/{len(a)} | Yok {nb}/{len(bb)} | fark {diff:+.1f} puan")
-    lines.append("⚠️ Çoklu özellik karşılaştırması hipotez üretir; stop nedenini nedensel olarak kanıtlamaz.")
-    return '\n'.join(lines)
+def golge_neden_raporu_uret():
+    return _shadow_report('MAIN')
 
 
 def selftest_raporu_uret() -> str:
@@ -4377,14 +4296,14 @@ def selftest_raporu_uret() -> str:
         testler.append((ad, bool(kosul)))
     test("safe_float", safe_float("1.25") == 1.25 and safe_float("x") == 0.0)
     test("yüzdelik", yuzdelik([1, 2, 3, 4], 0.5) == 2.5)
-    test("TP ağırlıkları", abs(sum(_tp_weights()) - 1.0) < 1e-9)
+    test("TP1 tam kapanış", _tp_weights() == [1.0,0.0,0.0,0.0])
     ornek = {"entry": 100, "orig_stop": 98}
     test("maliyet R", simulasyon_maliyet_r(ornek) >= 0)
     test("sembol", normalize_symbol("BTCUSDT") == "BTC-USDT-SWAP")
     test("DB mevcut", os.path.exists(OLCUM_DB))
     ok, detay = db_integrity_kontrol()
     test("DB integrity", ok)
-    lines = ["🧪 V12.0.2 ÖZ TEST"]
+    lines = ["🧪 V12.1.0 ÖZ TEST"]
     lines.extend(f"{'✅' if sonuc else '❌'} {ad}" for ad, sonuc in testler)
     lines.append(f"Sonuç: {sum(1 for _, x in testler if x)}/{len(testler)} geçti")
     lines.append(f"DB: {detay}")
@@ -4394,6 +4313,7 @@ def selftest_raporu_uret() -> str:
 async def post_init(application) -> None:
     logger.info('Veri kaynakları: OKX REST/WS; MEXC ikincil REST=%s', MEXC_ENABLED)
     await _db_call(olcum_db_init)
+    await _db_call(yeni_motor_db_init)
     await _db_call(_restore_ledger)
     now = time.time()
     _RUNTIME_HEALTH.update(started_ts=now,scan_heartbeat=now,paper_heartbeat=now,
@@ -4404,11 +4324,13 @@ async def post_init(application) -> None:
     active,_ = await refresh_coin_pool(force=True)
     count = len(await _db_call(olcum_db_satirlari))
     mp = _v10_mem()
+    follow_count=len(await _db_call(_follow_rows,True))
+    hidden_open=len(await _db_call(_gizli_rows,True))
     text = (f'🚀 {VERSION_NAME} başladı\nSaat: {tr_str()}\nCoin sayısı: {active}\n'
         f'PAPER | Stop %{SABIT_STOP_PCT} | TP {TP1_RR}/{TP2_RR}/{TP3_RR}/{TP4_RR}R\n'
-        f'Paylar: {"/".join(str(round(w*100)) for w in _tp_weights())}%\n'
+        f'TP1 tam kapanış; TP2/3/4 yalnız izleme. Gizli bildirim: {GIZLI_TELEGRAM_ENABLED}\n'
         f'Ölçüm modu: {OLCUM_MODU} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}\n'
-        f'Ölçüm kaydı: {count} pozisyon | Açık {len(mp["open"])} | Gölge {len(mp["golge"])}\n'
+        f'Ölçüm kaydı: {count} pozisyon | Açık {len(mp["open"])} | İzleme {follow_count} | Gizli açık {hidden_open}\n'
         f'RSI: {RSI_METHOD} | Skor: {SCORE_MODE} | CVD: {SCORE_CVD_SOURCE}\n'
         f'MEXC ikincil veri: {MEXC_ENABLED} | Süre çıkışı: {TIME_EXIT_MODE}\n'
         f'Balina motoru: {BALINA_MOTOR_ENABLED} | WS defter kanalı: {BALINA_WS_BOOK_CHANNEL}\n'
@@ -4418,7 +4340,7 @@ async def post_init(application) -> None:
         '\n'+'\n'.join(_persistence_warnings()))
     # Startup bildirimi tarama/paper başlamasını bekletmez.
     await _db_call(_enqueue_system_notification,text)
-    for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop):
+    for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop,yeni_motor_loop):
         _start_loop(factory)
     if MEXC_ENABLED:
         _start_loop(mexc_market_loop)
@@ -4434,7 +4356,7 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
-        "/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
+        "/eskisürüm - eski defter (salt okunur)\n/gizli - sessiz motor raporu\n/hedefler - alternatif kapanışlar\n/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
         "/kombinasyon - koşul ve kombinasyon laboratuvarı\n"
         "/dogrulama - ileri doğrulama ve net maliyet raporu\n"
@@ -4470,7 +4392,7 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V12.0.2 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için V12.1.0 sinyali yok.")
         return
     for part in telegram_parcala('ÖN ANALİZ — deftere sinyal açılmadı; giriş tekrar fiyatlanır.\n'+build_v10_message(res)):
         await update.message.reply_text(part)
@@ -4480,7 +4402,7 @@ async def cmd_v10(update, context):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V12.0.2 ULTRA motor durumu",
+        f"🆕 V12.1.0 ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
@@ -4567,7 +4489,7 @@ async def cmd_risk(update, context):
         return
     d = await asyncio.to_thread(risk_durumu)
     await update.message.reply_text(
-        "🛡 V12.0.2 RİSK MOTORU\n"
+        "🛡 V12.1.0 RİSK MOTORU\n"
         f"Motor: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}\n"
         f"Acil durdurma: {'AKTİF' if d['kill_switch'] else 'kapalı'}\n"
         f"Günlük: {d['daily_r']:+.2f}R / -{abs(RISK_MAX_DAILY_R):.2f}R\n"
@@ -4802,6 +4724,10 @@ def build_app():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_stop(post_stop).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("mexc", cmd_mexc))
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.Regex(r"^/eskisürüm(?:@\w+)?(?:\s|$)"), cmd_eskisurum))
+    app.add_handler(CommandHandler("eskisurum", cmd_eskisurum))
+    app.add_handler(CommandHandler("gizli", cmd_gizli))
+    app.add_handler(CommandHandler("hedefler", cmd_hedefler))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("coin", cmd_coin))
@@ -4872,8 +4798,14 @@ def validate_config() -> None:
         raise RuntimeError(f"OLCUM_DB dizini oluşturulamadı: {db_dizin}: {e}") from e
 
 
+    if GIZLI_MAX_OPEN<1 or not math.isfinite(GIZLI_MIN_OI_PCT) or not all(math.isfinite(x) and x>0 for x in (TAKIP_SAAT,GOLGE_SAAT)):
+        raise RuntimeError('Gizli limit ve izleme süreleri geçersiz')
+    if any(k not in OLCUM_KAPILARI for k in GIZLI_GEREKLI_KAPILAR):
+        raise RuntimeError('GIZLI_GEREKLI_KAPILAR içinde bilinmeyen kapı var')
+
 def main() -> None:
     validate_config()
+    _new_storage_preflight()
     load_memory()
     global app
     app = build_app()
@@ -4894,7 +4826,7 @@ def main() -> None:
 
 
 
-# === V12.0.2 kalıcı defter / bildirim kuyruğu ===
+# === V12.1.0 kalıcı defter / bildirim kuyruğu ===
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger")
 _OKX_SLOTS = asyncio.Semaphore(OKX_EXECUTOR_WORKERS)
 _SIGNAL_LOCK = asyncio.Lock()
@@ -4940,7 +4872,7 @@ async def _db_call(fn, *args):
 
 
 def _cohort():
-    return f"{BOT_BUILD}:{config_fingerprint()}"
+    return f"V12.1.0-TP1FULL:{config_fingerprint()}"
 
 
 def _adx_regime(value):
@@ -5053,26 +4985,14 @@ def _shadow_from_position(pos):
 
 
 def _persist_paper_step(pos, r_value=None, outcome=None):
-    shadow = None
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        changed = _db_update_position(conn, pos, outcome or "ACIK", r_value)
-        if not changed:
-            return None
-        for i in pos.get("pending_hits", []):
-            text = (f"✅ TP{i} GELDİ | #{pos.get('signal_no', 0)} | {pos['side']} | {pos['symbol']}\n"
-                    f"Seviye: {_v10_fmt(pos[f'tp{i}'])} | Paper: {tr_str(pos.get('last_price_ts'))}")
-            _outbox_insert(conn, f"{pos['uid']}:TP{i}", pos, "TP", text)
+    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not _db_update_position(conn,pos,outcome or 'ACIK',r_value): return None
         if outcome:
-            _audit_tx(conn,"PAPER_CLOSE",dict(pos,R=r_value,outcome=outcome))
-            text = build_v10_close_message(pos, r_value, outcome, pos["exit_price"])
-            _outbox_insert(conn, pos["uid"] + ":CLOSE", pos, "CLOSE", text)
-            if outcome == "STOP" and GOLGE_IZLEME:
-                shadow = _shadow_from_position(pos)
-                conn.execute("""UPDATE olcum_pozisyon SET golge_durum='IZLENIYOR',golge_tp=0,
-                    golge_mfe_pct=0,golge_mae_pct=0,shadow_json=?,stop_neden_json=?
-                    WHERE uid=? AND golge_durum IS NULL""", (_json(shadow), _json(pos), pos["uid"]))
-    return shadow
+            _audit_tx(conn,'PAPER_CLOSE',dict(pos,R=r_value,outcome=outcome))
+            _outbox_insert(conn,pos['uid']+':CLOSE',pos,'CLOSE',build_v10_close_message(pos,r_value,outcome,pos['exit_price']))
+            _follow_insert(conn,pos,outcome,'MAIN')
+    return None
 
 
 def _restore_ledger():
@@ -5140,6 +5060,8 @@ def _restore_ledger():
 def _outbox_next():
     with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         conn.row_factory = sqlite3.Row
+        if not GIZLI_TELEGRAM_ENABLED:
+            conn.execute("UPDATE notification_outbox SET sent_ts=?,last_error='GIZLI_DISABLED_SUPPRESSED' WHERE kind='GIZLI' AND sent_ts IS NULL",(time.time(),))
         row = conn.execute("""SELECT a.* FROM notification_outbox a WHERE a.sent_ts IS NULL AND a.next_ts<=?
             AND NOT EXISTS(SELECT 1 FROM notification_outbox b WHERE b.uid=a.uid
             AND b.sent_ts IS NULL AND b.rowid<a.rowid) ORDER BY a.rowid LIMIT 1""", (time.time(),)).fetchone()
@@ -5273,7 +5195,7 @@ def _balina_gate(sig):
 
 
 
-async def _history_range(symbol, interval, start_ms, end_ms, step_ms):
+async def _history_raw(symbol, interval, start_ms, end_ms, step_ms):
     """[start,end) kapalı mumlar; sayfa/interval boşluğu ayrıca bildirilir."""
     start_ms, end_ms = int(start_ms), int(end_ms)
     if start_ms >= end_ms:
@@ -5308,9 +5230,14 @@ def _paper_process_rows(pos, rows):
         duration = safe_float(row[9])/1000 if len(row)>9 else interval_minutes(V107_TAKIP_TF)*60
         if ts < pos['open_ts'] or ts*1000 < safe_float(pos.get('scan_ts')):
             continue
+        expected = max(int(pos['open_ts']*1000),int(safe_float(pos.get('scan_ts'))))
+        expected = ((expected+999)//1000)*1000
+        if int(row[0]) != expected:
+            _history_gap(pos,expected,int(row[0])); break
         R, outcome = v107_check_paper_bar(pos,safe_float(row[2]),safe_float(row[3]))
         close_at = ts+duration
         if outcome:
+            pos['exit_observation']={'hi':safe_float(row[2]),'lo':safe_float(row[3]),'close':safe_float(row[4]),'start_ts':ts,'duration':duration}
             if outcome=='STOP':
                 exit_price = pos['orig_stop']
                 if pos['side']=='LONG':
@@ -5318,7 +5245,7 @@ def _paper_process_rows(pos, rows):
                 else:
                     row[2],row[3] = max(exit_price,safe_float(row[1])), min(pos['entry'],safe_float(row[1]))
             else:
-                exit_price = pos['tp4']
+                exit_price = pos['tp1']
                 if pos['side']=='LONG':
                     row[2],row[3] = exit_price,min(pos['entry'],safe_float(row[1]))
                 else:
@@ -5329,6 +5256,7 @@ def _paper_process_rows(pos, rows):
         v10_update_excursions(pos,[row])
         pos.update(last_price=safe_float(row[4]),last_price_ts=close_at,scan_ts=close_at*1000)
         if outcome:
+            pos.pop('history_gap',None)
             return R,outcome
         if _time_exit_due(pos, close_at):
             risk = abs(pos['entry']-pos['orig_stop'])
@@ -5347,6 +5275,8 @@ async def paper_tur():
         try:
             rows,_ = await v107_takip_barlari(pos)
             if not rows:
+                await _db_call(_persist_paper_step,pos,None,None)
+                original.clear(); original.update(pos)
                 continue
             R,outcome = _paper_process_rows(pos,rows)
             shadow = await _db_call(_persist_paper_step,pos,R,outcome)
@@ -5368,58 +5298,7 @@ async def paper_tur():
 
 
 async def golge_tur():
-    mp = _v10_mem()
-    groups = defaultdict(list)
-    for g in list(mp['golge']):
-        groups[g['symbol']].append(g)
-    step = interval_minutes(GOLGE_TF)*60000
-    now = int(time.time()*1000)
-    for symbol,records in groups.items():
-        _RUNTIME_HEALTH['shadow_heartbeat'] = time.time()
-        try:
-            start = int(min(max(g['stop_ts']*1000,safe_float(g.get('scan_ts'))) for g in records))
-            max_deadline = max(safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600) for g in records)*1000
-            end = min(now,int(max_deadline))//step*step
-            bars,complete = await _history_range(symbol,GOLGE_TF,start//step*step,end,step)
-            # Tüm kayıtların kısmi ilk/son mumlarını ortak 1m havuzunda tek kez çek.
-            bounds = []
-            for g in records:
-                a = int(max(g['stop_ts']*1000,safe_float(g.get('scan_ts'))))
-                b = ((a+step-1)//step)*step
-                deadline = int(safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600)*1000)
-                if a<b<=now:
-                    bounds.append((((a+59999)//60000)*60000,b))
-                if deadline<=now and deadline%step:
-                    bounds.append((deadline//step*step,deadline//60000*60000))
-            minute_rows,minute_ok = [],True
-            if bounds:
-                minute_rows,minute_ok = await _history_range(symbol,'1m',min(a for a,b in bounds),max(b for a,b in bounds),60000)
-            for original in records:
-                g = copy.deepcopy(original)
-                deadline = safe_float(g.get('end_ts'),g['stop_ts']+GOLGE_SAAT*3600)
-                g['end_ts'] = deadline
-                cutoff = max(g['stop_ts']*1000,safe_float(g.get('scan_ts')))
-                first_full = ((int(cutoff)+step-1)//step)*step
-                end_full = int(deadline*1000)//step*step
-                partial = [r for r in minute_rows if int(r[0])<first_full or int(r[0])>=end_full]
-                usable = [r for r in bars if int(r[0])>=first_full and int(r[0])+step<=end_full]
-                golge_kaydi_guncelle(g,partial+usable)
-                if not complete or not minute_ok:
-                    g['coverage'] = 'INCOMPLETE_HISTORY'
-                if int(g['stop_ts']*1000)%60000 or int(deadline*1000)%60000:
-                    g['coverage'] = 'PARTIAL_BOUNDARY_MINUTE'
-                done = now>=deadline*1000
-                await _db_call(olcum_db_golge_guncelle,g,done)
-                if done:
-                    mp['golge'] = [x for x in mp['golge'] if x['uid']!=g['uid']]
-                else:
-                    original.clear()
-                    original.update(g)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            stats['shadow_error'] = int(stats.get('shadow_error',0))+1
-            logger.exception('Gölge takip hatası %s; kayıt korunuyor',symbol)
+    await _continuation_tur()
 
 
 
@@ -5433,8 +5312,13 @@ def _report_rows():
 
 
 def _report_scope():
-    return ('Ölçüm serisi: '+(_cohort() if REPORT_CURRENT_COHORT_ONLY else 'TÜM SÜRÜMLER / AYARLAR')+
-            (' | Eksik/kaba tarihçe hariç; girişin <1 saniyesi ve çıkış mumu sınırı belirsiz' if REPORT_REQUIRE_COMPLETE else ' | Eksik tarihçe dahil'))
+    rows=olcum_db_ortak_satirlari()
+    included=[r for r in rows if (not REPORT_CURRENT_COHORT_ONLY or r.get('cohort')==_cohort()) and (not REPORT_REQUIRE_COMPLETE or r.get('coverage') in ('COMPLETE','SUBSECOND_ENTRY_OMITTED'))]
+    excluded=len(rows)-len(included)
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        waiting=sum(bool(json.loads(p or '{}').get('history_gap')) for p, in conn.execute('SELECT position_json FROM olcum_pozisyon'))
+    return (f'Yeni seri: {_cohort()} | Toplam {len(rows)} | Dahil {len(included)} | Kapsam/veri nedeniyle dışlanan {excluded} | Mum bekleyen {waiting}\n'
+            'Eski sürüm ve gizli motor hariç. Girişin <1 saniyesi atlanır; aynı saniyede STOP önce kabul edilir.')
 
 
 def _metric(value, digits=3):
@@ -5451,7 +5335,7 @@ def _combo_partition(rows,keys):
     for row in rows:
         conditions = row.get('_conditions') or _kombinasyon_kosullari(row)
         values = [conditions[k] for k in keys]
-        (failed if False in values else passed if all(v is True for v in values) else unknown).append(row)
+        (unknown if any(v is None for v in values) else failed if False in values else passed).append(row)
     return passed,failed,unknown
 
 
@@ -5471,89 +5355,10 @@ def _comparison_lines(first,second,unknown=0):
 
 
 def status_raporu_uret():
-    mp = _v10_mem()
-    cl = mp["closed"]; n = len(cl)
-    wins = sum(1 for x in cl if x["R"] > 0)
-    ev = (sum(x["R"] for x in cl) / n) if n else 0
-    try:
-        with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
-            net_values = [safe_float(x[0]) for x in conn.execute(
-                "SELECT net_r_value FROM olcum_pozisyon WHERE durum!='ACIK' AND net_r_value IS NOT NULL"
-            ).fetchall()]
-    except Exception:
-        net_values = []
-    net_ev = avg(net_values) if net_values else None
-    tum_rows = olcum_db_ortak_satirlari()
-    sonuc_rows = [r for r in tum_rows if r.get("durum") != "ACIK"]
-    acik_rows = [r for r in tum_rows if r.get("durum") == "ACIK"]
-    n = len(sonuc_rows)
-    wins = sum(r['r_value']>0 for r in sonuc_rows)
-    ev = _mean_present(sonuc_rows,'r_value')
-    incomplete = sum(r.get('coverage') not in ('COMPLETE','SUBSECOND_ENTRY_OMITTED') for r in tum_rows)
-    sonuc_adlari = ("TEMIZ_STOP", "TP1_STOP", "TP2_STOP", "TP3_STOP", "TP4_TAM", "TIME_EXIT")
-    sonuc_satirlari = []
-    for sonuc_adi in sonuc_adlari:
-        grup = [r for r in sonuc_rows if r.get("sonuc_tipi") == sonuc_adi]
-        yuzde = len(grup) / len(sonuc_rows) * 100.0 if sonuc_rows else 0.0
-        ort_r = avg([safe_float(r.get("r_value")) for r in grup])
-        sonuc_satirlari.append(f"{sonuc_adi}: {len(grup)} (%{yuzde:.1f}) | Ort.R {ort_r:+.3f}")
-    en_az_bir_tp = sum(1 for r in sonuc_rows if r.get("hit1"))
-    hic_tp = len(sonuc_rows) - en_az_bir_tp
-    toplam_tp1 = sum(1 for r in tum_rows if r.get("hit1"))
-    toplam_tp2 = sum(1 for r in tum_rows if r.get("hit2"))
-    toplam_tp3 = sum(1 for r in tum_rows if r.get("hit3"))
-    toplam_tp4 = sum(1 for r in tum_rows if r.get("hit4"))
-    acik_tp = sum(1 for r in acik_rows if r.get("hit1"))
-    acik_tpsiz = len(acik_rows) - acik_tp
-    lines = [
-        f"📊 V12.0.2 ULTRA DURUM",
-        f"Saat: {tr_str()}", "Kapsam: tüm kayıtlı sürümler; TP temasları birbirini dışlamaz.",
-        f"Coin havuzu: {len(COINS)}/{MA_COIN_LIMIT}",
-        f"Analiz: {stats.get('v10_analyzed', 0)} | Aday: {stats.get('v10_candidates', 0)} | Sinyal: {stats.get('v10_signals', 0)}",
-        f"Açık: {len(acik_rows)} | Kapalı: {n} | Win%{round(wins/n*100,1) if n else 0} | EV {_metric(ev)}R",
-        f"Eksik/legacy tarihçe: {incomplete} | Kurtarma bekleyen: {stats.get('recovery_missing_position',0)}",
-        f"Maliyet sonrası Net EV: {_metric(net_ev)}R | Kayıt: {len(net_values)}",
-        f"Tüm sinyallerde TP teması: TP1 {toplam_tp1} | TP2 {toplam_tp2} | TP3 {toplam_tp3} | TP4 {toplam_tp4}",
-        f"Açık pozisyon: TP gören {acik_tp} | Henüz TP görmeyen {acik_tpsiz}",
-        f"TP görmeden stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TEMIZ_STOP')}",
-        f"TP1 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP1_STOP')} | "
-        f"TP2 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP2_STOP')} | "
-        f"TP3 sonrası stop: {sum(1 for r in sonuc_rows if r.get('sonuc_tipi') == 'TP3_STOP')}",
-        *sonuc_satirlari,
-        f"Kapananlarda en az bir TP aldı: {en_az_bir_tp} (%{en_az_bir_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
-        f"Kapananlarda hiç TP almadı: {hic_tp} (%{hic_tp/len(sonuc_rows)*100.0 if sonuc_rows else 0.0:.1f})",
-        f"🎯 Filtre red sayaçları:",
-        f"  Yapı: {stats.get('v10_red_yapi', 0)} | 4H: {stats.get('v10_red_4h',0)} | Pullback: {stats.get('v10_red_pullback',0)}",
-        f"  Coin EMA: {stats.get('v11_red_coin_ema', 0)}",
-        f"  RANGE: {stats.get('v107_red_range', 0)}",
-        f"  FOMO: {stats.get('v11_red_fomo', 0)}",
-        f"  OI zayıf: {stats.get('v11_red_oi_zayif', 0)}",
-        f"  RSI: {stats.get('v10_red_rsi', 0)}",
-        f"  VWAP: {stats.get('v113_red_vwap', 0)}",
-        f"  Session: {stats.get('v113_red_session', 0)}",
-        f"  MTF: {stats.get('v113_red_mtf', 0)}",
-        f"  VWM: {stats.get('v113_red_vwm', 0)}",
-        f"  Korelasyon: {stats.get('v113_red_correlation', 0)}",
-        f"🛡 Manipülasyon:",
-        f"  Spoof: {stats.get('v112_red_spoofing', 0)}",
-        f"  Spoof görülen: {stats.get('v112_spoof_gorulen', 0)} | Keserdi: {stats.get('v112_spoof_keserdi', 0)}",
-        f"  Wash: {stats.get('v112_red_wash', 0)}",
-        f"  Pump/Dump: {stats.get('v112_red_pump_dump', 0)}",
-        f"  Insider: {stats.get('v112_red_insider', 0)}",
-        f"  Stop-hunt: {stats.get('v112_hit_stop_hunt', 0)}",
-        f"  OKX timeout: {stats.get('okx_timeout', 0)}",
-        f"  Balina kârlı kapı reddi: {stats.get('balina_red_karli_kapi', 0)}",
-        f"🏢 Risk reddi: {stats.get('risk_reject', 0)} | Veri kalitesi reddi: {stats.get('data_quality_reject', 0)}",
-        f"💾 DB: {_RUNTIME_HEALTH.get('db_integrity')} | Yedek: {stats.get('backup_success', 0)} başarılı / {stats.get('backup_fail', 0)} hata",
-        f"🐋 Balina motoru: {'AKTİF' if BALINA_MOTOR_ENABLED else 'kapalı'} | "
-        f"WS: {'BAĞLI' if _BALINA_WS_STATUS.get('connected') else 'KOPUK/KAPALI'} | "
-        f"Balina işlem: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}",
-    ]
-    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
-        pending = conn.execute("SELECT COUNT(*) FROM notification_outbox WHERE sent_ts IS NULL").fetchone()[0]
-    lines.append(f"Bildirim bekleyen: {pending} | Analiz hatası: {stats.get('analysis_error',0)} | DB yazım hatası: {stats.get('ledger_write_fail',0)}")
-    lines.append(f"Ölçümde keserdi: MTF {stats.get('v113_would_mtf',0)} | Korelasyon {stats.get('v113_would_correlation',0)} | Balina {stats.get('balina_would_reject',0)}")
-    return "\n".join(lines)
+    text=_engine_report('MAIN')
+    return text + (f"\nCoin havuzu: {len(COINS)} | Analiz {stats.get('v10_analyzed',0)} | Aday {stats.get('v10_candidates',0)}"
+        f"\nAnaliz hatası {stats.get('analysis_error',0)} | Paper hata {stats.get('paper_position_error',0)}"
+        f"\nOKX timeout {stats.get('okx_timeout',0)} | DB yazım hatası {stats.get('ledger_write_fail',0)}")
 
 
 
@@ -5590,7 +5395,7 @@ def _audit_tx(conn,event,pos):
              pos.get('config_hash',config_fingerprint()),_json(pos)))
 
 
-# === V12.0.2 VERİ KAYNAKLARI VE ÖLÇÜLEBİLİR SKOR ===
+# === V12.1.0 VERİ KAYNAKLARI VE ÖLÇÜLEBİLİR SKOR ===
 _MEXC_CACHE = {"instruments": {}, "tickers": {}, "ts": 0.0, "meta_ts": 0.0, "error": ""}
 _SPOOF_CACHE = {}
 _SPOOF_LOCKS = {}
@@ -6010,6 +5815,420 @@ async def cmd_yedekindir(update, context):
         except Exception:
             logger.exception("Yedek indirme başarısız")
             await update.message.reply_text("Yedek hazırlanamadı veya gönderilemedi. /yedekindir ile tekrar deneyebilirsin; asıl kayıtlar korunur.")
+
+
+# === V12.1 bağımsız motor / TP1 sonrası gözlem ===
+_GIZLI_LOCK = asyncio.Lock()
+_FOLLOW_PRELOAD = {}
+_HISTORY_RAW = _history_raw
+
+
+async def _history_range(symbol, interval, start_ms, end_ms, step_ms):
+    # Gölge turu başına aynı coin'in tam dakikaları tek havuzdan paylaşılır.
+    key=(symbol,interval,step_ms)
+    pool=_FOLLOW_PRELOAD.get(key)
+    if interval=='1s' and _FOLLOW_PRELOAD.get('_active'):
+        pools=_FOLLOW_PRELOAD.get(('seconds',symbol),[])
+        pool=next((item for item in pools if item[0]<=start_ms and end_ms<=item[1]),pool)
+    if pool and pool[0]<=start_ms and end_ms<=pool[1]:
+        result=[r for r in pool[2] if start_ms<=int(r[0]) and int(r[0])+step_ms<=end_ms]
+        complete=len(result)==max(0,(end_ms-start_ms)//step_ms) and all(int(r[0])==start_ms+i*step_ms for i,r in enumerate(result))
+        return result,complete
+    result,complete=await _HISTORY_RAW(symbol,interval,start_ms,end_ms,step_ms)
+    if _FOLLOW_PRELOAD.get('_active') and interval=='1s':
+        _FOLLOW_PRELOAD.setdefault(('seconds',symbol),[]).append((start_ms,end_ms,result))
+    return result,complete
+
+
+def _history_gap(pos,start,end):
+    old=pos.get('history_gap') or {}
+    pos['history_gap']={'start_ms':int(start),'end_ms':int(end),
+        'first_seen':old.get('first_seen',time.time()),'last_attempt':time.time(),
+        'attempts':int(old.get('attempts',0))+1}
+
+
+def yeni_motor_db_init():
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('CREATE TABLE IF NOT EXISTS motor_identity (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)')
+        identity=conn.execute('SELECT value FROM motor_identity WHERE id=1').fetchone()
+        if identity is None:
+            # Yanlışlıkla eski DB'ye yönlendirme, geri yükleme veya yol hatasında karışma yerine dur.
+            if conn.execute('SELECT COUNT(*) FROM olcum_pozisyon').fetchone()[0]:
+                raise RuntimeError('Yeni DB boş değil ve V12.1 kimliği yok. YENI_OLCUM_DB ayrı olmalı.')
+            conn.execute("INSERT INTO motor_identity VALUES(1,'V12.1-TP1FULL')")
+        elif identity[0]!='V12.1-TP1FULL':
+            raise RuntimeError('Defter motor kimliği uyumsuz')
+        conn.execute('CREATE TABLE IF NOT EXISTS gizli_position (uid TEXT PRIMARY KEY,symbol TEXT NOT NULL,candle TEXT NOT NULL,side TEXT NOT NULL,status TEXT NOT NULL,position_json TEXT NOT NULL,UNIQUE(symbol,candle))')
+        conn.execute('CREATE INDEX IF NOT EXISTS gizli_status ON gizli_position(status,symbol)')
+        conn.execute('CREATE TABLE IF NOT EXISTS continuation (uid TEXT PRIMARY KEY,engine TEXT NOT NULL,symbol TEXT NOT NULL,phase TEXT NOT NULL,payload TEXT NOT NULL)')
+        conn.execute('CREATE INDEX IF NOT EXISTS continuation_phase ON continuation(phase,symbol)')
+        conn.execute("INSERT OR IGNORE INTO schema_meta VALUES('v12_1_started',?)",(str(time.time()),))
+        conn.execute("INSERT OR IGNORE INTO schema_meta VALUES('archive_paths',?)",(_json({'olcum':ESKI_OLCUM_DB,'memory':ESKI_MEMORY_FILE,'akis':ESKI_BALINA_DB}),))
+    if memory.get('v12_1_identity') not in (None,'V12.1-TP1FULL'):
+        raise RuntimeError('Yeni JSON motor kimliği uyumsuz')
+    if memory.get('v12_1_identity') is None and any(_v10_mem().get(k) for k in ('open','closed','golge')):
+        raise RuntimeError('Eski JSON yeni deftere yüklenemez. YENI_MEMORY_FILE ayrı olmalı.')
+    memory['v12_1_identity']='V12.1-TP1FULL'
+
+
+def _gizli_accept(sig):
+    # Aday filtreler; kârlılık iddiası değil. Ölçümsüz bir değer geçer sayılmaz.
+    if sig.get('kontrol'): return False
+    oi=sig.get('oi_change_pct')
+    if oi is None or safe_float(oi)<=GIZLI_MIN_OI_PCT: return False
+    gates=sig.get('kapi_sonuclari') or {}
+    return all(gates.get(k)=='gecti' for k in GIZLI_GEREKLI_KAPILAR)
+
+
+def _gizli_can_open(symbol,candle):
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        if conn.execute("SELECT COUNT(*) FROM gizli_position WHERE status='ACIK'").fetchone()[0]>=GIZLI_MAX_OPEN:return False
+        return conn.execute("SELECT 1 FROM gizli_position WHERE symbol=? AND (status='ACIK' OR candle=?)",(symbol,candle)).fetchone() is None
+
+
+def _gizli_insert(pos):
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute("SELECT 1 FROM gizli_position WHERE symbol=? AND (status='ACIK' OR candle=?)",(pos['symbol'],pos['candle_ts'])).fetchone():return None
+        if conn.execute("SELECT COUNT(*) FROM gizli_position WHERE status='ACIK'").fetchone()[0]>=GIZLI_MAX_OPEN:return None
+        old=conn.execute("SELECT value FROM schema_meta WHERE key='gizli_seq'").fetchone()
+        pos['signal_no']=int(old[0])+1 if old else 1
+        conn.execute('INSERT INTO gizli_position VALUES(?,?,?,?,?,?)',(pos['uid'],pos['symbol'],pos['candle_ts'],pos['side'],'ACIK',_json(pos)))
+        conn.execute("INSERT OR REPLACE INTO schema_meta VALUES('gizli_seq',?)",(str(pos['signal_no']),))
+        if GIZLI_TELEGRAM_ENABLED:
+            text=f"🔒 GİZLİ PAPER #{pos['signal_no']} | {pos['symbol']} {pos['side']}\nGiriş {pos['entry']} | Stop %3 | TP %5/%9/%13/%20\nTP1 tam kapanış; aday filtreler, kârlılık doğrulanmadı."
+            _outbox_insert(conn,pos['uid']+':OPEN',pos,'GIZLI',text)
+    return pos
+
+
+async def gizli_aday(sig):
+    if not GIZLI_ENABLED or not _gizli_accept(sig):return
+    if RISK_KILL_SWITCH or _RUNTIME_HEALTH.get('emergency_stop'):return
+    async with _GIZLI_LOCK:
+        try:
+            if not await _db_call(_gizli_can_open,sig['symbol'],str(sig['candle_ts'])):return
+            quote=await _live_entry_quote(sig['symbol'],sig['direction'])
+            s=copy.deepcopy(sig);entry=quote['price'];sign=1 if s['direction']=='LONG' else -1
+            s.update(entry=entry,stop=entry*(1-sign*.03),stop_pct=3.0,risk=entry*.03,accepted_ts=time.time(),entry_kaynak=quote['source'])
+            for i,pct in enumerate((5,9,13,20),1):
+                s[f'tp{i}']=entry*(1+sign*pct/100);s[f'tp{i}_rr']=pct/3
+            p=v10_open_paper(s,persist=False)
+            p.update(uid='GIZLI|'+p['uid'],engine='GIZLI',tp_weights=[1,0,0,0],
+                filter_snapshot={'oi_min':GIZLI_MIN_OI_PCT,'gates':list(GIZLI_GEREKLI_KAPILAR)},cohort=_cohort()+':GIZLI')
+            p.pop('cost_r_frozen',None)
+            p['cost_r_frozen']=simulasyon_maliyet_r(p)
+            await _db_call(_gizli_insert,p)
+        except asyncio.CancelledError:raise
+        except Exception:
+            stats['gizli_error']=int(stats.get('gizli_error',0))+1
+            logger.exception('Gizli aday hatası; ana motor devam ediyor')
+
+
+def _follow_insert(conn,pos,outcome,engine):
+    if outcome not in ('TP1','STOP'):return
+    p=copy.deepcopy(pos)
+    p.pop('pending_hits',None);p.pop('history_gap',None)
+    phase='AFTER_TP' if outcome=='TP1' else 'AFTER_STOP'
+    end=(pos['open_ts']+TAKIP_SAAT*3600) if phase=='AFTER_TP' else pos['close_ts']+GOLGE_SAAT*3600
+    risk=abs(pos['entry']-pos['orig_stop'])
+    rrs=[abs(pos[f'tp{i}']-pos['entry'])/risk for i in range(1,5)]
+    p.update(engine=engine,phase=phase,actual_outcome=outcome,actual_r=rrs[0] if outcome=='TP1' else -1,
+        tracking_deadline=float(math.ceil(max(pos['close_ts'],end))),targets={str(i):({'state':'TP','r':rrs[i-1]} if i==1 and outcome=='TP1' else {'state':'STOP','r':-1.0} if outcome=='STOP' else {'state':'PENDING','r':None}) for i in range(1,5)},
+        follow_hits=[1] if outcome=='TP1' else [],follow_mfe_pct=0.0,follow_mae_pct=0.0,
+        shadow_hits=[],shadow_mfe_pct=0.0,shadow_mae_pct=0.0,shadow_times={},shadow_complete=False,
+        post_tp_stop_highest=None,stop_ts=pos['close_ts'] if outcome=='STOP' else None,
+        first_tp_ts=pos['close_ts'] if outcome=='TP1' else None,shadow_enabled=GOLGE_IZLEME,shadow_hours=GOLGE_SAAT)
+    observation=pos.get('exit_observation') or {}
+    if outcome=='TP1' and observation:
+        for i in range(2,5):
+            reached=observation['hi']>=p[f'tp{i}'] if p['side']=='LONG' else observation['lo']<=p[f'tp{i}']
+            if reached:
+                p['follow_hits'].append(i);p['targets'][str(i)]={'state':'TP','r':rrs[i-1]}
+                if engine=='MAIN' or GIZLI_TELEGRAM_ENABLED:
+                    _outbox_insert(conn,p['uid']+f':POST_TP{i}',p,'FOLLOW' if engine=='MAIN' else 'GIZLI',
+                        f"{'GİZLİ ' if engine=='GIZLI' else ''}#{p.get('signal_no',0)} | {p['symbol']} | TP{i} {rrs[i-1]:.3f}R teması\nTP1 ile aynı kapanış saniyesi; gerçekleşen TP1 sonucu değişmez.")
+        if len(p['follow_hits'])==4:p['phase']='DONE'
+        elif p['tracking_deadline']<=p['close_ts']:
+            current=(observation['close']-p['entry'])*(1 if p['side']=='LONG' else -1)/risk
+            for target in p['targets'].values():
+                if target['state']=='PENDING':target.update(state='TIME_EXIT',r=current)
+            p['phase']='DONE'
+    if outcome=='STOP' and not GOLGE_IZLEME:p['phase']='DONE'
+    conn.execute('INSERT OR IGNORE INTO continuation VALUES(?,?,?,?,?)',(p['uid'],engine,p['symbol'],p['phase'],_json(p)))
+
+
+def _follow_process(p,rows):
+    events=[]
+    for row in rows:
+        ts=int(row[0]);end=ts+int(row[9]);cursor=int(p.get('scan_ts',p['close_ts']*1000))
+        if ts<cursor:continue
+        if ts!=((cursor+999)//1000)*1000:
+            _history_gap(p,cursor,ts);break
+        if end>int(p['tracking_deadline']*1000):break
+        hi,lo,c=map(safe_float,(row[2],row[3],row[4]));long=p['side']=='LONG';entry=p['entry']
+        favorable=max(0,(hi-entry if long else entry-lo)/entry*100)
+        adverse=max(0,(entry-lo if long else hi-entry)/entry*100)
+        stop=lo<=p['orig_stop'] if long else hi>=p['orig_stop']
+        touched=lambda i:hi>=p[f'tp{i}'] if long else lo<=p[f'tp{i}']
+        if p['phase']=='AFTER_TP':
+            p['follow_mfe_pct']=max(p['follow_mfe_pct'],favorable)
+            p['follow_mae_pct']=max(p['follow_mae_pct'],adverse)
+            if stop:
+                highest=max(p['follow_hits'],default=1)
+                p['post_tp_stop_highest']=highest;p['stop_ts']=end/1000
+                for target in p['targets'].values():
+                    if target['state']=='PENDING':target.update(state='STOP',r=-1.0)
+                events.append(('POST_STOP',f"TP{highest} sonrası STOP | TP1 kapanışı sonrası izleme. Gerçekleşen brüt {p['actual_r']:+.3f}R değişmedi."))
+                p['phase']='AFTER_STOP' if p.get('shadow_enabled',True) else 'DONE'
+                p['tracking_deadline']=end/1000+p.get('shadow_hours',GOLGE_SAAT)*3600
+                # Stop saniyesinin tamamı gölgeye dahil edilmez; sıralama belirsizdir.
+            else:
+                for i in range(2,5):
+                    if i not in p['follow_hits'] and touched(i):
+                        p['follow_hits'].append(i)
+                        rr=p['tp_rrs'][i-1];p['targets'][str(i)]={'state':'TP','r':rr}
+                        events.append((f'POST_TP{i}',f"TP{i} GELDİ | {rr:.3f}R | TP1 kapanışı sonrası izleme; gerçekleşen sonuç değişmedi."))
+                if len(p['follow_hits'])==4:p['phase']='DONE'
+                elif end>=int(p['tracking_deadline']*1000):
+                    current=(c-entry)*(1 if long else -1)/abs(entry-p['orig_stop'])
+                    for target in p['targets'].values():
+                        if target['state']=='PENDING':target.update(state='TIME_EXIT',r=current)
+                    p['phase']='DONE'
+        elif p['phase']=='AFTER_STOP':
+            p['shadow_mfe_pct']=max(p['shadow_mfe_pct'],favorable)
+            p['shadow_mae_pct']=max(p['shadow_mae_pct'],adverse)
+            for i in range(1,5):
+                if i not in p['shadow_hits'] and touched(i):
+                    p['shadow_hits'].append(i);p['shadow_times'][str(i)]=(end/1000-p['stop_ts'])/60
+                    events.append((f'SHADOW_TP{i}',f"STOP SONRASI TP{i} | {p['tp_rrs'][i-1]:.3f}R mesafesi | Yalnız gölge izleme; kapanış sonucu değişmedi."))
+            if end>=int(p['tracking_deadline']*1000):
+                p['phase']='DONE';p['shadow_complete']=True
+        p['scan_ts']=end;p['last_price']=c
+        if p['phase']=='DONE':
+            p.pop('history_gap',None)
+            break
+    return events
+
+
+def _follow_save(p,events):
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('UPDATE continuation SET phase=?,payload=? WHERE uid=?',(p['phase'],_json(p),p['uid']))
+        if p['engine']=='MAIN' or GIZLI_TELEGRAM_ENABLED:
+            for key,text in events:
+                label='GİZLİ ' if p['engine']=='GIZLI' else ''
+                _outbox_insert(conn,p['uid']+':'+key,p,'GIZLI' if p['engine']=='GIZLI' else 'FOLLOW',
+                    f"{label}#{p.get('signal_no',0)} | {p['symbol']} {p['side']}\n{text}\nMum sonu: {tr_str(p['scan_ts']/1000)}")
+
+
+def _follow_rows(active_only=False,engine=None):
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        query='SELECT payload FROM continuation';conditions=[];args=[]
+        if active_only:conditions.append("phase!='DONE'")
+        if engine:conditions.append('engine=?');args.append(engine)
+        if conditions:query+=' WHERE '+' AND '.join(conditions)
+        return [json.loads(r[0]) for r in conn.execute(query,args)]
+
+
+async def _continuation_tur():
+    records=await _db_call(_follow_rows,True)
+    groups=defaultdict(list)
+    for p in records:
+        tf=GOLGE_TF if p['phase']=='AFTER_STOP' else V107_TAKIP_TF
+        groups[(p['symbol'],tf)].append(p)
+    for (symbol,tf),group in groups.items():
+        _RUNTIME_HEALTH['shadow_heartbeat']=time.time()
+        try:
+            step=interval_minutes(tf)*60000
+            start=min(int(p.get('scan_ts',p['close_ts']*1000)) for p in group)//step*step
+            end=min(int((time.time()-HISTORY_SETTLE_SEC)*1000)//step*step,start+300*step)
+            full,_=await _HISTORY_RAW(symbol,tf,start,end,step) if end>start else ([],True)
+            _FOLLOW_PRELOAD.clear();_FOLLOW_PRELOAD['_active']=True
+            _FOLLOW_PRELOAD[(symbol,tf,step)]=(start,end,full)
+            for p in group:
+                try:
+                    # Aynı coinin tüm kayıtları ortak zaman penceresini paylaşır.
+                    p['fetch_cutoff_ts']=end/1000
+                    rows,_=await v107_takip_barlari(p)
+                    p.pop('fetch_cutoff_ts',None)
+                    events=_follow_process(p,rows)
+                    await _db_call(_follow_save,p,events)
+                except asyncio.CancelledError:raise
+                except Exception:
+                    stats['shadow_error']=int(stats.get('shadow_error',0))+1
+                    logger.exception('Gölge UID hatası %s',p['uid'])
+        except asyncio.CancelledError:raise
+        except Exception:
+            stats['shadow_error']=int(stats.get('shadow_error',0))+1
+            logger.exception('Gölge coin hatası %s',symbol)
+        finally:_FOLLOW_PRELOAD.clear()
+
+
+def _gizli_rows(active_only=False):
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        return [json.loads(p) for p, in conn.execute('SELECT position_json FROM gizli_position'+(" WHERE status='ACIK'" if active_only else ''))]
+
+
+def _gizli_step(p,r=None,outcome=None):
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        current=conn.execute('SELECT status FROM gizli_position WHERE uid=?',(p['uid'],)).fetchone()
+        if not current or current[0]!='ACIK':return
+        p['status']=outcome or 'ACIK'
+        if outcome:
+            p['r_value']=r;p['net_r_value']=r-simulasyon_maliyet_r(p)
+            p['sonuc_tipi']=sonuc_tipi_belirle(outcome,p)
+            _follow_insert(conn,p,outcome,'GIZLI')
+            if GIZLI_TELEGRAM_ENABLED:
+                _outbox_insert(conn,p['uid']+':CLOSE',p,'GIZLI',build_v10_close_message(p,r,outcome,p['exit_price']))
+        conn.execute('UPDATE gizli_position SET status=?,position_json=? WHERE uid=?',(p['status'],_json(p),p['uid']))
+
+
+async def yeni_motor_loop():
+    while True:
+        if True:  # Açılmış kayıtlar GIZLI_ENABLED kapatılsa da takip edilir.
+            for p in await _db_call(_gizli_rows,True):
+                if p.get('status','ACIK')!='ACIK':continue
+                try:
+                    rows,_=await v107_takip_barlari(p)
+                    r,outcome=_paper_process_rows(p,rows)
+                    await _db_call(_gizli_step,p,r,outcome)
+                except asyncio.CancelledError:raise
+                except Exception:
+                    stats['gizli_error']=int(stats.get('gizli_error',0))+1
+                    logger.exception('Gizli takip hatası %s',p['uid'])
+        await asyncio.sleep(max(1,V107_TAKIP_ARALIK_SEC))
+
+
+def _engine_positions(engine):
+    if engine=='GIZLI':return _gizli_rows()
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        result=[]
+        for raw,status,r,net in conn.execute('SELECT position_json,durum,r_value,net_r_value FROM olcum_pozisyon'):
+            p=json.loads(raw);p.update(status=status,r_value=r,net_r_value=net);result.append(p)
+        return result
+
+
+def _ratio(n,total):
+    return f'{n}/{total} (%{n/total*100:.1f})' if total else '0/0 (ölçümsüz)'
+
+
+def _engine_report(engine):
+    rows=_engine_positions(engine);follows=_follow_rows(False,engine)
+    lines=[f"📊 {BOT_BUILD} | {'ANA MOTOR' if engine=='MAIN' else 'GİZLİ MOTOR'} | TP1 %100 kapanış",
+        'Eski sürüm ve diğer motor hariç; TP sonrası temaslar gerçekleşmiş kâr değildir.']
+    lines.append(f'Toplam {len(rows)} | Açık {sum(p.get("status","ACIK")=="ACIK" for p in rows)} | Kapalı {sum(p.get("status","ACIK")!="ACIK" for p in rows)}')
+    if engine=='GIZLI':lines.append(f'Bildirim: {GIZLI_TELEGRAM_ENABLED} | Aday filtreler: OI > %{GIZLI_MIN_OI_PCT:g}, '+','.join(GIZLI_GEREKLI_KAPILAR))
+    for control,name in ((False,'NORMAL'),(True,'KONTROL')):
+        group=[p for p in rows if bool(p.get('kontrol'))==control]
+        if engine=='GIZLI' and control:continue
+        closed=[p for p in group if p.get('status','ACIK')!='ACIK']
+        tp=sum(p.get('status')=='TP1' for p in closed);stop=sum(p.get('status')=='STOP' for p in closed)
+        lines.extend([f'\n{name}: toplam {len(group)} | açık {len(group)-len(closed)} | kapanan {len(closed)}',
+            f'TP1 tam kapanış: {_ratio(tp,len(closed))} | TP görmeden stop: {_ratio(stop,len(closed))}',
+            f"Süre çıkışı: {sum(p.get('status')=='TIME_EXIT' for p in closed)} | Brüt EV {_metric(_mean_present(closed,'r_value'))}R | Net EV {_metric(_mean_present(closed,'net_r_value'))}R",
+            f"MFE/MAE (gerçek pozisyon): %{_metric(_mean_present(group,'mfe_pct'))}/%{_metric(_mean_present(group,'mae_pct'))}"])
+        mfe=[p['mfe_pct'] for p in group if p.get('mfe_pct') is not None]
+        mae=[p['mae_pct'] for p in group if p.get('mae_pct') is not None]
+        lines.append('MFE dağılımı: '+ ' | '.join(f'{label} %{_metric(yuzdelik(mfe,q) if mfe else None)}' for label,q in (('medyan',.5),('p75',.75),('p90',.9))))
+        lines.append(f'MAE medyan %{_metric(yuzdelik(mae,.5) if mae else None)} | Stop mesafesine ulaşan {sum(p.get("mae_pct",0)>=abs(p["entry"]-p["orig_stop"])/p["entry"]*100-1e-6 for p in group)}')
+        fs=[p for p in follows if bool(p.get('kontrol'))==control]
+        lines.append('TP1 sonrası temaslar: '+' | '.join(f'TP{i}: {sum(i in p["follow_hits"] for p in fs)}' for i in range(2,5)))
+        lines.append('TP sonrası stop: '+' | '.join(f'TP{i} sonrası {sum(p.get("post_tp_stop_highest")==i for p in fs)}' for i in range(1,4)))
+        lines.append(f"Mum bekleyen: {sum(bool(p.get('history_gap')) for p in group)} | Gözlemde mum bekleyen: {sum(bool(p.get('history_gap')) for p in fs)}")
+    return '\n'.join(lines)
+
+
+def _target_report(engine):
+    rows=_engine_positions(engine);fs={p['uid']:p for p in _follow_rows(False,engine)}
+    lines=['📐 ALTERNATİF TAM KAPANIŞ | ana sonuca yazılmaz',f'İzleme ufku {TAKIP_SAAT:g} saat. Aynı saniyede stop önce; eksik veri karar dışı.']
+    for control,name in ((False,'NORMAL'),(True,'KONTROL')):
+        if engine=='GIZLI' and control:continue
+        group=[p for p in rows if bool(p.get('kontrol'))==control]
+        lines.append(name)
+        for target in range(1,5):
+            values=[];net=[];pending=missing=0
+            for p in group:
+                follow=fs.get(p['uid']);result=None
+                if target==1 and p.get('status','ACIK')!='ACIK':result=p.get('r_value')
+                elif follow:
+                    result=follow['targets'][str(target)]['r']
+                elif p.get('status')=='TIME_EXIT':result=p.get('r_value')
+                if result is None:
+                    pending+=1;missing+=bool((follow or p).get('history_gap'));continue
+                values.append(result);net.append(result-simulasyon_maliyet_r(p))
+            lines.append(f'TP{target}: sonuçlanan {len(values)} | bekleyen {pending} (veri bekleyen {missing}) | Brüt EV {_metric(avg(values) if values else None)}R | Net EV {_metric(avg(net) if net else None)}R'+(' | KARAR YOK (<100)' if len(values)<100 else ' | ileri doğrulama gerekir'))
+    return '\n'.join(lines)
+
+
+def _shadow_report(engine):
+    fs=[p for p in _follow_rows(False,engine) if p.get('stop_ts') is not None]
+    lines=[f'👻 STOP SONRASI | {engine} | Eski sürüm hariç',f'İzleme {GOLGE_SAAT:g} saat; eksik aralık kapanmadan tamamlanmaz.']
+    for control,name in ((False,'NORMAL'),(True,'KONTROL')):
+        if engine=='GIZLI' and control:continue
+        group=[p for p in fs if bool(p.get('kontrol'))==control];done=[p for p in group if p.get('shadow_complete')]
+        lines.append(f'{name}: stop {len(group)} | biten {len(done)} | izlenen {sum(p["phase"]=="AFTER_STOP" for p in group)} | kapalı izleme {sum(not p.get("shadow_enabled",True) for p in group)}')
+        for i in range(1,5):
+            hit=[p for p in group if i in p['shadow_hits']];times=[p['shadow_times'][str(i)] for p in hit]
+            finished=sum(i in p['shadow_hits'] for p in done)
+            lines.append(f'TP{i}: {_ratio(len(hit),len(group))} | bitenlerde {_ratio(finished,len(done))} | medyan dk {_metric(yuzdelik(times,.5) if times else None,1)}')
+        lines.append(f"Gölge MFE/MAE: %{_metric(_mean_present(group,'shadow_mfe_pct'))}/%{_metric(_mean_present(group,'shadow_mae_pct'))}")
+        yes=[{'ozellikler':pozisyon_ozellikleri(p),'kapilar':p.get('kapi_sonuclari',{})} for p in done if 1 in p['shadow_hits']]
+        no=[{'ozellikler':pozisyon_ozellikleri(p),'kapilar':p.get('kapi_sonuclari',{})} for p in done if 1 not in p['shadow_hits']]
+        lines.append(f'Tamamlanmış gölgelerde TP1 gören {len(yes)} / görmeyen {len(no)}')
+        lines.extend(ortak_ozellik_analiz(yes,no))
+    lines.append('Çoklu özellik farkları hipotezdir; stop nedenini nedensel olarak kanıtlamaz.')
+    return '\n'.join(lines)
+
+
+def _archive_report():
+    from pathlib import Path
+    path=Path(ESKI_OLCUM_DB)
+    if not path.is_file():return f'Eski defter bulunamadı: {path.name}. ESKI_OLCUM_DB eski dosyayı göstermeli.'
+    with sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=10) as conn:
+        rows=conn.execute('SELECT kontrol,durum,r_value,sonuc_tipi FROM olcum_pozisyon').fetchall()
+    lines=['📚 ESKİ SÜRÜM | DONDURULMUŞ ARŞİV','Takip ve bildirim kapalı. Yeni sürümün hiçbir hesabına girmez.']
+    for control,name in ((0,'NORMAL'),(1,'KONTROL')):
+        group=[r for r in rows if r[0]==control];closed=[r for r in group if r[1]!='ACIK']
+        lines.append(f'{name}: toplam {len(group)} | arşivlenmiş açık {len(group)-len(closed)} | kapanan {len(closed)} | Brüt EV {_metric(avg([r[2] for r in closed]) if closed else None)}R')
+        counts=defaultdict(int)
+        for r in closed:counts[r[3] or r[1]]+=1
+        lines.append(' | '.join(f'{k}: {v}' for k,v in sorted(counts.items())))
+    return '\n'.join(lines)
+
+
+async def cmd_eskisurum(update,context):
+    if not telegram_yetkili(update):return
+    for part in telegram_parcala(await _db_call(_archive_report)):await update.message.reply_text(part)
+
+
+async def cmd_gizli(update,context):
+    if not telegram_yetkili(update):return
+    for fn in (_engine_report,_target_report,_shadow_report):
+        for part in telegram_parcala(await _db_call(fn,'GIZLI')):await update.message.reply_text(part)
+
+
+async def cmd_hedefler(update,context):
+    if not telegram_yetkili(update):return
+    for part in telegram_parcala(await _db_call(_target_report,'MAIN')):await update.message.reply_text(part)
+
+
+def _new_storage_preflight():
+    from pathlib import Path
+    for new in (OLCUM_DB,MEMORY_FILE,BALINA_DB):
+        for old in (ESKI_OLCUM_DB,ESKI_MEMORY_FILE,ESKI_BALINA_DB):
+            if os.path.realpath(new)==os.path.realpath(old) or (os.path.exists(new) and os.path.exists(old) and os.path.samefile(new,old)):
+                raise RuntimeError("Yeni dosya eski arşivle aynı; başlatma durduruldu")
+    if os.path.exists(OLCUM_DB):
+        with sqlite3.connect(Path(OLCUM_DB).resolve().as_uri()+'?mode=ro',uri=True) as conn:
+            tables={r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'olcum_pozisyon' in tables and conn.execute('SELECT COUNT(*) FROM olcum_pozisyon').fetchone()[0] and 'motor_identity' not in tables:
+                raise RuntimeError('Yeni defter yolunda eski kayıtlar var; ayrı dosya seçin')
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE,encoding='utf-8') as f: m=json.load(f)
+        if m.get('v12_1_identity')!='V12.1-TP1FULL' and any(m.get('v10_paper',{}).get(k) for k in ('open','closed','golge')):
+            raise RuntimeError('Yeni JSON yolunda eski kayıtlar var; ayrı dosya seçin')
 
 
 if __name__ == "__main__":
