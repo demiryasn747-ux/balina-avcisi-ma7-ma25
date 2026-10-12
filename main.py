@@ -15,6 +15,8 @@ import platform
 import math
 import functools
 import itertools
+import heapq
+from statistics import NormalDist
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
@@ -26,8 +28,21 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-VERSION_NAME = "Balina Avcısı V12.1.0 KURUMSAL ÖLÇÜM PLATFORMU"
-BOT_BUILD = "V12.1.0"  # Bu çalıştırılabilir dosyanın sürümü; eski Railway etiketiyle karışmaz.
+VERSION_NAME = "Balina Avcısı V12.1.1 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = "V12.1.1"  # Bu çalıştırılabilir dosyanın sürümü; eski Railway etiketiyle karışmaz.
+# Ölçüm kohortu kimliği: V12.1.1 yalnız altyapı/rapor yamasıdır; sinyal, kapı ve çıkış mantığı
+# V12.1.0 ile aynı olduğundan kohort BİLEREK değiştirilmez (örnek bölünmesin, eski kayıtlar raporda kalsın).
+COHORT_ID = "V12.1.0-TP1FULL"
+
+# === V12.1.1 ALTYAPI YAMALARI ===
+# DİKKAT: Bu adlar config_fingerprint öneklerinden (BALINA_, SCORE_, DATA_ ...) BİLEREK farklı:
+# fingerprint'e girselerdi yapılandırma kimliği değişir ve eski ölçüm kayıtları rapor dışında kalırdı.
+YAMA_WS_DATA_STALE_SEC = float(os.getenv("YAMA_WS_DATA_STALE_SEC", "60"))
+YAMA_BOOK_RESYNC_MAX_PER_MIN = int(float(os.getenv("YAMA_BOOK_RESYNC_MAX_PER_MIN", "15")))
+YAMA_BOOK_RESYNC_MAX_PER_HOUR = int(float(os.getenv("YAMA_BOOK_RESYNC_MAX_PER_HOUR", "100")))
+YAMA_BOOK_TRIM_SLACK = int(float(os.getenv("YAMA_BOOK_TRIM_SLACK", "100")))
+YAMA_BAD_SYMBOL_TTL_SEC = float(os.getenv("YAMA_BAD_SYMBOL_TTL_SEC", "21600"))
+YAMA_READ_WORKERS = int(float(os.getenv("YAMA_READ_WORKERS", "2")))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -755,7 +770,7 @@ def olcum_db_sonuc_tipi_yaz(pos: Dict[str, Any], outcome: str) -> None:
 def olcum_db_ortak_satirlari() -> List[Dict[str, Any]]:
     if not os.path.exists(OLCUM_DB):
         return []
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+    with sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         rows = conn.execute("""
             SELECT uid,side,kontrol,durum,r_value,mfe_pct,mae_pct,sonuc_tipi,kapi_json,cohort,net_r_value,open_ts,close_ts
             FROM olcum_pozisyon
@@ -829,7 +844,7 @@ def olcum_db_golge_guncelle(golge: Dict[str, Any], bitti: bool=False) -> None:
 def olcum_db_tp_satirlari() -> List[Tuple[Any, ...]]:
     if not os.path.exists(OLCUM_DB):
         return []
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+    with sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         return conn.execute("""
             SELECT kontrol,mfe_pct,mae_pct,kapi_json,durum,golge_durum,golge_tp,
                    golge_mfe_pct,golge_mae_pct,golge_tp1_dk
@@ -840,7 +855,7 @@ def olcum_db_tp_satirlari() -> List[Tuple[Any, ...]]:
 def olcum_db_satirlari() -> List[Tuple[Any, ...]]:
     if not os.path.exists(OLCUM_DB):
         return []
-    with _OLCUM_DB_LOCK, sqlite3.connect(OLCUM_DB, timeout=10) as conn:
+    with sqlite3.connect(OLCUM_DB, timeout=10) as conn:
         return conn.execute(
             "SELECT kontrol,r_value,mfe_pct,mae_pct,kapi_json,durum FROM olcum_pozisyon"
         ).fetchall()
@@ -1944,6 +1959,24 @@ def _balina_trade_near(state: Dict[str, Any], side: str, price: float,
                and abs(safe_float(t.get("price")) - price) / price <= tol)
 
 
+class _BookGap(Exception):
+    """Tek sembolün orderbook sıra boşluğu; tüm WS bağlantısını düşürmez."""
+
+    def __init__(self, symbol: str):
+        super().__init__(symbol)
+        self.symbol = symbol
+
+
+def _balina_book_invalidate(state: Dict[str, Any]) -> None:
+    # Boşluktan sonra defter ve duvarlar güvenilmez; iptal kanıtı üretilemez. Trade akışına (CVD) dokunulmaz.
+    state['book_resync'] = True
+    state['book_seq'] = None
+    state['book_full'] = {'bids': {}, 'asks': {}}
+    state['books'] = {'bids': {}, 'asks': {}}
+    state['walls'].clear()
+    state['last_book_ts'] = 0.0  # yeni snapshot gelene kadar balina_snapshot "BAYAT/VERI_YETERSIZ" döner
+
+
 def _balina_process_book(row: Dict[str, Any], action: str='snapshot') -> None:
     symbol = normalize_symbol(str(row.get('instId','')))
     ts = safe_float(row.get('ts'))/1000
@@ -1955,14 +1988,23 @@ def _balina_process_book(row: Dict[str, Any], action: str='snapshot') -> None:
             stats['balina_out_of_order_book'] = int(stats.get('balina_out_of_order_book',0))+1
             return
         seq,prev = row.get('seqId'),row.get('prevSeqId')
+        if action=='update' and state.get('book_resync'):
+            # Yeniden abonelik snapshot'ı gelene kadar eski aboneliğin artıkları yok sayılır.
+            stats['balina_book_stale_update'] = int(stats.get('balina_book_stale_update',0))+1
+            return
         if action=='update' and (state.get('book_seq') is None or prev!=state.get('book_seq')):
             stats['balina_book_gap'] = int(stats.get('balina_book_gap',0))+1
-            raise ValueError('Orderbook sequence gap: yeni snapshot gerekli')
+            _balina_book_invalidate(state)
+            raise _BookGap(symbol)  # WS döngüsü yalnız bu sembolün book kanalını yeniden abone eder
         if action=='snapshot':
+            state['book_resync'] = False
             state['book_full'] = {'bids':{},'asks':{}}
             if BALINA_WS_BOOK_CHANNEL=='books':
                 state['walls'].clear()
         state['book_seq'] = seq
+        keep = 400
+        depth = max(1, min(BALINA_BOOK_DEPTH,5) if BALINA_WS_BOOK_CHANNEL=='books5' else BALINA_BOOK_DEPTH)
+        depth = min(depth, keep)
         for side in ('bids','asks'):
             full = state['book_full'][side]
             for level in row.get(side,[]):
@@ -1973,10 +2015,13 @@ def _balina_process_book(row: Dict[str, Any], action: str='snapshot') -> None:
                     full.pop(p,None)
                 else:
                     full[p] = q
-            ordered = sorted(full.items(),reverse=side=='bids')[:400]
-            state['book_full'][side] = dict(ordered)
-            depth = min(BALINA_BOOK_DEPTH,5) if BALINA_WS_BOOK_CHANNEL=='books5' else BALINA_BOOK_DEPTH
-            state['books'][side] = dict(ordered[:max(1,depth)])
+            # V12.1.1: her mesajda 400 seviyeyi tam sıralamak yerine yalnız gerektiğinde kırp ve
+            # üst `depth` seviyeyi heap ile seç (aynı sonuç, ~3x az CPU; WS okuma döngüsü event loop'ta çalışır).
+            pick = heapq.nlargest if side=='bids' else heapq.nsmallest
+            if len(full) > keep + YAMA_BOOK_TRIM_SLACK:
+                full = {p: full[p] for p in pick(keep, full)}
+                state['book_full'][side] = full
+            state['books'][side] = {p: full[p] for p in pick(depth, full)}
         state['last_book_ts'] = ts
         tol = max(0,SPOOF_FIYAT_TOLERANS_PCT)/100
         for key,wall in list(state['walls'].items()):
@@ -2246,6 +2291,53 @@ async def _balina_ws_change_symbols(ws, old_symbols: set, new_symbols: set) -> N
     _BALINA_WS_STATUS["subscriptions"] = len(new_symbols) * 2 + int(LIQ_EVENTS_ENABLED)
 
 
+_BALINA_BAD_SYMBOLS: Dict[str, float] = {}
+_WS_BAD_INST_RE = re.compile(r'instId\s*[:=]\s*"?([A-Za-z0-9_\-]+)')
+
+
+def _balina_ws_symbols() -> List[str]:
+    """Abone olunacak semboller; OKX'in reddettiği (geçersiz/delist) semboller TTL boyunca hariç."""
+    now = time.time()
+    for s in [s for s, ts in _BALINA_BAD_SYMBOLS.items() if now - ts > YAMA_BAD_SYMBOL_TTL_SEC]:
+        _BALINA_BAD_SYMBOLS.pop(s, None)
+    seen, out = set(), []
+    for s in list(COINS)[:MA_COIN_LIMIT]:
+        n = normalize_symbol(s)
+        if n and n not in seen and n not in _BALINA_BAD_SYMBOLS:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _balina_ws_bad_symbol(msg: Dict[str, Any]) -> Optional[str]:
+    """OKX 'error' olayı tek bir enstrümanı reddettiyse sembolü döndürür; ayrıştırılamazsa None (tam yeniden bağlanma)."""
+    if str(msg.get('code')) not in ('60018', '51001'):
+        return None
+    m = _WS_BAD_INST_RE.search(str(msg.get('msg', '')))
+    return normalize_symbol(m.group(1)) if m else None
+
+
+async def _balina_ws_resync_books(ws, symbols: List[str], gap_times: deque) -> None:
+    """Boşluk yaşayan sembollerin yalnız book kanalını yeniden abone eder.
+
+    OKX abonelik istek bütçesi sınırlıdır; aşırı boşlukta tam yeniden bağlanmaya düşülür (yeni bütçe açar).
+    """
+    now = time.monotonic()
+    for _ in symbols:
+        gap_times.append(now)
+    while gap_times and now - gap_times[0] > 3600:
+        gap_times.popleft()
+    last_min = sum(1 for t in gap_times if now - t <= 60)
+    if last_min > YAMA_BOOK_RESYNC_MAX_PER_MIN or len(gap_times) > YAMA_BOOK_RESYNC_MAX_PER_HOUR:
+        raise RuntimeError(f"Orderbook boşlukları çok sık ({last_min}/dk, {len(gap_times)}/saat); tam yeniden bağlanma")
+    for symbol in symbols:
+        arg = {"channel": BALINA_WS_BOOK_CHANNEL, "instId": symbol}
+        await ws.send(json.dumps({"op": "unsubscribe", "args": [arg]}, separators=(",", ":")))
+        await ws.send(json.dumps({"op": "subscribe", "args": [arg]}, separators=(",", ":")))
+        stats["balina_book_resync"] = int(stats.get("balina_book_resync", 0)) + 1
+        await asyncio.sleep(0.05)
+
+
 async def balina_ws_loop() -> None:
     if not BALINA_MOTOR_ENABLED:
         return
@@ -2256,38 +2348,58 @@ async def balina_ws_loop() -> None:
         logger.error("Balina motoru için 'websockets' paketi gerekli")
         raise
     backoff = 1.0
+    gap_times: deque = deque()
     while True:
         try:
-            symbols = [normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]]
+            symbols = _balina_ws_symbols()
             async with websockets.connect(BALINA_WS_URL, ping_interval=15, ping_timeout=10,
                                           close_timeout=5, max_queue=20000) as ws:
                 _BALINA_STATE.clear()  # Kopuk aralık için yeni ısınma/snapshot gerekir.
                 _BALINA_WS_STATUS.update({"connected": True, "connected_ts": time.time(),
                                           "last_error": "", "last_message_ts": time.time()})
                 stats["balina_ws_connect"] = int(stats.get("balina_ws_connect", 0)) + 1
+                gap_times.clear()
                 await _balina_ws_subscribe(ws, symbols)
                 subscribed = set(symbols)
                 last_symbol_check = time.time()
+                last_data_ts = time.time()
                 backoff = 1.0
                 while True:
+                    # V12.1.1: 'pong' bağlantının canlı olduğunu gösterir, VERİNİN aktığını değil.
+                    if time.time() - last_data_ts > YAMA_WS_DATA_STALE_SEC:
+                        raise RuntimeError(f"WS veri akışı {YAMA_WS_DATA_STALE_SEC:g} sn durdu (bağlantı canlı, veri yok)")
                     try:
                         raw = await asyncio.wait_for(ws.recv(),timeout=20)
                     except asyncio.TimeoutError:
                         await ws.send('ping')
                         raw = await asyncio.wait_for(ws.recv(),timeout=10)
-                    _BALINA_WS_STATUS["last_message_ts"] = time.time()
-                    stats["balina_ws_message"] = int(stats.get("balina_ws_message", 0)) + 1
                     if raw == "pong":
+                        _BALINA_WS_STATUS["last_pong_ts"] = time.time()
                         continue
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
                     if msg.get('event')=='error':
-                        raise RuntimeError('OKX WS error '+str(msg.get('code')))
+                        bad = _balina_ws_bad_symbol(msg)
+                        if bad is None:
+                            raise RuntimeError('OKX WS error '+str(msg.get('code')))
+                        # Tek enstrüman reddedildi: tüm bağlantıyı düşürüp 200 coini sıfırlamak yerine hariç tut.
+                        _BALINA_BAD_SYMBOLS[bad] = time.time()
+                        _BALINA_STATE.pop(bad, None)
+                        subscribed.discard(bad)
+                        stats["balina_ws_bad_symbol"] = int(stats.get("balina_ws_bad_symbol", 0)) + 1
+                        logger.warning("OKX WS %s enstrümanını reddetti; %.0f sn hariç tutuluyor", bad, YAMA_BAD_SYMBOL_TTL_SEC)
+                        continue
+                    data = msg.get("data") or []
+                    if data:
+                        last_data_ts = time.time()
+                        _BALINA_WS_STATUS["last_message_ts"] = last_data_ts
+                        stats["balina_ws_message"] = int(stats.get("balina_ws_message", 0)) + 1
                     channel = str((msg.get("arg") or {}).get("channel", ""))
                     inst_id = str((msg.get("arg") or {}).get("instId", ""))
-                    for row in msg.get("data", []):
+                    resync: List[str] = []
+                    for row in data:
                         if inst_id and "instId" not in row:
                             row["instId"] = inst_id
                         if channel == "liquidation-orders":
@@ -2295,9 +2407,15 @@ async def balina_ws_loop() -> None:
                         elif channel == "trades":
                             _balina_process_trade(row)
                         elif channel == BALINA_WS_BOOK_CHANNEL:
-                            _balina_process_book(row,msg.get("action","snapshot"))
+                            try:
+                                _balina_process_book(row,msg.get("action","snapshot"))
+                            except _BookGap as gap:
+                                if gap.symbol not in resync:
+                                    resync.append(gap.symbol)
+                    if resync:
+                        await _balina_ws_resync_books(ws, resync, gap_times)
                     if time.time() - last_symbol_check >= 30.0:
-                        current = {normalize_symbol(s) for s in list(COINS)[:MA_COIN_LIMIT]}
+                        current = set(_balina_ws_symbols())
                         if current != subscribed:
                             await _balina_ws_change_symbols(ws, subscribed, current)
                             subscribed = current
@@ -3475,7 +3593,7 @@ def build_v10_message(sig):
 
     signal_no_line = f"🆔 Sinyal #{int(safe_float(sig.get('signal_no')))}\n" if sig.get("signal_no") else ""
     return (f"{signal_no_line}{trend_line}"
-            f"🎯 {VERSION_NAME}\n🆕 V12.1.0 | {sig['direction']} | {sig['symbol']}\n"
+            f"🎯 {VERSION_NAME}\n🆕 {BOT_BUILD} | {sig['direction']} | {sig['symbol']}\n"
             f"Yapı: {sig['structure']} | 1H:{sig['trend_1h']} 4H:{sig['trend_4h']}\n"
             f"BTC: 1H:{sig.get('btc_1h','-')} 4H:{sig.get('btc_4h','-')}"
             + (f" | Coin 1H EMA: {sig.get('coin_1h_ema','-')}" if sig.get('coin_1h_ema') else "") + "\n"
@@ -3982,7 +4100,7 @@ def health_raporu_uret() -> str:
         disk_free = 0.0
     ws_age = max(0.0, now - safe_float(_BALINA_WS_STATUS.get("last_message_ts"), now))
     return (
-        "🏥 V12.1.0 SİSTEM SAĞLIĞI\n"
+        f"🏥 {BOT_BUILD} SİSTEM SAĞLIĞI\n"
         f"Çalışma süresi: {(now-safe_float(_RUNTIME_HEALTH.get('started_ts')))/3600:.1f} saat\n"
         f"Tarama yaşı: {now-safe_float(_RUNTIME_HEALTH.get('scan_heartbeat')):.1f} sn\n"
         f"Paper takip yaşı: {now-safe_float(_RUNTIME_HEALTH.get('paper_heartbeat')):.1f} sn\n"
@@ -4034,7 +4152,7 @@ async def kurumsal_bakim_loop() -> None:
             if sorunlar and HEALTH_ALERT_ENABLED and now - safe_float(_RUNTIME_HEALTH.get("last_health_alert_ts")) >= HEALTH_ALERT_COOLDOWN_SEC:
                 _RUNTIME_HEALTH["last_health_alert_ts"] = now
                 stats["health_alert"] = int(stats.get("health_alert", 0)) + 1
-                await safe_send_telegram("🚨 V12.1.0 SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
+                await safe_send_telegram(f"🚨 {BOT_BUILD} SAĞLIK ALARMI\n" + "\n".join(f"• {x}" for x in sorunlar))
         except Exception as e:
             logger.exception("kurumsal_bakim_loop hata: %s", e)
         await asyncio.sleep(max(15, HEALTH_CHECK_INTERVAL_SEC))
@@ -4210,7 +4328,7 @@ def _kombinasyon_metrik(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     n,nc = len(rows),len(closed)
     return {'toplam':n,'kapanan':nc,
             'temiz_pct':sum(r.get('sonuc_tipi')=='TEMIZ_STOP' for r in closed)/nc*100 if nc else None,
-            **{f'tp{i}_pct':sum(bool(r.get(f'hit{i}')) for r in rows)/n*100 if n else None for i in range(1,5)},
+            **{f'tp{i}_pct':sum(bool(r.get(f'hit{i}')) for r in closed)/nc*100 if nc else None for i in range(1,5)},
             'r':_mean_present(closed,'r_value'),'net_r':_mean_present(closed,'net_r_value'),
             'mfe':_mean_present(rows,'mfe_pct'),'mae':_mean_present(rows,'mae_pct')}
 
@@ -4230,8 +4348,9 @@ def kombinasyon_raporu_uret() -> str:
               ('Beş şart',('oi','coin_ema','range','kapanis','spoof')))
     for r in rows:
         r['_conditions'] = _kombinasyon_kosullari(r)
+    zs = []
     lines = [f'🧪 KOMBİNASYON LABORATUVARI | Min kapanan hücre: {KOMBINASYON_MIN_KAPANIS}',_report_scope(),
-             'TP ve MFE/MAE açık+kapalı; R ve temiz stop yalnız kapananlardan. Açık sonuçlar tamamlanmamıştır.',
+             'TP oranları yalnız kapananlar üzerinden (TP2-4 = TP1 sonrası izleme teması, gerçekleşmiş kâr değil); MFE/MAE açık+kapalı.',
              'Ölçümsüz kayıtlar karşılaştırmadan çıkarılır. Hiçbir kombinasyon sinyal kesmez.']
     for control,name in ((0,'NORMAL'),(1,'KONTROL')):
         group = [r for r in rows if r['kontrol']==control]
@@ -4241,7 +4360,7 @@ def kombinasyon_raporu_uret() -> str:
             for label,keys in combos:
                 a,b,u = _combo_partition(base,keys)
                 lines.append('\n• '+label)
-                lines.extend(_comparison_lines(a,b,len(u)))
+                lines.extend(_comparison_lines(a,b,len(u),zs))
         lines.append(f'\n{name} / BALİNA DURUMU + YÖN')
         for side in ('LONG','SHORT'):
             base = [r for r in group if r['side']==side]
@@ -4251,13 +4370,19 @@ def kombinasyon_raporu_uret() -> str:
             for state,a in sorted(states.items()):
                 b = [r for s,items in states.items() if s!=state for r in items]
                 lines.append(f'\n• {state} / {side}')
-                lines.extend(_comparison_lines(a,b))
+                lines.extend(_comparison_lines(a,b,0,zs))
+    k = len(zs)
+    if k:
+        bonf = NormalDist().inv_cdf(1 - 0.025 / k)
+        lines.append(f'\n🔎 ÇOKLU TEST UYARISI: {k} karşılaştırma yapıldı; |z|≥1.96 olan {sum(abs(z)>=1.96 for z in zs)} adet, '
+                     f'yalnız tesadüfle beklenen ≈{0.05*k:.1f}. Bonferroni eşiği |z|≥{bonf:.2f}: {sum(abs(z)>=bonf for z in zs)} karşılaştırma geçti '
+                     '(gruplar örtüştüğü için yaklaşık). Bunlar hipotezdir; aynı veride seçilen filtre ileri doğrulama olmadan karar değildir.')
     return '\n'.join(lines)
 
 
 def dogrulama_raporu_uret() -> str:
     rows = _report_rows()
-    lines = ['📐 V12.1.0 İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
+    lines = [f'📐 {BOT_BUILD} İLERİ DOĞRULAMA',_report_scope(),f'Minimum kapanış: {VALIDATION_MIN_CLOSED}',
              'Maliyet girişte dondurulur; net R komisyon/kayma/funding varsayımı sonrasıdır.']
     if VALIDATION_START_TS<=0:
         lines.append('Sabit ileri doğrulama başlangıcı tanımlanmadı; sonuçlar betimseldir, karar yok.')
@@ -4274,6 +4399,7 @@ def dogrulama_raporu_uret() -> str:
             lines.append(f'{label}: n={len(part)} | Brüt EV '+_metric(_mean_present(part,'r_value'))+
                          'R | Net EV '+_metric(_mean_present(part,'net_r_value'))+'R | '+
                          ('karar yok' if len(part)<VALIDATION_MIN_CLOSED or VALIDATION_START_TS<=0 else 'örnek eşiği tamam; tek başına karar değildir'))
+            lines.append('  '+_ev_ci_line('Net EV', [r.get('net_r_value') for r in part]))
         for side in ('LONG','SHORT'):
             part = [r for r in closed if r['side']==side]
             lines.append(f'{side}: n={len(part)} | Net EV '+_metric(_mean_present(part,'net_r_value'))+
@@ -4303,7 +4429,7 @@ def selftest_raporu_uret() -> str:
     test("DB mevcut", os.path.exists(OLCUM_DB))
     ok, detay = db_integrity_kontrol()
     test("DB integrity", ok)
-    lines = ["🧪 V12.1.0 ÖZ TEST"]
+    lines = [f"🧪 {BOT_BUILD} ÖZ TEST"]
     lines.extend(f"{'✅' if sonuc else '❌'} {ad}" for ad, sonuc in testler)
     lines.append(f"Sonuç: {sum(1 for _, x in testler if x)}/{len(testler)} geçti")
     lines.append(f"DB: {detay}")
@@ -4379,7 +4505,7 @@ async def cmd_test(update, context):
 async def cmd_status(update, context):
     if not telegram_yetkili(update):
         return
-    text = await _db_call(status_raporu_uret)
+    text = await _read_call(status_raporu_uret)
     for part in telegram_parcala(text):
         await update.message.reply_text(part)
 
@@ -4392,7 +4518,7 @@ async def cmd_coin(update, context):
     symbol = normalize_symbol(context.args[0])
     res = await analyze_v10_symbol(symbol)
     if not res:
-        await update.message.reply_text(f"{symbol} için V12.1.0 sinyali yok.")
+        await update.message.reply_text(f"{symbol} için {BOT_BUILD} sinyali yok.")
         return
     for part in telegram_parcala('ÖN ANALİZ — deftere sinyal açılmadı; giriş tekrar fiyatlanır.\n'+build_v10_message(res)):
         await update.message.reply_text(part)
@@ -4402,7 +4528,7 @@ async def cmd_v10(update, context):
         return
     mp = _v10_mem()
     lines = [
-        f"🆕 V12.1.0 ULTRA motor durumu",
+        f"🆕 {BOT_BUILD} ULTRA motor durumu",
         f"Açık: {len(mp['open'])} | Sinyal: {stats.get('v10_signals', 0)}",
         f"Session: {session_belirle()[0]}",
         f"VWAP: {'AKTİF' if VWAP_ENABLED else 'kapalı'} | ADX: {'AKTİF' if ADX_ENABLED else 'kapalı'}",
@@ -4489,7 +4615,7 @@ async def cmd_risk(update, context):
         return
     d = await asyncio.to_thread(risk_durumu)
     await update.message.reply_text(
-        "🛡 V12.1.0 RİSK MOTORU\n"
+        f"🛡 {BOT_BUILD} RİSK MOTORU\n"
         f"Motor: {'AKTİF' if RISK_ENGINE_ENABLED else 'ölçüm/kapalı'}\n"
         f"Acil durdurma: {'AKTİF' if d['kill_switch'] else 'kapalı'}\n"
         f"Günlük: {d['daily_r']:+.2f}R / -{abs(RISK_MAX_DAILY_R):.2f}R\n"
@@ -4660,6 +4786,8 @@ async def cmd_ws(update, context):
         f"Mesaj: {stats.get('balina_ws_message', 0)} | İşlem: {stats.get('balina_trade', 0)} | "
         f"Balina: {stats.get('balina_whale', 0)} | Spoof: {stats.get('balina_spoof', 0)}\n"
         f"Bağlanma/Kopma: {stats.get('balina_ws_connect', 0)}/{stats.get('balina_ws_disconnect', 0)}\n"
+        f"Book boşluğu/yeniden abonelik: {stats.get('balina_book_gap', 0)}/{stats.get('balina_book_resync', 0)} | "
+        f"Reddedilen sembol: {stats.get('balina_ws_bad_symbol', 0)}\n"
         f"Son hata: {_BALINA_WS_STATUS.get('last_error') or '-'}"
     )
 
@@ -4828,6 +4956,8 @@ def main() -> None:
 
 # === V12.1.0 kalıcı defter / bildirim kuyruğu ===
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger")
+# V12.1.1: ağır raporlar (tüm defteri tarar) tek yazıcı thread'ini bloklamasın diye ayrı okuma havuzu.
+_READ_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, YAMA_READ_WORKERS), thread_name_prefix="ledger-ro")
 _OKX_SLOTS = asyncio.Semaphore(OKX_EXECUTOR_WORKERS)
 _SIGNAL_LOCK = asyncio.Lock()
 _BACKGROUND_TASKS = set()
@@ -4871,8 +5001,13 @@ async def _db_call(fn, *args):
         raise
 
 
+async def _read_call(fn, *args):
+    """Salt-okunur rapor çağrısı: yazıcı (ledger) thread'ini beklemez; WAL sayesinde yazmayı da engellemez."""
+    return await asyncio.get_running_loop().run_in_executor(_READ_EXECUTOR, functools.partial(fn, *args))
+
+
 def _cohort():
-    return f"V12.1.0-TP1FULL:{config_fingerprint()}"
+    return f"{COHORT_ID}:{config_fingerprint()}"
 
 
 def _adx_regime(value):
@@ -5155,6 +5290,7 @@ async def post_shutdown(application):
         await post_stop(application)
     await asyncio.to_thread(OKX_EXECUTOR.shutdown, wait=True, cancel_futures=True)
     await asyncio.to_thread(_DB_EXECUTOR.shutdown, wait=True, cancel_futures=True)
+    await asyncio.to_thread(_READ_EXECUTOR.shutdown, wait=True, cancel_futures=True)
     for session in _HTTP_SESSIONS:
         session.close()
     SESSION.close()
@@ -5304,6 +5440,18 @@ async def golge_tur():
 
 def _report_rows():
     rows = olcum_db_ortak_satirlari()
+    # V12.1.1: TP1 tam kapanışta ana kayıtta hit2-4 hiç işaretlenmez; TP1 sonrası temaslar 'continuation'
+    # tablosundadır. Bu birleştirme olmadan /kombinasyon TP2-4 sütunları yapısal olarak hep %0 çıkıyordu.
+    try:
+        follows = {p['uid']: p for p in _follow_rows(False, 'MAIN')}
+    except Exception:
+        follows = {}
+    for r in rows:
+        f = follows.get(r['uid'])
+        if f:
+            hits = f.get('follow_hits') or []
+            for i in range(2, 5):
+                r[f'hit{i}'] = bool(r.get(f'hit{i}')) or (i in hits)
     if REPORT_CURRENT_COHORT_ONLY:
         rows = [r for r in rows if r.get('cohort')==_cohort()]
     if REPORT_REQUIRE_COMPLETE:
@@ -5317,8 +5465,67 @@ def _report_scope():
     excluded=len(rows)-len(included)
     with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
         waiting=sum(bool(json.loads(p or '{}').get('history_gap')) for p, in conn.execute('SELECT position_json FROM olcum_pozisyon'))
+    funding_notu = ('\n⚠️ Net EV funding maliyeti İÇERMİYOR (SIM_FUNDING_COST_PCT=0); gerçekte net sonuç daha düşüktür.'
+                    if SIM_FUNDING_COST_PCT <= 0 else '')
     return (f'Yeni seri: {_cohort()} | Toplam {len(rows)} | Dahil {len(included)} | Kapsam/veri nedeniyle dışlanan {excluded} | Mum bekleyen {waiting}\n'
-            'Eski sürüm ve gizli motor hariç. Girişin <1 saniyesi atlanır; aynı saniyede STOP önce kabul edilir.')
+            'Eski sürüm ve gizli motor hariç. Girişin <1 saniyesi atlanır; aynı saniyede STOP önce kabul edilir.'+funding_notu)
+
+
+_T95 = (None, 12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052,
+        2.048, 2.045, 2.042)  # iki yönlü %95 t kritik değerleri, df=1..30
+
+
+def _ev_ozet(values):
+    v = [safe_float(x) for x in values if x is not None]
+    n = len(v)
+    if n < 2:
+        return None
+    mean = sum(v) / n
+    sd = math.sqrt(sum((x - mean) ** 2 for x in v) / (n - 1))
+    se = sd / math.sqrt(n)
+    t = _T95[n - 1] if n - 1 < len(_T95) else 1.96
+    return {"n": n, "mean": mean, "sd": sd, "se": se, "lo": mean - t * se, "hi": mean + t * se}
+
+
+def _ev_ci_line(label, values):
+    s = _ev_ozet(values)
+    if not s:
+        return f"{label}: güven aralığı için n yetersiz"
+    if s["lo"] <= 0 <= s["hi"]:
+        yorum = "sıfırdan ayırt edilemez"
+    elif s["lo"] > 0:
+        yorum = "GA sıfırın üstünde (tek başına kanıt değil; ileri doğrulama gerekir)"
+    else:
+        yorum = "GA sıfırın altında"
+    return (f"{label} %95 GA [{s['lo']:+.3f}, {s['hi']:+.3f}]R | SE ±{s['se']:.3f} | n={s['n']} → {yorum}")
+
+
+def _welch_z(a, b):
+    sa, sb = _ev_ozet(a), _ev_ozet(b)
+    if not sa or not sb:
+        return None
+    se = math.sqrt(sa["sd"] ** 2 / sa["n"] + sb["sd"] ** 2 / sb["n"])
+    return None if se <= 0 else (sa["mean"] - sb["mean"]) / se
+
+
+def _basabas_satiri(closed):
+    """TP1 tam kapanışta başabaş TP1 oranı ≈ (1+maliyet)/(RR+1); gözlenen oranla SE birlikte gösterilir."""
+    rrs = [safe_float((p.get("tp_rrs") or [None])[0]) for p in closed if p.get("tp_rrs")]
+    costs = [safe_float(p.get("r_value")) - safe_float(p.get("net_r_value"))
+             for p in closed if p.get("r_value") is not None and p.get("net_r_value") is not None]
+    n = len(closed)
+    if not rrs or n < 2:
+        return ""
+    rr = sum(rrs) / len(rrs)
+    if rr <= 0:
+        return ""
+    cost = sum(costs) / len(costs) if costs else 0.0
+    breakeven = (1 + cost) / (rr + 1)
+    observed = sum(p.get("status") == "TP1" for p in closed) / n
+    se = math.sqrt(max(observed * (1 - observed), 0.0) / n)
+    return (f"Başabaş TP1 oranı ≈ %{breakeven*100:.1f} (RR {rr:.2f}, maliyet {cost:.3f}R; TIME_EXIT varsa yaklaşık) | "
+            f"gözlenen %{observed*100:.1f} ± %{se*100:.1f} (SE)")
 
 
 def _metric(value, digits=3):
@@ -5339,7 +5546,7 @@ def _combo_partition(rows,keys):
     return passed,failed,unknown
 
 
-def _comparison_lines(first,second,unknown=0):
+def _comparison_lines(first,second,unknown=0,sink=None):
     a,b = _kombinasyon_metrik(first),_kombinasyon_metrik(second)
     lines = [_kombinasyon_metrik_satiri('Geçen',a),_kombinasyon_metrik_satiri('Geçmeyen',b),
              f'Ölçümsüz: {unknown}']
@@ -5350,6 +5557,16 @@ def _comparison_lines(first,second,unknown=0):
     ready = min(a['kapanan'],b['kapanan'])>=KOMBINASYON_MIN_KAPANIS
     lines.append(('ÖRNEK EŞİĞİ TAMAM; ileri doğrulama gerekir' if ready else 'KARAR YOK')+
                  f": kapanan geçen={a['kapanan']}, geçmeyen={b['kapanan']}")
+    za = [r.get('net_r_value') for r in first if r.get('durum') not in ('ACIK',None) and r.get('net_r_value') is not None]
+    zb = [r.get('net_r_value') for r in second if r.get('durum') not in ('ACIK',None) and r.get('net_r_value') is not None]
+    z = _welch_z(za, zb)
+    if z is None:
+        lines.append('İstatistik: Net R farkı için her grupta ≥2 kapanış gerekir')
+    else:
+        lines.append(f"İstatistik: ΔNetR z={z:+.2f} → "+('gürültü içinde' if abs(z)<1.96 else 'tek karşılaştırmada anlamlı görünüyor')+
+                     ' (çoklu karşılaştırma düzeltmesiz)')
+        if sink is not None:
+            sink.append(z)
     return lines
 
 
@@ -6129,6 +6346,10 @@ def _engine_report(engine):
             f'TP1 tam kapanış: {_ratio(tp,len(closed))} | TP görmeden stop: {_ratio(stop,len(closed))}',
             f"Süre çıkışı: {sum(p.get('status')=='TIME_EXIT' for p in closed)} | Brüt EV {_metric(_mean_present(closed,'r_value'))}R | Net EV {_metric(_mean_present(closed,'net_r_value'))}R",
             f"MFE/MAE (gerçek pozisyon): %{_metric(_mean_present(group,'mfe_pct'))}/%{_metric(_mean_present(group,'mae_pct'))}"])
+        lines.append(_ev_ci_line('Net EV', [p.get('net_r_value') for p in closed]))
+        be = _basabas_satiri(closed)
+        if be:
+            lines.append(be)
         mfe=[p['mfe_pct'] for p in group if p.get('mfe_pct') is not None]
         mae=[p['mae_pct'] for p in group if p.get('mae_pct') is not None]
         lines.append('MFE dağılımı: '+ ' | '.join(f'{label} %{_metric(yuzdelik(mfe,q) if mfe else None)}' for label,q in (('medyan',.5),('p75',.75),('p90',.9))))
@@ -6200,18 +6421,18 @@ def _archive_report():
 
 async def cmd_eskisurum(update,context):
     if not telegram_yetkili(update):return
-    for part in telegram_parcala(await _db_call(_archive_report)):await update.message.reply_text(part)
+    for part in telegram_parcala(await _read_call(_archive_report)):await update.message.reply_text(part)
 
 
 async def cmd_gizli(update,context):
     if not telegram_yetkili(update):return
     for fn in (_engine_report,_target_report,_shadow_report):
-        for part in telegram_parcala(await _db_call(fn,'GIZLI')):await update.message.reply_text(part)
+        for part in telegram_parcala(await _read_call(fn,'GIZLI')):await update.message.reply_text(part)
 
 
 async def cmd_hedefler(update,context):
     if not telegram_yetkili(update):return
-    for part in telegram_parcala(await _db_call(_target_report,'MAIN')):await update.message.reply_text(part)
+    for part in telegram_parcala(await _read_call(_target_report,'MAIN')):await update.message.reply_text(part)
 
 
 def _new_storage_preflight():
