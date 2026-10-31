@@ -393,6 +393,8 @@ for _new in (OLCUM_DB, MEMORY_FILE, BALINA_DB):
     if os.path.realpath(_new) in {os.path.realpath(p) for p in (ESKI_OLCUM_DB, ESKI_MEMORY_FILE, ESKI_BALINA_DB)}:
         raise RuntimeError("Yeni ve eski dosya yolları aynı olamaz; arşiv korunmalıdır")
 DB_BACKUP_DIR = os.path.join(DB_BACKUP_DIR, "v12_1")
+RSI_HIBRIT_ENABLED = os.getenv("RSI_HIBRIT_ENABLED", "true").lower() == "true"
+RSI_HIBRIT_MAX_OPEN = int(os.getenv("RSI_HIBRIT_MAX_OPEN", "400"))
 GIZLI_ENABLED = os.getenv("GIZLI_ENABLED", "true").lower() == "true"
 GIZLI_TELEGRAM_ENABLED = os.getenv("GIZLI_TELEGRAM_ENABLED", "false").lower() == "true"
 GIZLI_MAX_OPEN = int(os.getenv("GIZLI_MAX_OPEN", "400"))
@@ -585,6 +587,8 @@ def config_fingerprint() -> str:
                 'HISTORY_', 'TAKIP_', 'MIN_24H_', 'MAX_24H_', 'EXCLUDE_', 'ADAPTIVE_', 'DATA_', 'SCORE_', 'MEXC_', 'LIQ_')
     values = {}
     for key,value in list(globals().items()):
+        if key.startswith('RSI_HIBRIT_'):
+            continue
         if not key.startswith(prefixes) or any(x in key for x in ('TOKEN','SECRET','KEY','URL','DB')):
             continue
         if isinstance(value,(str,int,float,bool)):
@@ -3981,6 +3985,7 @@ async def v10_scan_loop() -> None:
                         stats["v10_candidates"] = int(stats.get("v10_candidates", 0)) + 1
                         await gizli_aday(res)
                         await maybe_send_v10_signal(res)
+                        rsi_aday_kuyruga(res)
                 await asyncio.sleep(max(0.1, min(HOT_SCAN_INTERVAL_SEC, 2.0)))
         except Exception as e:
             logger.exception("v10_scan_loop hata: %s", e)
@@ -4457,6 +4462,7 @@ async def post_init(application) -> None:
         f'TP1 tam kapanış; TP2/3/4 yalnız izleme. Gizli bildirim: {GIZLI_TELEGRAM_ENABLED}\n'
         f'Ölçüm modu: {OLCUM_MODU} | Kontrol oranı: %{OLCUM_RASTGELE_ORAN*100:.1f}\n'
         f'Ölçüm kaydı: {count} pozisyon | Açık {len(mp["open"])} | İzleme {follow_count} | Gizli açık {hidden_open}\n'
+        f'RSI hibrit ters yön: {RSI_HIBRIT_ENABLED} | Bildirim: False | /rsi\n'
         f'RSI: {RSI_METHOD} | Skor: {SCORE_MODE} | CVD: {SCORE_CVD_SOURCE}\n'
         f'MEXC ikincil veri: {MEXC_ENABLED} | Süre çıkışı: {TIME_EXIT_MODE}\n'
         f'Balina motoru: {BALINA_MOTOR_ENABLED} | WS defter kanalı: {BALINA_WS_BOOK_CHANNEL}\n'
@@ -4466,7 +4472,7 @@ async def post_init(application) -> None:
         '\n'+'\n'.join(_persistence_warnings()))
     # Startup bildirimi tarama/paper başlamasını bekletmez.
     await _db_call(_enqueue_system_notification,text)
-    for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop,yeni_motor_loop):
+    for factory in (symbol_refresh_loop,v10_scan_loop,v10_paper_loop,golge_loop,save_loop,notification_loop,yeni_motor_loop,rsi_aday_loop,rsi_motor_loop):
         _start_loop(factory)
     if MEXC_ENABLED:
         _start_loop(mexc_market_loop)
@@ -4482,7 +4488,7 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
-        "/eskisürüm - eski defter (salt okunur)\n/gizli - sessiz motor raporu\n/hedefler - alternatif kapanışlar\n/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
+        "/eskisürüm - eski defter (salt okunur)\n/gizli - sessiz motor raporu\n/rsi veya /rsı - ters yön RSI hibrit testi\n/hedefler - alternatif kapanışlar\n/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
         "/kombinasyon - koşul ve kombinasyon laboratuvarı\n"
         "/dogrulama - ileri doğrulama ve net maliyet raporu\n"
@@ -4855,6 +4861,8 @@ def build_app():
     app.add_handler(MessageHandler(filters.Regex(r"^/eskisürüm(?:@\w+)?(?:\s|$)"), cmd_eskisurum))
     app.add_handler(CommandHandler("eskisurum", cmd_eskisurum))
     app.add_handler(CommandHandler("gizli", cmd_gizli))
+    app.add_handler(CommandHandler("rsi", cmd_rsi))
+    app.add_handler(MessageHandler(filters.Regex(r"^/rsı(?:@\w+)?(?:\s|$)"), cmd_rsi))
     app.add_handler(CommandHandler("hedefler", cmd_hedefler))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -4926,6 +4934,8 @@ def validate_config() -> None:
         raise RuntimeError(f"OLCUM_DB dizini oluşturulamadı: {db_dizin}: {e}") from e
 
 
+    if RSI_HIBRIT_MAX_OPEN < 1:
+        raise RuntimeError('RSI_HIBRIT_MAX_OPEN en az 1 olmalı')
     if GIZLI_MAX_OPEN<1 or not math.isfinite(GIZLI_MIN_OI_PCT) or not all(math.isfinite(x) and x>0 for x in (TAKIP_SAAT,GOLGE_SAAT)):
         raise RuntimeError('Gizli limit ve izleme süreleri geçersiz')
     if any(k not in OLCUM_KAPILARI for k in GIZLI_GEREKLI_KAPILAR):
@@ -6078,6 +6088,8 @@ def yeni_motor_db_init():
             raise RuntimeError('Defter motor kimliği uyumsuz')
         conn.execute('CREATE TABLE IF NOT EXISTS gizli_position (uid TEXT PRIMARY KEY,symbol TEXT NOT NULL,candle TEXT NOT NULL,side TEXT NOT NULL,status TEXT NOT NULL,position_json TEXT NOT NULL,UNIQUE(symbol,candle))')
         conn.execute('CREATE INDEX IF NOT EXISTS gizli_status ON gizli_position(status,symbol)')
+        conn.execute('CREATE TABLE IF NOT EXISTS rsi_position (uid TEXT PRIMARY KEY,symbol TEXT NOT NULL,candle TEXT NOT NULL,side TEXT NOT NULL,status TEXT NOT NULL,position_json TEXT NOT NULL,UNIQUE(symbol,candle))')
+        conn.execute('CREATE INDEX IF NOT EXISTS rsi_status ON rsi_position(status,symbol)')
         conn.execute('CREATE TABLE IF NOT EXISTS continuation (uid TEXT PRIMARY KEY,engine TEXT NOT NULL,symbol TEXT NOT NULL,phase TEXT NOT NULL,payload TEXT NOT NULL)')
         conn.execute('CREATE INDEX IF NOT EXISTS continuation_phase ON continuation(phase,symbol)')
         conn.execute("INSERT OR IGNORE INTO schema_meta VALUES('v12_1_started',?)",(str(time.time()),))
@@ -6162,7 +6174,7 @@ def _follow_insert(conn,pos,outcome,engine):
             reached=observation['hi']>=p[f'tp{i}'] if p['side']=='LONG' else observation['lo']<=p[f'tp{i}']
             if reached:
                 p['follow_hits'].append(i);p['targets'][str(i)]={'state':'TP','r':rrs[i-1]}
-                if engine=='MAIN' or GIZLI_TELEGRAM_ENABLED:
+                if engine=='MAIN' or (engine=='GIZLI' and GIZLI_TELEGRAM_ENABLED):
                     _outbox_insert(conn,p['uid']+f':POST_TP{i}',p,'FOLLOW' if engine=='MAIN' else 'GIZLI',
                         f"{'GİZLİ ' if engine=='GIZLI' else ''}#{p.get('signal_no',0)} | {p['symbol']} | TP{i} {rrs[i-1]:.3f}R teması\nTP1 ile aynı kapanış saniyesi; gerçekleşen TP1 sonucu değişmez.")
         if len(p['follow_hits'])==4:p['phase']='DONE'
@@ -6232,7 +6244,7 @@ def _follow_save(p,events):
     with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
         conn.execute('BEGIN IMMEDIATE')
         conn.execute('UPDATE continuation SET phase=?,payload=? WHERE uid=?',(p['phase'],_json(p),p['uid']))
-        if p['engine']=='MAIN' or GIZLI_TELEGRAM_ENABLED:
+        if p['engine']=='MAIN' or (p['engine']=='GIZLI' and GIZLI_TELEGRAM_ENABLED):
             for key,text in events:
                 label='GİZLİ ' if p['engine']=='GIZLI' else ''
                 _outbox_insert(conn,p['uid']+':'+key,p,'GIZLI' if p['engine']=='GIZLI' else 'FOLLOW',
@@ -6319,6 +6331,7 @@ async def yeni_motor_loop():
 
 
 def _engine_positions(engine):
+    if engine=='RSI':return _rsi_rows()
     if engine=='GIZLI':return _gizli_rows()
     with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
         result=[]
@@ -6333,13 +6346,13 @@ def _ratio(n,total):
 
 def _engine_report(engine):
     rows=_engine_positions(engine);follows=_follow_rows(False,engine)
-    lines=[f"📊 {BOT_BUILD} | {'ANA MOTOR' if engine=='MAIN' else 'GİZLİ MOTOR'} | TP1 %100 kapanış",
+    lines=[f"📊 {BOT_BUILD} | {'ANA MOTOR' if engine=='MAIN' else 'RSI HİBRİT TERS YÖN' if engine=='RSI' else 'GİZLİ MOTOR'} | TP1 %100 kapanış",
         'Eski sürüm ve diğer motor hariç; TP sonrası temaslar gerçekleşmiş kâr değildir.']
     lines.append(f'Toplam {len(rows)} | Açık {sum(p.get("status","ACIK")=="ACIK" for p in rows)} | Kapalı {sum(p.get("status","ACIK")!="ACIK" for p in rows)}')
     if engine=='GIZLI':lines.append(f'Bildirim: {GIZLI_TELEGRAM_ENABLED} | Aday filtreler: OI > %{GIZLI_MIN_OI_PCT:g}, '+','.join(GIZLI_GEREKLI_KAPILAR))
     for control,name in ((False,'NORMAL'),(True,'KONTROL')):
         group=[p for p in rows if bool(p.get('kontrol'))==control]
-        if engine=='GIZLI' and control:continue
+        if engine in ('GIZLI','RSI') and control:continue
         closed=[p for p in group if p.get('status','ACIK')!='ACIK']
         tp=sum(p.get('status')=='TP1' for p in closed);stop=sum(p.get('status')=='STOP' for p in closed)
         lines.extend([f'\n{name}: toplam {len(group)} | açık {len(group)-len(closed)} | kapanan {len(closed)}',
@@ -6365,7 +6378,7 @@ def _target_report(engine):
     rows=_engine_positions(engine);fs={p['uid']:p for p in _follow_rows(False,engine)}
     lines=['📐 ALTERNATİF TAM KAPANIŞ | ana sonuca yazılmaz',f'İzleme ufku {TAKIP_SAAT:g} saat. Aynı saniyede stop önce; eksik veri karar dışı.']
     for control,name in ((False,'NORMAL'),(True,'KONTROL')):
-        if engine=='GIZLI' and control:continue
+        if engine in ('GIZLI','RSI') and control:continue
         group=[p for p in rows if bool(p.get('kontrol'))==control]
         lines.append(name)
         for target in range(1,5):
@@ -6387,7 +6400,7 @@ def _shadow_report(engine):
     fs=[p for p in _follow_rows(False,engine) if p.get('stop_ts') is not None]
     lines=[f'👻 STOP SONRASI | {engine} | Eski sürüm hariç',f'İzleme {GOLGE_SAAT:g} saat; eksik aralık kapanmadan tamamlanmaz.']
     for control,name in ((False,'NORMAL'),(True,'KONTROL')):
-        if engine=='GIZLI' and control:continue
+        if engine in ('GIZLI','RSI') and control:continue
         group=[p for p in fs if bool(p.get('kontrol'))==control];done=[p for p in group if p.get('shadow_complete')]
         lines.append(f'{name}: stop {len(group)} | biten {len(done)} | izlenen {sum(p["phase"]=="AFTER_STOP" for p in group)} | kapalı izleme {sum(not p.get("shadow_enabled",True) for p in group)}')
         for i in range(1,5):
@@ -6451,6 +6464,147 @@ def _new_storage_preflight():
         if m.get('v12_1_identity')!='V12.1-TP1FULL' and any(m.get('v10_paper',{}).get(k) for k in ('open','closed','golge')):
             raise RuntimeError('Yeni JSON yolunda eski kayıtlar var; ayrı dosya seçin')
 
+
+
+def _rsi_can_open(symbol,candle):
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        if conn.execute("SELECT COUNT(*) FROM rsi_position WHERE status='ACIK'").fetchone()[0]>=RSI_HIBRIT_MAX_OPEN:return False
+        return conn.execute("SELECT 1 FROM rsi_position WHERE symbol=? AND (status='ACIK' OR candle=?)",(symbol,candle)).fetchone() is None
+
+def _rsi_insert(pos):
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute("SELECT 1 FROM rsi_position WHERE symbol=? AND (status='ACIK' OR candle=?)",(pos['symbol'],pos['candle_ts'])).fetchone():return None
+        if conn.execute("SELECT COUNT(*) FROM rsi_position WHERE status='ACIK'").fetchone()[0]>=RSI_HIBRIT_MAX_OPEN:return None
+        old=conn.execute("SELECT value FROM schema_meta WHERE key='rsi_seq'").fetchone()
+        pos['signal_no']=int(old[0])+1 if old else 1
+        conn.execute('INSERT INTO rsi_position VALUES(?,?,?,?,?,?)',(pos['uid'],pos['symbol'],pos['candle_ts'],pos['side'],'ACIK',_json(pos)))
+        conn.execute("INSERT OR REPLACE INTO schema_meta VALUES('rsi_seq',?)",(str(pos['signal_no']),))
+    return pos
+
+def _rsi_rows(active_only=False):
+    with sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        return [json.loads(p) for p, in conn.execute('SELECT position_json FROM rsi_position'+(" WHERE status='ACIK'" if active_only else ''))]
+
+def _rsi_step(p,r=None,outcome=None):
+    with _OLCUM_DB_LOCK,sqlite3.connect(OLCUM_DB,timeout=10) as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        current=conn.execute('SELECT status FROM rsi_position WHERE uid=?',(p['uid'],)).fetchone()
+        if not current or current[0]!='ACIK':return
+        p['status']=outcome or 'ACIK'
+        if outcome:
+            p['r_value']=r;p['net_r_value']=r-simulasyon_maliyet_r(p)
+            p['sonuc_tipi']=sonuc_tipi_belirle(outcome,p)
+            _follow_insert(conn,p,outcome,'RSI')
+        conn.execute('UPDATE rsi_position SET status=?,position_json=? WHERE uid=?',(p['status'],_json(p),p['uid']))
+
+# RSI hybrid v1: reverse normal candidate direction; no RSI threshold change.
+_RSI_LOCK = asyncio.Lock()
+_RSI_QUEUE = asyncio.Queue(maxsize=400)
+
+
+def rsi_aday_kuyruga(sig):
+    if not RSI_HIBRIT_ENABLED or sig.get('kontrol'):
+        return
+    try:
+        _RSI_QUEUE.put_nowait(copy.deepcopy(sig))
+    except asyncio.QueueFull:
+        stats['rsi_queue_drop'] = int(stats.get('rsi_queue_drop', 0)) + 1
+
+
+async def rsi_aday_loop():
+    while True:
+        sig = await _RSI_QUEUE.get()
+        try:
+            await rsi_aday(sig)
+        finally:
+            _RSI_QUEUE.task_done()
+
+
+def _rsi_reverse_signal(sig, quote, accepted_ts):
+    source_side = sig.get('direction')
+    if source_side not in ('LONG', 'SHORT'):
+        raise ValueError('RSI kaynak yönü geçersiz')
+    rsi = float(sig['rsi'])
+    if not math.isfinite(rsi) or not 0 <= rsi <= 100:
+        raise ValueError('RSI ölçümsüz/geçersiz')
+    side = 'SHORT' if source_side == 'LONG' else 'LONG'
+    entry = float(quote['price'])
+    if not math.isfinite(entry) or entry <= 0:
+        raise ValueError('RSI giriş fiyatı geçersiz')
+    s = copy.deepcopy(sig)
+    s.update(direction=side, entry=entry, entry_ref=entry, accepted_ts=accepted_ts,
+             entry_kaynak=quote['source'], kontrol=False)
+    s.update(v10_targets(side, entry))
+    # Gates describe the source candidate, not the reversed side.
+    s['kapi_sonuclari'] = {}
+    return s
+
+
+async def rsi_aday(sig):
+    if not RSI_HIBRIT_ENABLED or sig.get('kontrol'):
+        return
+    if RISK_KILL_SWITCH or _RUNTIME_HEALTH.get('emergency_stop'):
+        return
+    async with _RSI_LOCK:
+        try:
+            if not await _db_call(_rsi_can_open, sig['symbol'], str(sig['candle_ts'])):
+                return
+            side = 'SHORT' if sig['direction'] == 'LONG' else 'LONG'
+            quote = await _live_entry_quote(sig['symbol'], side)
+            s = _rsi_reverse_signal(sig, quote, time.time())
+            p = v10_open_paper(s, persist=False)
+            p.update(uid='RSI|'+p['uid'], engine='RSI', tp_weights=[1,0,0,0],
+                     cohort=_cohort()+':RSI-REVERSE-V1', source_side=sig['direction'],
+                     source_rsi=sig['rsi'], source_candle=str(sig['candle_ts']),
+                     source_signal_no=sig.get('signal_no'),
+                     source_gates=copy.deepcopy(sig.get('kapi_sonuclari', {})))
+            await _db_call(_rsi_insert, p)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            stats['rsi_error'] = int(stats.get('rsi_error',0)) + 1
+            logger.exception('RSI ters yön adayı kaydedilemedi')
+
+
+async def rsi_motor_loop():
+    while True:
+        # Existing positions remain tracked when new entries are disabled.
+        for p in await _db_call(_rsi_rows, True):
+            try:
+                rows, _ = await v107_takip_barlari(p)
+                r, outcome = _paper_process_rows(p, rows)
+                await _db_call(_rsi_step, p, r, outcome)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                stats['rsi_paper_error'] = int(stats.get('rsi_paper_error',0)) + 1
+                logger.exception('RSI takip hatası %s', p['uid'])
+        await asyncio.sleep(max(1, V107_TAKIP_ARALIK_SEC))
+
+
+def _rsi_report():
+    lines = [_engine_report('RSI'),
+             f"Yeni aday: {RSI_HIBRIT_ENABLED} | Otomatik bildirim: False",
+             'Kaynak: normal analiz adayları; rastgele kontrol hariç.',
+             'LONG → SHORT; SHORT → LONG. RSI sayısı ve kaynak eşikleri değiştirilmez.',
+             'Ana motor ile aynı stop/TP ayarları; kaynak kapılar ters yönde yeniden uygulanmaz.',
+             f"Kuyruk {_RSI_QUEUE.qsize()} | Atlanan {stats.get('rsi_queue_drop',0)} | Aday hatası {stats.get('rsi_error',0)} | Takip hatası {stats.get('rsi_paper_error',0)}"]
+    rows = _rsi_rows()
+    for side in ('LONG', 'SHORT'):
+        group = [p for p in rows if p['side'] == side]
+        closed = [p for p in group if p.get('status') != 'ACIK']
+        lines.append(f"Ters {side}: toplam {len(group)} | kapanan {len(closed)} | Net EV {_metric(_mean_present(closed,'net_r_value'))}R")
+    lines.append('Bağımsız paper deneyi; ana motorla birebir eşleşmiş performans karşılaştırması değildir.')
+    return '\n'.join(lines)
+
+
+async def cmd_rsi(update, context):
+    if not telegram_yetkili(update):
+        return
+    for fn, args in ((_rsi_report, ()), (_target_report, ('RSI',)), (_shadow_report, ('RSI',))):
+        for part in telegram_parcala(await _read_call(fn, *args)):
+            await update.message.reply_text(part)
 
 if __name__ == "__main__":
     main()
