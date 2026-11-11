@@ -28,11 +28,9 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-VERSION_NAME = "Balina Avcısı V12.1.1 KURUMSAL ÖLÇÜM PLATFORMU"
-BOT_BUILD = "V12.1.1"  # Bu çalıştırılabilir dosyanın sürümü; eski Railway etiketiyle karışmaz.
-# Ölçüm kohortu kimliği: V12.1.1 yalnız altyapı/rapor yamasıdır; sinyal, kapı ve çıkış mantığı
-# V12.1.0 ile aynı olduğundan kohort BİLEREK değiştirilmez (örnek bölünmesin, eski kayıtlar raporda kalsın).
-COHORT_ID = "V12.1.0-TP1FULL"
+VERSION_NAME = "Balina Avcısı V12.1.2 KURUMSAL ÖLÇÜM PLATFORMU"
+BOT_BUILD = "V12.1.2"  # Bu çalıştırılabilir dosyanın sürümü; eski Railway etiketiyle karışmaz.
+COHORT_ID = "V12.1.2-TP1FULL"
 
 # === V12.1.1 ALTYAPI YAMALARI ===
 # DİKKAT: Bu adlar config_fingerprint öneklerinden (BALINA_, SCORE_, DATA_ ...) BİLEREK farklı:
@@ -393,6 +391,15 @@ for _new in (OLCUM_DB, MEMORY_FILE, BALINA_DB):
     if os.path.realpath(_new) in {os.path.realpath(p) for p in (ESKI_OLCUM_DB, ESKI_MEMORY_FILE, ESKI_BALINA_DB)}:
         raise RuntimeError("Yeni ve eski dosya yolları aynı olamaz; arşiv korunmalıdır")
 DB_BACKUP_DIR = os.path.join(DB_BACKUP_DIR, "v12_1")
+# Yeni Railway deploy'una ayrı, geçici çalışma alanı; arşiv dosyası silinmez.
+if os.getenv("DEPLOY_RESET_ENABLED","false").lower()=="true":
+    deployment=os.getenv("RAILWAY_DEPLOYMENT_ID","").strip()
+    if not deployment:
+        raise RuntimeError("Deploy kimliği yok; defter başlatılmadı")
+    root=os.path.join("/tmp","balina-paper",hashlib.sha256(deployment.encode()).hexdigest())
+    os.makedirs(root,exist_ok=True)
+    OLCUM_DB,MEMORY_FILE,BALINA_DB,DB_BACKUP_DIR,LOG_FILE=[os.path.join(root,x) for x in
+        ("olcum.db","paper.json","akis.db","backups","bot.log")]
 RSI_HIBRIT_ENABLED = os.getenv("RSI_HIBRIT_ENABLED", "true").lower() == "true"
 RSI_HIBRIT_MAX_OPEN = int(os.getenv("RSI_HIBRIT_MAX_OPEN", "400"))
 GIZLI_ENABLED = os.getenv("GIZLI_ENABLED", "true").lower() == "true"
@@ -3192,11 +3199,6 @@ def v10_structure_gate(symbol, k1h, k4h, allowed_side=None):
         if blk:
             stats["v11_red_fomo"] = int(stats.get("v11_red_fomo", 0)) + 1
             continue
-        if V109_COIN_1H_UYUM:
-            _cy = v109_coin_1h_yon(k1h)
-            if (side == "LONG" and _cy != "UP") or (side == "SHORT" and _cy != "DOWN"):
-                stats["v11_red_coin_ema"] = int(stats.get("v11_red_coin_ema", 0)) + 1
-                continue
         pb, note = v10_pullback(side, k, ms)
         if not pb:
             stats["v10_red_pullback"] = int(stats.get("v10_red_pullback",0))+1
@@ -3645,6 +3647,7 @@ def v10_open_paper(sig, persist=True):
     poz = {
         "uid": f"{sig['symbol']}|{sig['direction']}|{time.time():.3f}|{uuid.uuid4().hex[:6]}",
         "symbol": sig["symbol"], "side": sig["direction"], "entry": sig["entry"],
+        "pair_id": sig.get("pair_id"),
         "orig_stop": sig["stop"],
         "tp1": sig["tp1"], "tp2": sig["tp2"], "tp3": sig["tp3"], "tp4": sig["tp4"],
         "hit1": False, "hit2": False, "hit3": False, "hit4": False,
@@ -3959,6 +3962,7 @@ async def maybe_send_v10_signal(sig):
         stats["v10_signals"] += 1
         stats["last_signal"] = f"{BOT_BUILD} #{pos['signal_no']} {side} {symbol}"
         logger.info("Paper sinyal kaydedildi #%s %s %s", pos["signal_no"], side, symbol)
+        return pos
 
 
 async def v10_scan_loop() -> None:
@@ -3984,7 +3988,11 @@ async def v10_scan_loop() -> None:
                     if res:
                         stats["v10_candidates"] = int(stats.get("v10_candidates", 0)) + 1
                         await gizli_aday(res)
-                        await maybe_send_v10_signal(res)
+                        if not res.get("kontrol"):
+                            res["pair_id"] = uuid.uuid4().hex
+                        opened = await maybe_send_v10_signal(res)
+                        if opened:
+                            res["signal_no"] = opened["signal_no"]
                         rsi_aday_kuyruga(res)
                 await asyncio.sleep(max(0.1, min(HOT_SCAN_INTERVAL_SEC, 2.0)))
         except Exception as e:
@@ -4488,7 +4496,7 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         f"{VERSION_NAME} aktif.\n"
-        "/eskisürüm - eski defter (salt okunur)\n/gizli - sessiz motor raporu\n/rsi veya /rsı - ters yön RSI hibrit testi\n/hedefler - alternatif kapanışlar\n/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
+        "/eskisürüm - eski defter (salt okunur)\n/gizli - sessiz motor raporu\n/yonrejim - yön ve rejime göre net R\n/rsi [ana sinyal no] veya /rsı - eşleşmiş aday ve ters yön testi\n/hedefler - alternatif kapanışlar\n/mexc COIN - ikincil borsa verisi\n/status - durum\n/test - test\n/v10 - motor durumu\n/coin SYMBOL - tek coin\n"
         "/kapi - kapı ölçüm raporu\n/tp - TP ve stop sonrası ölçüm raporu\n"
         "/kombinasyon - koşul ve kombinasyon laboratuvarı\n"
         "/dogrulama - ileri doğrulama ve net maliyet raporu\n"
@@ -4861,6 +4869,7 @@ def build_app():
     app.add_handler(MessageHandler(filters.Regex(r"^/eskisürüm(?:@\w+)?(?:\s|$)"), cmd_eskisurum))
     app.add_handler(CommandHandler("eskisurum", cmd_eskisurum))
     app.add_handler(CommandHandler("gizli", cmd_gizli))
+    app.add_handler(CommandHandler("yonrejim", cmd_yonrejim))
     app.add_handler(CommandHandler("rsi", cmd_rsi))
     app.add_handler(MessageHandler(filters.Regex(r"^/rsı(?:@\w+)?(?:\s|$)"), cmd_rsi))
     app.add_handler(CommandHandler("hedefler", cmd_hedefler))
@@ -6599,9 +6608,78 @@ def _rsi_report():
     return '\n'.join(lines)
 
 
+def _pair_note(stop, other):
+    obs = stop.get('exit_observation') or {}
+    a, d = obs.get('start_ts'), obs.get('duration')
+    if a is None or not d:
+        return 'stop zamanı ölçümsüz'
+    b = a+d
+    status = other.get('status','ACIK')
+    event = other.get('exit_observation') or {}
+    end = other.get('close_ts')
+    if end is not None and end <= a:
+        return 'karşı taraf önceden kapandı: '+status
+    if other['open_ts'] >= b:
+        return 'karşı taraf henüz açılmamıştı'
+    if other['open_ts'] > a or (end is not None and event.get('start_ts',end) < b):
+        return 'aynı mumda olay sırası belirsiz'
+    if end is None and other.get('scan_ts',0) < b*1000:
+        return 'karşı tarafın takibi bu ana ulaşmadı'
+    if d != 1:
+        return 'karşı taraf açıktı; saniyelik fiyat ölçümsüz'
+    risk=abs(other['entry']-other['orig_stop'])
+    if not risk or not obs.get('lo') or not obs.get('hi'):
+        return 'karşı taraf açıktı; fiyat ölçümsüz'
+    sign=1 if other['side']=='LONG' else -1
+    lo,hi=sorted(sign*(obs[k]-other['entry'])/risk for k in ('lo','hi'))
+    return f'karşı taraf açıktı; o saniyede brüt {lo:+.2f}…{hi:+.2f}R'
+
+def _paired_report(number=None):
+    pairs={}
+    for role in ('MAIN','RSI'):
+        for p in _engine_positions(role):
+            if p.get('pair_id') and not p.get('kontrol'):
+                pairs.setdefault(p['pair_id'],{})[role]=p
+    complete=[g for g in pairs.values() if len(g)==2]
+    doubles=sum(all(p.get('status')=='STOP' for p in g.values()) for g in complete)
+    lines=[f'Aynı aday: {len(complete)} çift | iki STOP {doubles} | yalnız ana {sum(set(g)=={"MAIN"} for g in pairs.values())} | yalnız ters {sum(set(g)=={"RSI"} for g in pairs.values())}']
+    selected=sorted((g for g in pairs.values() if (str(g.get('MAIN',{}).get('signal_no'))==number if number else len(g)==2 and any(p.get('status')=='STOP' for p in g.values()))),key=lambda g:max(p['open_ts'] for p in g.values()),reverse=True)
+    if number and not selected: lines.append('Bu ana sinyal numarası için yeni çift kaydı yok.')
+    for g in selected[:5]:
+        p=g.get('MAIN') or g['RSI']
+        lines.append(f"#{p.get('signal_no','—')} {p['symbol']} | "+' / '.join(f"{role} {q['side']} {q.get('status','ACIK')}" for role,q in g.items()))
+        if len(g)==2:
+            for role,other in [('MAIN','RSI'),('RSI','MAIN')]:
+                if g[role].get('status')=='STOP':
+                    lines.append(role+' stop: '+_pair_note(g[role],g[other]))
+    return '\n'.join(lines)
+
+def _side_regimes():
+    rows=[p for p in _engine_positions('MAIN') if p.get('pair_id') and not p.get('kontrol')]
+    lines=['ANA NORMAL | yeni adaylar | yön × giriş rejimi']
+    for side in ('LONG','SHORT'):
+        for regime in ('TREND','RANGE','GECIS','ÖLÇÜMSÜZ'):
+            def label(p):
+                s=str(p.get('piyasa_modu','')).upper().replace('Ç','C').replace('İ','I').replace('Ş','S')
+                return s if s in ('TREND','RANGE','GECIS') else 'ÖLÇÜMSÜZ'
+            cell=[p for p in rows if p['side']==side and label(p)==regime]
+            closed=[p for p in cell if p['status']!='ACIK']
+            vals=[p['net_r_value'] for p in closed if p.get('net_r_value') is not None]
+            ev=f'{sum(vals)/len(vals):+.3f}R' if vals else '—'
+            lines.append(f'{side} {regime}: toplam {len(cell)} | kapalı {len(closed)} | net EV {ev} (n={len(vals)})')
+    return '\n'.join(lines)
+
+async def cmd_yonrejim(update,context):
+    if telegram_yetkili(update):
+        await update.message.reply_text(await _read_call(_side_regimes))
+
+
 async def cmd_rsi(update, context):
     if not telegram_yetkili(update):
         return
+    parts=(update.message.text or "").split()
+    await update.message.reply_text(await _read_call(_paired_report,parts[1].lstrip("#") if len(parts)>1 else None))
+    if len(parts)>1: return
     for fn, args in ((_rsi_report, ()), (_target_report, ('RSI',)), (_shadow_report, ('RSI',))):
         for part in telegram_parcala(await _read_call(fn, *args)):
             await update.message.reply_text(part)
